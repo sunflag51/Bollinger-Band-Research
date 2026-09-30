@@ -1,16 +1,18 @@
 # ============================================================
 # GOOG / NVDA
-# Bollinger Band Research Program
+# Bollinger Band Lower-Band Research Program
 #
-# Version : 1.0
+# Version : 1.1
 #
-# 目的
-# ・GOOG / NVDA の株価取得
-# ・ボリンジャーバンド計算
-# ・BandWidth 計算
-# ・BB下限との位置関係を確認
-# ・スクイーズ研究の基礎データを確認
+# v1.1 追加内容
+# ・125営業日 BandWidth 正規化
+# ・公式Squeeze基準の確認
+# ・研究用「低BandWidthゾーン」
+# ・BandWidth 収縮 / 拡大分類
+# ・Squeezeからの拡大開始候補
+# ・過去の状態一覧
 #
+# 注意
 # 現段階では売買判断を行わない
 # ============================================================
 
@@ -35,14 +37,26 @@ st.set_page_config(
 # 定数
 # ============================================================
 
-APP_VERSION = "1.0"
+APP_VERSION = "1.1"
 
 BB_PERIOD = 20
 BB_STD = 2.0
 
-# John Bollinger の Squeeze 研究を参考に、
-# 125営業日の BandWidth 最小値を確認するために使用
 SQUEEZE_LOOKBACK = 125
+
+# ------------------------------------------------------------
+# 研究用の低BandWidthゾーン
+#
+# 0.00 = 過去125営業日の最低BandWidth
+# 1.00 = 過去125営業日の最高BandWidth
+#
+# 0.20以下を「低BandWidthゾーン」として表示する。
+#
+# これはBollinger公式のSqueeze定義ではない。
+# 今後GOOG/NVDAの過去実績を比較するための研究用分類。
+# ------------------------------------------------------------
+
+LOW_BANDWIDTH_ZONE = 0.20
 
 
 # ============================================================
@@ -68,7 +82,6 @@ def get_stock_data(ticker: str, period: str) -> pd.DataFrame:
 
         data = data.copy()
 
-        # 必要列を確認
         required_columns = [
             "Open",
             "High",
@@ -78,11 +91,10 @@ def get_stock_data(ticker: str, period: str) -> pd.DataFrame:
         ]
 
         for column in required_columns:
+
             if column not in data.columns:
                 return pd.DataFrame()
 
-        # 数値化
-        for column in required_columns:
             data[column] = pd.to_numeric(
                 data[column],
                 errors="coerce",
@@ -104,7 +116,7 @@ def get_stock_data(ticker: str, period: str) -> pd.DataFrame:
 
 
 # ============================================================
-# ボリンジャーバンド計算
+# ボリンジャーバンド
 # ============================================================
 
 def calculate_bollinger_bands(
@@ -115,27 +127,24 @@ def calculate_bollinger_bands(
 
     df = data.copy()
 
-    # 中央線
     df["BB_Middle"] = (
         df["Close"]
         .rolling(window=period)
         .mean()
     )
 
-    # 標準偏差
+    # Bollinger公式のpopulation standard deviationに合わせる
     df["BB_Std"] = (
         df["Close"]
         .rolling(window=period)
         .std(ddof=0)
     )
 
-    # 上側バンド
     df["BB_Upper"] = (
         df["BB_Middle"]
         + std_multiplier * df["BB_Std"]
     )
 
-    # 下側バンド
     df["BB_Lower"] = (
         df["BB_Middle"]
         - std_multiplier * df["BB_Std"]
@@ -145,7 +154,7 @@ def calculate_bollinger_bands(
 
 
 # ============================================================
-# BandWidth 計算
+# BandWidth
 # ============================================================
 
 def calculate_bandwidth(
@@ -180,7 +189,6 @@ def calculate_lower_band_distance(
 
     df = data.copy()
 
-    # 終値がBB下限から何％離れているか
     df["Lower_Distance_Close"] = np.where(
         df["BB_Lower"] != 0,
         (
@@ -194,7 +202,6 @@ def calculate_lower_band_distance(
         np.nan,
     )
 
-    # 当日安値がBB下限から何％離れているか
     df["Lower_Distance_Low"] = np.where(
         df["BB_Lower"] != 0,
         (
@@ -212,7 +219,7 @@ def calculate_lower_band_distance(
 
 
 # ============================================================
-# BandWidth 状態
+# BandWidth 状態計算
 # ============================================================
 
 def calculate_bandwidth_state(
@@ -222,7 +229,10 @@ def calculate_bandwidth_state(
 
     df = data.copy()
 
-    # 125営業日の最小BandWidth
+    # --------------------------------------------------------
+    # 過去125営業日のBandWidth最低・最高
+    # --------------------------------------------------------
+
     df["BandWidth_Min_125"] = (
         df["BandWidth"]
         .rolling(
@@ -232,7 +242,6 @@ def calculate_bandwidth_state(
         .min()
     )
 
-    # 125営業日の最大BandWidth
     df["BandWidth_Max_125"] = (
         df["BandWidth"]
         .rolling(
@@ -242,23 +251,166 @@ def calculate_bandwidth_state(
         .max()
     )
 
-    # 直前日との差
-    df["BandWidth_Change"] = (
+    # --------------------------------------------------------
+    # 正規化BandWidth
+    #
+    # 0 = 125日最低
+    # 1 = 125日最高
+    # --------------------------------------------------------
+
+    bandwidth_range = (
+        df["BandWidth_Max_125"]
+        - df["BandWidth_Min_125"]
+    )
+
+    df["Normalized_BandWidth"] = np.where(
+        bandwidth_range > 0,
+        (
+            df["BandWidth"]
+            - df["BandWidth_Min_125"]
+        )
+        / bandwidth_range,
+        np.nan,
+    )
+
+    # --------------------------------------------------------
+    # BandWidth変化
+    # --------------------------------------------------------
+
+    df["BandWidth_Change_1D"] = (
         df["BandWidth"]
         - df["BandWidth"].shift(1)
     )
 
-    # 5日前との差
+    df["BandWidth_Change_3D"] = (
+        df["BandWidth"]
+        - df["BandWidth"].shift(3)
+    )
+
     df["BandWidth_Change_5D"] = (
         df["BandWidth"]
         - df["BandWidth"].shift(5)
+    )
+
+    # --------------------------------------------------------
+    # 公式Squeeze
+    #
+    # 現在のBandWidthが125期間最低値
+    # --------------------------------------------------------
+
+    df["Official_Squeeze"] = (
+        df["BandWidth"].notna()
+        & df["BandWidth_Min_125"].notna()
+        & np.isclose(
+            df["BandWidth"],
+            df["BandWidth_Min_125"],
+            rtol=1e-10,
+            atol=1e-12,
+        )
+    )
+
+    # --------------------------------------------------------
+    # 研究用 低BandWidthゾーン
+    #
+    # 公式Squeezeとは別物
+    # --------------------------------------------------------
+
+    df["Low_BandWidth_Zone"] = (
+        df["Normalized_BandWidth"].notna()
+        & (
+            df["Normalized_BandWidth"]
+            <= LOW_BANDWIDTH_ZONE
+        )
     )
 
     return df
 
 
 # ============================================================
-# データ処理まとめ
+# BandWidthの方向分類
+# ============================================================
+
+def classify_bandwidth_direction(
+    row,
+) -> str:
+
+    change_1d = row["BandWidth_Change_1D"]
+    change_3d = row["BandWidth_Change_3D"]
+    change_5d = row["BandWidth_Change_5D"]
+
+    if (
+        pd.isna(change_1d)
+        or pd.isna(change_3d)
+        or pd.isna(change_5d)
+    ):
+        return "判定不可"
+
+    # 1日・3日・5日すべて縮小
+    if (
+        change_1d < 0
+        and change_3d < 0
+        and change_5d < 0
+    ):
+        return "収縮中"
+
+    # 1日・3日・5日すべて拡大
+    if (
+        change_1d > 0
+        and change_3d > 0
+        and change_5d > 0
+    ):
+        return "拡大中"
+
+    # 5日では縮小していたが、
+    # 直近1日で拡大
+    if (
+        change_5d < 0
+        and change_1d > 0
+    ):
+        return "拡大開始候補"
+
+    # 5日では拡大していたが、
+    # 直近1日で縮小
+    if (
+        change_5d > 0
+        and change_1d < 0
+    ):
+        return "収縮開始候補"
+
+    return "混合状態"
+
+
+# ============================================================
+# Squeeze状態分類
+# ============================================================
+
+def classify_squeeze_state(
+    row,
+) -> str:
+
+    normalized = row["Normalized_BandWidth"]
+
+    if pd.isna(normalized):
+        return "判定不可"
+
+    if bool(row["Official_Squeeze"]):
+        return "公式Squeeze基準"
+
+    if bool(row["Low_BandWidth_Zone"]):
+
+        if row["BandWidth_Change_1D"] > 0:
+            return "低BandWidth・拡大開始候補"
+
+        if row["BandWidth_Change_1D"] < 0:
+            return "低BandWidth・収縮中"
+
+        return "低BandWidth"
+
+    return "非Squeeze"
+
+
+# ============================================================
+# 全データ準備
 # ============================================================
 
 def prepare_data(
@@ -289,11 +441,21 @@ def prepare_data(
         SQUEEZE_LOOKBACK,
     )
 
+    df["BandWidth_Direction"] = df.apply(
+        classify_bandwidth_direction,
+        axis=1,
+    )
+
+    df["Squeeze_State"] = df.apply(
+        classify_squeeze_state,
+        axis=1,
+    )
+
     return df
 
 
 # ============================================================
-# 表示用関数
+# 表示補助
 # ============================================================
 
 def format_number(
@@ -311,26 +473,31 @@ def format_number(
 # タイトル
 # ============================================================
 
-st.title("📊 GOOG・NVDA BB下限研究")
+st.title(
+    "📊 GOOG・NVDA BB下限研究"
+)
 
 st.caption(
     f"Version {APP_VERSION} ｜ "
-    "ボリンジャーバンド・BandWidth 基礎確認版"
+    "スクイーズ状態分類版"
 )
 
 st.info(
-    "現在は研究の第1段階です。"
-    "この画面は売買を指示するものではなく、"
-    "GOOG・NVDAのBB下限とボラティリティ状態を"
-    "正しく確認するための画面です。"
+    "現在は研究段階です。"
+    "スクイーズやBandWidthの状態を分類し、"
+    "GOOG・NVDAの実際の値動きと一致しているか"
+    "確認するためのプログラムです。"
+    "まだ買い・売り判断は行いません。"
 )
 
 
 # ============================================================
-# 銘柄選択
+# 銘柄
 # ============================================================
 
-st.subheader("① 銘柄を選択")
+st.subheader(
+    "① 銘柄を選択"
+)
 
 ticker = st.radio(
     "研究する銘柄",
@@ -343,7 +510,7 @@ ticker = st.radio(
 
 
 # ============================================================
-# 取得期間
+# 期間
 # ============================================================
 
 period_label = st.selectbox(
@@ -381,10 +548,6 @@ with st.spinner(
     )
 
 
-# ============================================================
-# データ取得失敗
-# ============================================================
-
 if df.empty:
 
     st.error(
@@ -392,7 +555,8 @@ if df.empty:
     )
 
     st.warning(
-        "Yahoo Finance側の一時的な通信エラーの可能性があります。"
+        "Yahoo Finance側の一時的な通信エラーの"
+        "可能性があります。"
         "少し時間を置いて再読み込みしてください。"
     )
 
@@ -400,7 +564,7 @@ if df.empty:
 
 
 # ============================================================
-# BB計算済みデータだけ使用
+# BB計算済みデータ
 # ============================================================
 
 valid_df = df.dropna(
@@ -417,25 +581,14 @@ if valid_df.empty:
 
     st.error(
         "ボリンジャーバンドを計算するための"
-        "十分な株価データがありません。"
+        "十分なデータがありません。"
     )
 
     st.stop()
 
 
-# ============================================================
-# 最新データ
-# ============================================================
-
 latest = valid_df.iloc[-1]
-
 latest_date = valid_df.index[-1]
-
-previous = (
-    valid_df.iloc[-2]
-    if len(valid_df) >= 2
-    else latest
-)
 
 
 # ============================================================
@@ -450,15 +603,14 @@ st.subheader(
 
 st.write(
     "データ日：",
-    latest_date.strftime("%Y年%m月%d日"),
+    latest_date.strftime(
+        "%Y年%m月%d日"
+    ),
 )
 
 
-# ============================================================
-# 主要数値
-# ============================================================
-
 col1, col2 = st.columns(2)
+
 
 with col1:
 
@@ -497,7 +649,7 @@ with col2:
 
 
 # ============================================================
-# BB下限との位置関係
+# BB下限
 # ============================================================
 
 st.subheader(
@@ -522,15 +674,14 @@ if close_distance < 0:
 elif close_distance <= 1:
 
     st.info(
-        "終値はBB下限から1％以内にあります。"
-        "研究上の『BB下限付近』候補です。"
+        "終値はBB下限から1％以内です。"
+        "研究上のBB下限付近候補です。"
     )
 
 else:
 
     st.success(
-        "現在の終値はBB下限から"
-        "1％より離れています。"
+        "終値はBB下限から1％より離れています。"
     )
 
 
@@ -538,7 +689,7 @@ if low_distance <= 0:
 
     st.warning(
         "当日の安値はBB下限に到達、"
-        "またはBB下限を下回っています。"
+        "または下回っています。"
     )
 
 else:
@@ -549,169 +700,218 @@ else:
 
 
 st.caption(
-    "注意：1％は現在の正式な売買条件ではありません。"
-    "BB下限との距離を確認するための仮の研究表示です。"
+    "1％は正式なエントリー条件ではありません。"
+    "現在は研究表示です。"
 )
 
 
 # ============================================================
-# BandWidth 方向
+# Squeeze
 # ============================================================
 
 st.subheader(
-    "④ BandWidth の状態"
+    "④ スクイーズ状態"
 )
 
-bandwidth_change = latest[
-    "BandWidth_Change"
+squeeze_state = latest[
+    "Squeeze_State"
 ]
 
-bandwidth_change_5d = latest[
-    "BandWidth_Change_5D"
-]
-
-
-if pd.notna(bandwidth_change):
-
-    if bandwidth_change > 0:
-
-        st.write(
-            "前日比：BandWidth は拡大しています。"
-        )
-
-    elif bandwidth_change < 0:
-
-        st.write(
-            "前日比：BandWidth は縮小しています。"
-        )
-
-    else:
-
-        st.write(
-            "前日比：BandWidth はほぼ変化していません。"
-        )
-
-
-if pd.notna(bandwidth_change_5d):
-
-    if bandwidth_change_5d > 0:
-
-        st.write(
-            "5営業日前との比較："
-            "BandWidth は拡大方向です。"
-        )
-
-    elif bandwidth_change_5d < 0:
-
-        st.write(
-            "5営業日前との比較："
-            "BandWidth は縮小方向です。"
-        )
-
-    else:
-
-        st.write(
-            "5営業日前との比較："
-            "BandWidth はほぼ同水準です。"
-        )
-
-
-# ============================================================
-# 125営業日 Squeeze 候補確認
-# ============================================================
-
-st.subheader(
-    "⑤ スクイーズ研究用確認"
-)
-
-bw_min_125 = latest[
-    "BandWidth_Min_125"
+direction_state = latest[
+    "BandWidth_Direction"
 ]
 
 
-if pd.isna(bw_min_125):
+if squeeze_state == "公式Squeeze基準":
+
+    st.warning(
+        "公式Squeeze基準："
+        "現在のBandWidthは"
+        "過去125営業日の最低水準です。"
+    )
+
+elif squeeze_state == "低BandWidth・収縮中":
 
     st.info(
-        "125営業日のスクイーズ判定に必要な"
-        "データがまだ不足しています。"
+        "研究分類："
+        "BandWidthは125営業日の中で低い位置にあり、"
+        "現在も収縮方向です。"
+    )
+
+elif squeeze_state == "低BandWidth・拡大開始候補":
+
+    st.warning(
+        "研究分類："
+        "低BandWidth状態から"
+        "拡大し始めている可能性があります。"
+    )
+
+elif squeeze_state == "低BandWidth":
+
+    st.info(
+        "研究分類："
+        "BandWidthは125営業日の中で"
+        "低い位置にあります。"
+    )
+
+elif squeeze_state == "非Squeeze":
+
+    st.success(
+        "現在は低BandWidthゾーンではありません。"
     )
 
 else:
 
-    distance_from_min = (
-        (
-            latest["BandWidth"]
-            - bw_min_125
-        )
-        / bw_min_125
-        * 100
-        if bw_min_125 != 0
-        else np.nan
-    )
-
     st.write(
-        "現在のBandWidth：",
-        f"{format_number(latest['BandWidth'])}%",
+        "スクイーズ状態はまだ判定できません。"
     )
 
-    st.write(
-        "過去125営業日の最小BandWidth：",
-        f"{format_number(bw_min_125)}%",
-    )
 
-    st.write(
-        "125営業日最小値との差：",
-        f"{format_number(distance_from_min)}%",
-    )
-
-    if (
-        pd.notna(distance_from_min)
-        and distance_from_min <= 0.01
-    ):
-
-        st.warning(
-            "現在のBandWidthは、"
-            "過去125営業日の最小水準です。"
-            "スクイーズ研究候補として記録できます。"
-        )
-
-    else:
-
-        st.info(
-            "現在は過去125営業日の"
-            "BandWidth最小値そのものではありません。"
-        )
-
-
-st.caption(
-    "現段階ではスクイーズを売買シグナルには使用しません。"
-    "まずGOOG・NVDAで実際の状態を確認します。"
+st.write(
+    "BandWidth方向：",
+    direction_state,
 )
 
 
 # ============================================================
-# 株価 + Bollinger Bands チャート
+# 正規化BandWidth
+# ============================================================
+
+st.subheader(
+    "⑤ 125営業日内でのBandWidth位置"
+)
+
+normalized = latest[
+    "Normalized_BandWidth"
+]
+
+
+if pd.isna(normalized):
+
+    st.info(
+        "125営業日の計算に必要な"
+        "データが不足しています。"
+    )
+
+else:
+
+    normalized_percent = (
+        normalized * 100
+    )
+
+    st.metric(
+        "正規化BandWidth",
+        f"{format_number(normalized_percent)}%",
+    )
+
+    st.write(
+        "0％に近いほど、"
+        "過去125営業日の最低BandWidthに近く、"
+        "100％に近いほど最高BandWidthに近い状態です。"
+    )
+
+    st.write(
+        "過去125営業日の最小BandWidth：",
+        f"{format_number(latest['BandWidth_Min_125'])}%",
+    )
+
+    st.write(
+        "過去125営業日の最大BandWidth：",
+        f"{format_number(latest['BandWidth_Max_125'])}%",
+    )
+
+
+st.caption(
+    "正規化BandWidthが20％以下という分類は、"
+    "GOOG・NVDAの比較研究のための仮分類です。"
+    "John Bollinger公式のSqueeze定義そのものではありません。"
+)
+
+
+# ============================================================
+# BandWidth変化
+# ============================================================
+
+st.subheader(
+    "⑥ BandWidth変化"
+)
+
+col1, col2, col3 = st.columns(3)
+
+
+with col1:
+
+    st.metric(
+        "前日比",
+        f"{format_number(latest['BandWidth_Change_1D'])}",
+    )
+
+
+with col2:
+
+    st.metric(
+        "3営業日前比",
+        f"{format_number(latest['BandWidth_Change_3D'])}",
+    )
+
+
+with col3:
+
+    st.metric(
+        "5営業日前比",
+        f"{format_number(latest['BandWidth_Change_5D'])}",
+    )
+
+
+st.write(
+    "現在の方向分類：",
+    direction_state,
+)
+
+
+# ============================================================
+# チャート
 # ============================================================
 
 st.divider()
 
 st.subheader(
-    "⑥ 株価とボリンジャーバンド"
+    "⑦ 株価とボリンジャーバンド"
 )
 
-chart_days = st.slider(
-    "チャート表示営業日数",
-    min_value=60,
-    max_value=min(
-        500,
-        len(valid_df),
-    ),
-    value=min(
-        250,
-        len(valid_df),
-    ),
-    step=10,
+
+max_chart_days = min(
+    500,
+    len(valid_df),
 )
+
+min_chart_days = min(
+    60,
+    max_chart_days,
+)
+
+default_chart_days = min(
+    250,
+    max_chart_days,
+)
+
+
+if max_chart_days > min_chart_days:
+
+    chart_days = st.slider(
+        "チャート表示営業日数",
+        min_value=min_chart_days,
+        max_value=max_chart_days,
+        value=max(
+            min_chart_days,
+            default_chart_days,
+        ),
+        step=10,
+    )
+
+else:
+
+    chart_days = max_chart_days
 
 
 price_chart = (
@@ -727,12 +927,14 @@ price_chart = (
     .copy()
 )
 
+
 price_chart.columns = [
     "終値",
     "BB上限",
     "BB中央線",
     "BB下限",
 ]
+
 
 st.line_chart(
     price_chart,
@@ -741,12 +943,13 @@ st.line_chart(
 
 
 # ============================================================
-# BandWidth チャート
+# BandWidthチャート
 # ============================================================
 
 st.subheader(
-    "⑦ BandWidth"
+    "⑧ BandWidth"
 )
+
 
 bandwidth_chart = (
     valid_df[
@@ -758,9 +961,11 @@ bandwidth_chart = (
     .copy()
 )
 
+
 bandwidth_chart.columns = [
     "BandWidth",
 ]
+
 
 st.line_chart(
     bandwidth_chart,
@@ -769,40 +974,117 @@ st.line_chart(
 
 
 # ============================================================
-# 最新20営業日データ
+# 正規化BandWidthチャート
 # ============================================================
 
 st.subheader(
-    "⑧ 最新20営業日の確認"
+    "⑨ 正規化BandWidth"
 )
+
+
+normalized_chart = (
+    valid_df[
+        [
+            "Normalized_BandWidth",
+        ]
+    ]
+    .tail(chart_days)
+    .copy()
+    * 100
+)
+
+
+normalized_chart.columns = [
+    "正規化BandWidth %",
+]
+
+
+st.line_chart(
+    normalized_chart,
+    use_container_width=True,
+)
+
+
+# ============================================================
+# 過去状態一覧
+# ============================================================
+
+st.subheader(
+    "⑩ 最新30営業日の状態確認"
+)
+
 
 display_df = (
     valid_df[
         [
             "Close",
-            "BB_Upper",
-            "BB_Middle",
             "BB_Lower",
-            "BandWidth",
             "Lower_Distance_Close",
-            "Lower_Distance_Low",
+            "BandWidth",
+            "Normalized_BandWidth",
+            "BandWidth_Direction",
+            "Squeeze_State",
         ]
     ]
-    .tail(20)
+    .tail(30)
     .copy()
 )
 
-display_df.columns = [
+
+display_df[
+    "Normalized_BandWidth"
+] = (
+    display_df[
+        "Normalized_BandWidth"
+    ]
+    * 100
+)
+
+
+display_df = display_df.rename(
+    columns={
+        "Close":
+            "終値",
+
+        "BB_Lower":
+            "BB下限",
+
+        "Lower_Distance_Close":
+            "終値→BB下限 %",
+
+        "BandWidth":
+            "BandWidth %",
+
+        "Normalized_BandWidth":
+            "正規化BW %",
+
+        "BandWidth_Direction":
+            "BW方向",
+
+        "Squeeze_State":
+            "スクイーズ状態",
+    }
+)
+
+
+numeric_columns = [
     "終値",
-    "BB上限",
-    "BB中央線",
     "BB下限",
-    "BandWidth %",
     "終値→BB下限 %",
-    "安値→BB下限 %",
+    "BandWidth %",
+    "正規化BW %",
 ]
 
-display_df = display_df.round(2)
+
+display_df[
+    numeric_columns
+] = (
+    display_df[
+        numeric_columns
+    ]
+    .round(2)
+)
+
 
 st.dataframe(
     display_df,
@@ -811,25 +1093,100 @@ st.dataframe(
 
 
 # ============================================================
-# 現段階の研究状態
+# 研究用集計
+# ============================================================
+
+st.subheader(
+    "⑪ 現在取得している期間の分類件数"
+)
+
+
+research_df = valid_df.dropna(
+    subset=[
+        "Normalized_BandWidth",
+    ]
+).copy()
+
+
+if research_df.empty:
+
+    st.info(
+        "分類集計に必要なデータがありません。"
+    )
+
+else:
+
+    official_count = int(
+        research_df[
+            "Official_Squeeze"
+        ].sum()
+    )
+
+    low_bw_count = int(
+        research_df[
+            "Low_BandWidth_Zone"
+        ].sum()
+    )
+
+    total_count = len(
+        research_df
+    )
+
+    col1, col2, col3 = st.columns(3)
+
+
+    with col1:
+
+        st.metric(
+            "判定可能日",
+            f"{total_count}日",
+        )
+
+
+    with col2:
+
+        st.metric(
+            "公式Squeeze基準日",
+            f"{official_count}日",
+        )
+
+
+    with col3:
+
+        st.metric(
+            "研究用 低BWゾーン",
+            f"{low_bw_count}日",
+        )
+
+
+    st.caption(
+        "件数は売買成績ではありません。"
+        "現段階では各状態がどの程度発生するかを"
+        "確認するための数字です。"
+    )
+
+
+# ============================================================
+# 現在の研究段階
 # ============================================================
 
 st.divider()
 
 st.subheader(
-    "⑨ 現在の研究段階"
+    "⑫ 現在の研究段階"
 )
+
 
 st.write(
     "【実装済み】GOOG / NVDA 切り替え"
 )
 
 st.write(
-    "【実装済み】株価データ取得"
+    "【実装済み】株価取得"
 )
 
 st.write(
-    "【実装済み】20日ボリンジャーバンド"
+    "【実装済み】20日・2標準偏差BB"
 )
 
 st.write(
@@ -841,15 +1198,27 @@ st.write(
 )
 
 st.write(
-    "【実装済み】BandWidth 縮小・拡大確認"
+    "【実装済み】125営業日BandWidth最低・最高"
 )
 
 st.write(
-    "【研究表示】125営業日BandWidth最小水準"
+    "【実装済み】正規化BandWidth"
 )
 
 st.write(
-    "【未実装】正式なスクイーズ分類"
+    "【実装済み】公式Squeeze基準表示"
+)
+
+st.write(
+    "【研究分類】低BandWidthゾーン"
+)
+
+st.write(
+    "【実装済み】BandWidth収縮・拡大分類"
+)
+
+st.write(
+    "【研究分類】低BandWidthからの拡大開始候補"
 )
 
 st.write(
@@ -861,11 +1230,11 @@ st.write(
 )
 
 st.write(
-    "【未実装】1R 損切り"
+    "【未実装】1R損切り"
 )
 
 st.write(
-    "【未実装】1.5R / 2R 到達検証"
+    "【未実装】1.5R / 2R到達検証"
 )
 
 st.write(
@@ -874,13 +1243,23 @@ st.write(
 
 
 # ============================================================
-# 注意
+# 重要説明
 # ============================================================
 
 st.divider()
 
+st.warning(
+    "重要："
+    "『公式Squeeze基準』と"
+    "『研究用 低BandWidthゾーン』は別物です。"
+    "研究用ゾーンは今後GOOG・NVDAの"
+    "過去実績を比較するための仮分類であり、"
+    "売買条件として正式採用したものではありません。"
+)
+
+
 st.caption(
     "このプログラムは研究・検証用です。"
-    "表示された情報だけで将来の株価上昇・下落を"
+    "表示された状態は将来の株価上昇・下落を"
     "保証するものではありません。"
 )
