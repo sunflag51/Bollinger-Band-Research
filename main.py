@@ -2,13 +2,11 @@
 # GOOG / NVDA
 # Bollinger Band Lower-Band Research Program
 #
-# Version : 1.3.3
+# Version : 1.4
 #
 # v1.1
 # ・125営業日 BandWidth 正規化
-# ・Squeeze基準確認
-# ・研究用低BandWidthゾーン
-# ・BandWidth収縮 / 拡大分類
+# ・Squeeze / BandWidth環境分類
 #
 # v1.2
 # ・BB下限タッチ
@@ -18,25 +16,26 @@
 # ・低BandWidthから下方向拡大候補
 #
 # v1.3
-# ・前日安値を割らない
 # ・安値切り上げ
 # ・前日終値より上昇
 # ・陽線
-# ・安値切り上げ＋終値上昇
-# ・BB下限タッチ後の下落停止候補
+# ・下落停止候補
 #
 # v1.3.2
 # ・最初のBB下限タッチを0日目
 # ・0～3営業日目の固定観察
-# ・途中の再タッチでは期間を延長しない
-# ・固定期間内の最初の下落停止候補を記録
+# ・再タッチでは期間を延長しない
 #
 # v1.3.3
-# ・観察完了イベントと未完了イベントを分離
-# ・統計は観察完了イベントだけを母数にする
-# ・データ末尾の未完了イベントを失敗扱いしない
-# ・完了イベントの確認率を表示
-# ・完了イベントだけで確認タイミングを集計
+# ・観察完了 / 未完了イベント分離
+# ・完了イベントだけで統計
+#
+# v1.4
+# ・前日高値を終値で上回る条件を追加
+# ・反発開始候補を追加
+# ・イベント最初の反発開始を記録
+# ・下落停止と反発開始をイベント単位で比較
+# ・反発開始タイミングを0～3営業日で集計
 #
 # 注意
 # 現段階では売買判断を行わない
@@ -63,14 +62,12 @@ st.set_page_config(
 # 定数
 # ============================================================
 
-APP_VERSION = "1.3.3"
+APP_VERSION = "1.4"
 
 BB_PERIOD = 20
 BB_STD = 2.0
 
 SQUEEZE_LOOKBACK = 125
-
-# 研究用低BandWidthゾーン
 LOW_BANDWIDTH_ZONE = 0.20
 
 # 最初のBB下限タッチを0日目として
@@ -240,7 +237,7 @@ def calculate_lower_band_distance(
 
 
 # ============================================================
-# BandWidth 状態
+# BandWidth状態
 # ============================================================
 
 def calculate_bandwidth_state(
@@ -321,7 +318,7 @@ def calculate_bandwidth_state(
 
 
 # ============================================================
-# BandWidth方向
+# BandWidth方向分類
 # ============================================================
 
 def classify_bandwidth_direction(
@@ -369,7 +366,7 @@ def classify_bandwidth_direction(
 
 
 # ============================================================
-# Squeeze状態
+# Squeeze状態分類
 # ============================================================
 
 def classify_squeeze_state(
@@ -398,7 +395,6 @@ def classify_squeeze_state(
 
 
 # ============================================================
-# v1.2
 # BB下限イベント
 # ============================================================
 
@@ -431,10 +427,6 @@ def calculate_lower_band_events(
     return df
 
 
-# ============================================================
-# BB下限状態分類
-# ============================================================
-
 def classify_lower_band_event(
     row,
 ) -> str:
@@ -455,7 +447,6 @@ def classify_lower_band_event(
 
 
 # ============================================================
-# v1.2
 # 低BandWidthから下方向拡大
 # ============================================================
 
@@ -494,10 +485,6 @@ def calculate_downside_expansion(
     return df
 
 
-# ============================================================
-# 下方向拡大分類
-# ============================================================
-
 def classify_downside_expansion(
     row,
 ) -> str:
@@ -516,7 +503,7 @@ def classify_downside_expansion(
 
 # ============================================================
 # v1.3
-# 下落停止基本条件
+# 下落停止条件
 # ============================================================
 
 def calculate_decline_stop_conditions(
@@ -525,8 +512,13 @@ def calculate_decline_stop_conditions(
 
     df = data.copy()
 
-    df["Prev_Low"] = df["Low"].shift(1)
-    df["Prev_Close"] = df["Close"].shift(1)
+    df["Prev_Low"] = (
+        df["Low"].shift(1)
+    )
+
+    df["Prev_Close"] = (
+        df["Close"].shift(1)
+    )
 
     df["No_Lower_Low"] = (
         df["Prev_Low"].notna()
@@ -547,7 +539,7 @@ def calculate_decline_stop_conditions(
         df["Close"] > df["Open"]
     )
 
-    # 現在の研究用「下落停止候補」
+    # 研究中の下落停止候補
     df["Decline_Stop_Combo"] = (
         df["Higher_Low"]
         & df["Close_Up"]
@@ -557,10 +549,38 @@ def calculate_decline_stop_conditions(
 
 
 # ============================================================
-# v1.3
-# 従来の直近BB下限タッチ追跡
+# v1.4
+# 反発開始条件
 #
-# 過去バージョンとの比較のため残す
+# 終値が前日の高値を上回ったか
+#
+# まだ研究候補であり、
+# 売買条件として正式採用したわけではない
+# ============================================================
+
+def calculate_rebound_start_conditions(
+    data: pd.DataFrame,
+) -> pd.DataFrame:
+
+    df = data.copy()
+
+    df["Prev_High"] = (
+        df["High"].shift(1)
+    )
+
+    df["Close_Above_Prev_High"] = (
+        df["Prev_High"].notna()
+        & (
+            df["Close"]
+            > df["Prev_High"]
+        )
+    )
+
+    return df
+
+
+# ============================================================
+# v1.3 従来の直近タッチ追跡
 # ============================================================
 
 def calculate_lower_event_window(
@@ -622,8 +642,7 @@ def calculate_lower_event_window(
 
 
 # ============================================================
-# v1.3
-# 従来の下落停止候補
+# v1.3 従来の下落停止候補
 # ============================================================
 
 def calculate_decline_stop_candidates(
@@ -678,11 +697,6 @@ def calculate_decline_stop_candidates(
     return df
 
 
-# ============================================================
-# v1.3
-# 下落停止状態分類
-# ============================================================
-
 def classify_decline_stop(
     row,
 ) -> str:
@@ -723,12 +737,7 @@ def classify_decline_stop(
 
 # ============================================================
 # v1.3.2
-# 固定観察期間方式
-#
-# 最初のBB下限タッチ = 0日目
-# 0・1・2・3営業日目だけ観察
-#
-# 再タッチしても期間を延長しない
+# 固定観察イベント
 # ============================================================
 
 def calculate_fixed_bb_event_units(
@@ -740,19 +749,32 @@ def calculate_fixed_bb_event_units(
 
     row_count = len(df)
 
-    event_ids = [np.nan] * row_count
-    new_event_flags = [False] * row_count
-    event_start_dates = [pd.NaT] * row_count
-    days_from_event_start = [np.nan] * row_count
+    event_ids = [
+        np.nan
+    ] * row_count
+
+    new_event_flags = [
+        False
+    ] * row_count
+
+    event_start_dates = [
+        pd.NaT
+    ] * row_count
+
+    days_from_event_start = [
+        np.nan
+    ] * row_count
 
     event_counter = 0
+
     active_event_id = None
     event_start_position = None
     event_start_date = pd.NaT
 
-    for position in range(row_count):
+    for position in range(
+        row_count
+    ):
 
-        # 前の固定観察期間が終了したか
         if (
             active_event_id is not None
             and event_start_position is not None
@@ -773,7 +795,6 @@ def calculate_fixed_bb_event_units(
             ]
         )
 
-        # イベントがない状態でタッチしたら開始
         if (
             active_event_id is None
             and is_touch
@@ -781,32 +802,45 @@ def calculate_fixed_bb_event_units(
 
             event_counter += 1
 
-            active_event_id = event_counter
-            event_start_position = position
-            event_start_date = df.index[position]
+            active_event_id = (
+                event_counter
+            )
 
-            new_event_flags[position] = True
+            event_start_position = (
+                position
+            )
 
-        # 固定観察期間内
+            event_start_date = (
+                df.index[position]
+            )
+
+            new_event_flags[
+                position
+            ] = True
+
         if (
             active_event_id is not None
             and event_start_position is not None
         ):
 
-            event_ids[position] = (
-                active_event_id
-            )
+            event_ids[
+                position
+            ] = active_event_id
 
-            event_start_dates[position] = (
-                event_start_date
-            )
+            event_start_dates[
+                position
+            ] = event_start_date
 
-            days_from_event_start[position] = (
+            days_from_event_start[
+                position
+            ] = (
                 position
                 - event_start_position
             )
 
-    df["BB_Event_ID"] = event_ids
+    df["BB_Event_ID"] = (
+        event_ids
+    )
 
     df["New_BB_Lower_Event"] = (
         new_event_flags
@@ -824,6 +858,7 @@ def calculate_fixed_bb_event_units(
         df["BB_Event_ID"].notna()
     )
 
+    # v1.3 下落停止候補
     df[
         "Fixed_Window_Decline_Stop_Candidate"
     ] = (
@@ -831,28 +866,20 @@ def calculate_fixed_bb_event_units(
         & df["Decline_Stop_Combo"]
     )
 
+    # v1.4 反発開始候補
+    df[
+        "Fixed_Window_Rebound_Start_Candidate"
+    ] = (
+        df["Fixed_Event_Window"]
+        & df["Close_Above_Prev_High"]
+    )
+
     return df
 
 
 # ============================================================
 # v1.3.3
-# 観察完了 / 未完了判定
-#
-# イベント開始位置から3営業日後まで
-# 実データが存在する場合だけ「観察完了」
-#
-# 例
-#
-# 0日目 タッチ
-# 1日目 データあり
-# 2日目 データあり
-# 3日目 データあり
-#
-# → 完了
-#
-# データ末尾で2日目までしか存在しない
-#
-# → 未完了
+# 観察完了 / 未完了
 # ============================================================
 
 def calculate_event_completion(
@@ -864,17 +891,25 @@ def calculate_event_completion(
 
     row_count = len(df)
 
-    df["Event_Observation_Complete"] = False
-    df["Event_Observation_Status"] = "イベント外"
+    df[
+        "Event_Observation_Complete"
+    ] = False
+
+    df[
+        "Event_Observation_Status"
+    ] = "イベント外"
+
     df["Event_End_Date"] = pd.NaT
 
     event_start_positions = np.where(
-        df["New_BB_Lower_Event"].to_numpy(
-            dtype=bool
-        )
+        df[
+            "New_BB_Lower_Event"
+        ].to_numpy(dtype=bool)
     )[0]
 
-    for start_position in event_start_positions:
+    for start_position in (
+        event_start_positions
+    ):
 
         event_id = int(
             df.iloc[start_position][
@@ -894,9 +929,9 @@ def calculate_event_completion(
 
         if end_position < row_count:
 
-            end_date = df.index[
-                end_position
-            ]
+            end_date = (
+                df.index[end_position]
+            )
 
             df.loc[
                 event_mask,
@@ -929,7 +964,7 @@ def calculate_event_completion(
 
 
 # ============================================================
-# イベント内最初の下落停止確認
+# イベント最初の下落停止確認
 # ============================================================
 
 def calculate_first_decline_stop_per_event(
@@ -938,7 +973,7 @@ def calculate_first_decline_stop_per_event(
 
     df = data.copy()
 
-    first_candidate_flags = [
+    flags = [
         False
     ] * len(df)
 
@@ -954,7 +989,7 @@ def calculate_first_decline_stop_per_event(
             ]
         )
 
-        is_candidate = bool(
+        candidate = bool(
             df.iloc[position][
                 "Fixed_Window_Decline_Stop_Candidate"
             ]
@@ -962,7 +997,7 @@ def calculate_first_decline_stop_per_event(
 
         if (
             pd.notna(event_id)
-            and is_candidate
+            and candidate
         ):
 
             event_id_int = int(
@@ -974,7 +1009,67 @@ def calculate_first_decline_stop_per_event(
                 not in seen_event_ids
             ):
 
-                first_candidate_flags[
+                flags[position] = True
+
+                seen_event_ids.add(
+                    event_id_int
+                )
+
+    df[
+        "First_Decline_Stop_In_Event"
+    ] = flags
+
+    return df
+
+
+# ============================================================
+# v1.4
+# イベント最初の反発開始確認
+# ============================================================
+
+def calculate_first_rebound_start_per_event(
+    data: pd.DataFrame,
+) -> pd.DataFrame:
+
+    df = data.copy()
+
+    flags = [
+        False
+    ] * len(df)
+
+    seen_event_ids = set()
+
+    for position in range(
+        len(df)
+    ):
+
+        event_id = (
+            df.iloc[position][
+                "BB_Event_ID"
+            ]
+        )
+
+        candidate = bool(
+            df.iloc[position][
+                "Fixed_Window_Rebound_Start_Candidate"
+            ]
+        )
+
+        if (
+            pd.notna(event_id)
+            and candidate
+        ):
+
+            event_id_int = int(
+                event_id
+            )
+
+            if (
+                event_id_int
+                not in seen_event_ids
+            ):
+
+                flags[
                     position
                 ] = True
 
@@ -983,14 +1078,14 @@ def calculate_first_decline_stop_per_event(
                 )
 
     df[
-        "First_Decline_Stop_In_Event"
-    ] = first_candidate_flags
+        "First_Rebound_Start_In_Event"
+    ] = flags
 
     return df
 
 
 # ============================================================
-# 最初の下落停止確認時のBB状態
+# 下落停止確認時のBB状態
 # ============================================================
 
 def calculate_first_stop_bb_state(
@@ -1005,7 +1100,9 @@ def calculate_first_stop_bb_state(
         len(df)
     ):
 
-        row = df.iloc[position]
+        row = df.iloc[
+            position
+        ]
 
         if not bool(
             row[
@@ -1053,6 +1150,72 @@ def calculate_first_stop_bb_state(
 
 
 # ============================================================
+# v1.4
+# 反発開始確認時のBB状態
+# ============================================================
+
+def calculate_first_rebound_bb_state(
+    data: pd.DataFrame,
+) -> pd.DataFrame:
+
+    df = data.copy()
+
+    states = []
+
+    for position in range(
+        len(df)
+    ):
+
+        row = df.iloc[
+            position
+        ]
+
+        if not bool(
+            row[
+                "First_Rebound_Start_In_Event"
+            ]
+        ):
+
+            states.append(
+                "対象外"
+            )
+
+            continue
+
+        if bool(
+            row[
+                "BB_Lower_Close_Below"
+            ]
+        ):
+
+            states.append(
+                "BB下限より下で終値"
+            )
+
+        elif bool(
+            row[
+                "BB_Lower_Reclaim"
+            ]
+        ):
+
+            states.append(
+                "下抜け後BB内復帰"
+            )
+
+        else:
+
+            states.append(
+                "終値はBB内"
+            )
+
+    df[
+        "First_Rebound_BB_State"
+    ] = states
+
+    return df
+
+
+# ============================================================
 # イベント結果
 # ============================================================
 
@@ -1062,7 +1225,13 @@ def calculate_event_results(
 
     df = data.copy()
 
-    df["Event_Has_Decline_Stop"] = False
+    df[
+        "Event_Has_Decline_Stop"
+    ] = False
+
+    df[
+        "Event_Has_Rebound_Start"
+    ] = False
 
     event_ids = (
         df["BB_Event_ID"]
@@ -1085,10 +1254,22 @@ def calculate_event_results(
             ].any()
         )
 
+        has_rebound = bool(
+            df.loc[
+                event_mask,
+                "First_Rebound_Start_In_Event",
+            ].any()
+        )
+
         df.loc[
             event_mask,
             "Event_Has_Decline_Stop",
         ] = has_stop
+
+        df.loc[
+            event_mask,
+            "Event_Has_Rebound_Start",
+        ] = has_rebound
 
     return df
 
@@ -1165,11 +1346,17 @@ def prepare_data(
         axis=1,
     )
 
+    # v1.3
     df = calculate_decline_stop_conditions(
         df
     )
 
-    # v1.3 従来方式
+    # v1.4
+    df = calculate_rebound_start_conditions(
+        df
+    )
+
+    # v1.3 従来追跡
     df = calculate_lower_event_window(
         df,
         LOWER_EVENT_OBSERVATION_DAYS,
@@ -1186,25 +1373,37 @@ def prepare_data(
         axis=1,
     )
 
-    # v1.3.2 固定イベント
+    # 固定イベント
     df = calculate_fixed_bb_event_units(
         df,
         LOWER_EVENT_OBSERVATION_DAYS,
     )
 
-    # v1.3.3 観察完了判定
+    # 完了 / 未完了
     df = calculate_event_completion(
         df,
         LOWER_EVENT_OBSERVATION_DAYS,
     )
 
+    # 最初の下落停止
     df = (
         calculate_first_decline_stop_per_event(
             df
         )
     )
 
+    # 最初の反発開始
+    df = (
+        calculate_first_rebound_start_per_event(
+            df
+        )
+    )
+
     df = calculate_first_stop_bb_state(
+        df
+    )
+
+    df = calculate_first_rebound_bb_state(
         df
     )
 
@@ -1241,21 +1440,6 @@ def yes_no(
     )
 
 
-def format_days_since_touch(
-    value,
-) -> str:
-
-    if pd.isna(value):
-        return "直近3営業日以内になし"
-
-    value = int(value)
-
-    if value == 0:
-        return "本日"
-
-    return f"{value}営業日前"
-
-
 def format_event_id(
     value,
 ) -> str:
@@ -1278,20 +1462,19 @@ st.title(
 
 st.caption(
     f"Version {APP_VERSION} ｜ "
-    "観察完了・未完了分離版"
+    "下落停止 vs 反発開始 比較研究版"
 )
 
 st.info(
-    "v1.3.3では、最初のBB下限タッチから"
-    "0～3営業日目までの4営業日を"
-    "最後まで観察できたイベントと、"
-    "データ末尾のため観察できていないイベントを"
-    "分離します。"
+    "v1.4では、v1.3.3の固定観察方式を維持したまま、"
+    "『終値が前日の高値を上回る』状態を"
+    "反発開始候補として追加します。"
+    "まだ売買条件ではありません。"
 )
 
 
 # ============================================================
-# ① 銘柄
+# ① 銘柄・期間
 # ============================================================
 
 st.subheader(
@@ -1396,7 +1579,7 @@ st.write(
 )
 
 
-col1, col2 = st.columns(2)
+col1, col2, col3 = st.columns(3)
 
 
 with col1:
@@ -1404,11 +1587,6 @@ with col1:
     st.metric(
         "終値",
         f"${format_number(latest['Close'])}",
-    )
-
-    st.metric(
-        "BB中央線",
-        f"${format_number(latest['BB_Middle'])}",
     )
 
     st.metric(
@@ -1420,18 +1598,30 @@ with col1:
 with col2:
 
     st.metric(
-        "BB上限",
-        f"${format_number(latest['BB_Upper'])}",
-    )
-
-    st.metric(
         "BandWidth",
         f"{format_number(latest['BandWidth'])}%",
     )
 
     st.metric(
-        "終値とBB下限の距離",
+        "終値→BB下限",
         f"{format_number(latest['Lower_Distance_Close'])}%",
+    )
+
+
+with col3:
+
+    st.metric(
+        "前日高値",
+        f"${format_number(latest['Prev_High'])}",
+    )
+
+    st.write(
+        "終値が前日高値を上回る：",
+        yes_no(
+            latest[
+                "Close_Above_Prev_High"
+            ]
+        ),
     )
 
 
@@ -1488,134 +1678,52 @@ else:
 
 st.caption(
     "1％は正式なエントリー条件ではありません。"
-    "現在は研究表示です。"
 )
 
 
 # ============================================================
-# ④ スクイーズ
+# ④ BandWidth環境
 # ============================================================
 
 st.subheader(
-    "④ スクイーズ状態"
+    "④ BandWidth・スクイーズ環境"
 )
 
-squeeze_state = latest[
-    "Squeeze_State"
-]
-
-direction_state = latest[
-    "BandWidth_Direction"
-]
-
-
 st.write(
-    "現在の分類：",
-    squeeze_state,
+    "Squeeze分類：",
+    latest[
+        "Squeeze_State"
+    ],
 )
 
 st.write(
     "BandWidth方向：",
-    direction_state,
+    latest[
+        "BandWidth_Direction"
+    ],
 )
 
 
-# ============================================================
-# ⑤ 正規化BandWidth
-# ============================================================
-
-st.subheader(
-    "⑤ 125営業日内でのBandWidth位置"
-)
-
-normalized = latest[
-    "Normalized_BandWidth"
-]
-
-
-if pd.isna(normalized):
-
-    st.info(
-        "125営業日の計算に必要な"
-        "データが不足しています。"
-    )
-
-else:
+if pd.notna(
+    latest[
+        "Normalized_BandWidth"
+    ]
+):
 
     st.metric(
         "正規化BandWidth",
-        f"{format_number(normalized * 100)}%",
+        (
+            f"{latest['Normalized_BandWidth'] * 100:.2f}%"
+        ),
     )
-
-    st.write(
-        "過去125営業日の最小BandWidth：",
-        f"{format_number(latest['BandWidth_Min_125'])}%",
-    )
-
-    st.write(
-        "過去125営業日の最大BandWidth：",
-        f"{format_number(latest['BandWidth_Max_125'])}%",
-    )
-
-
-st.caption(
-    "20％以下は研究用の仮分類です。"
-)
 
 
 # ============================================================
-# ⑥ BandWidth変化
+# ⑤ BB下限イベント
 # ============================================================
 
 st.subheader(
-    "⑥ BandWidth変化"
-)
-
-col1, col2, col3 = st.columns(3)
-
-
-with col1:
-
-    st.metric(
-        "前日比",
-        format_number(
-            latest[
-                "BandWidth_Change_1D"
-            ]
-        ),
-    )
-
-
-with col2:
-
-    st.metric(
-        "3営業日前比",
-        format_number(
-            latest[
-                "BandWidth_Change_3D"
-            ]
-        ),
-    )
-
-
-with col3:
-
-    st.metric(
-        "5営業日前比",
-        format_number(
-            latest[
-                "BandWidth_Change_5D"
-            ]
-        ),
-    )
-
-
-# ============================================================
-# ⑦ BB下限イベント
-# ============================================================
-
-st.subheader(
-    "⑦ BB下限イベント"
+    "⑤ BB下限イベント"
 )
 
 st.write(
@@ -1624,7 +1732,6 @@ st.write(
         "Lower_Band_Event"
     ],
 )
-
 
 col1, col2 = st.columns(2)
 
@@ -1672,131 +1779,114 @@ with col2:
 
 
 # ============================================================
-# ⑧ 下方向拡大
+# ⑥ 下落停止候補
 # ============================================================
 
 st.subheader(
-    "⑧ 低BandWidthからの下方向拡大"
+    "⑥ 下落停止候補"
 )
 
 st.write(
-    "現在の分類：",
-    latest[
-        "Downside_Expansion_State"
-    ],
-)
-
-
-# ============================================================
-# ⑨ 下落停止候補
-# ============================================================
-
-st.subheader(
-    "⑨ v1.3 下落停止候補"
-)
-
-st.write(
-    "現在の研究分類：",
-    latest[
-        "Decline_Stop_State"
-    ],
-)
-
-st.write(
-    "直近のBB下限タッチ：",
-    format_days_since_touch(
+    "安値切り上げ：",
+    yes_no(
         latest[
-            "Days_Since_BB_Lower_Touch"
+            "Higher_Low"
+        ]
+    ),
+)
+
+st.write(
+    "前日終値より上昇：",
+    yes_no(
+        latest[
+            "Close_Up"
+        ]
+    ),
+)
+
+st.write(
+    "下落停止候補：",
+    yes_no(
+        latest[
+            "Decline_Stop_Combo"
+        ]
+    ),
+)
+
+st.caption(
+    "現在の下落停止候補は"
+    "『安値切り上げ＋前日終値より上昇』です。"
+    "まだ有効性は未検証です。"
+)
+
+
+# ============================================================
+# ⑦ v1.4 反発開始候補
+# ============================================================
+
+st.subheader(
+    "⑦ v1.4 反発開始候補"
+)
+
+st.write(
+    "前日高値：",
+    f"${format_number(latest['Prev_High'])}",
+)
+
+st.write(
+    "現在終値：",
+    f"${format_number(latest['Close'])}",
+)
+
+st.write(
+    "終値が前日高値を上回る：",
+    yes_no(
+        latest[
+            "Close_Above_Prev_High"
         ]
     ),
 )
 
 
-col1, col2 = st.columns(2)
+if bool(
+    latest[
+        "Fixed_Window_Rebound_Start_Candidate"
+    ]
+):
 
-
-with col1:
-
-    st.write(
-        "前日安値を割らない：",
-        yes_no(
-            latest[
-                "No_Lower_Low"
-            ]
-        ),
+    st.info(
+        "現在はBB下限固定観察期間内で、"
+        "終値が前日の高値を上回っています。"
+        "v1.4の『反発開始候補』です。"
     )
 
-    st.write(
-        "安値切り上げ：",
-        yes_no(
-            latest[
-                "Higher_Low"
-            ]
-        ),
-    )
+else:
 
     st.write(
-        "前日終値より上昇：",
-        yes_no(
-            latest[
-                "Close_Up"
-            ]
-        ),
+        "現在はv1.4の"
+        "反発開始候補には該当していません。"
     )
 
 
-with col2:
-
-    st.write(
-        "陽線：",
-        yes_no(
-            latest[
-                "Bullish_Candle"
-            ]
-        ),
-    )
-
-    st.write(
-        "当日のBB内復帰：",
-        yes_no(
-            latest[
-                "BB_Lower_Reclaim"
-            ]
-        ),
-    )
-
-    st.write(
-        "安値切上＋終値上昇：",
-        yes_no(
-            latest[
-                "Decline_Stop_Combo"
-            ]
-        ),
-    )
+st.caption(
+    "『前日高値を終値で上回る』は研究候補です。"
+    "買いシグナルとして正式採用したものではありません。"
+)
 
 
 # ============================================================
-# ⑩ 固定イベント状態
+# ⑧ 固定イベント状態
 # ============================================================
 
 st.subheader(
-    "⑩ v1.3.3 固定観察イベント"
+    "⑧ 固定観察イベント"
 )
 
 st.write(
-    "現在のイベント番号：",
+    "イベント番号：",
     format_event_id(
         latest[
             "BB_Event_ID"
-        ]
-    ),
-)
-
-st.write(
-    "新しいイベント開始日：",
-    yes_no(
-        latest[
-            "New_BB_Lower_Event"
         ]
     ),
 )
@@ -1819,7 +1909,10 @@ if pd.notna(
 
     st.write(
         "イベント開始から：",
-        f"{int(latest['Days_From_BB_Event_Start'])}営業日目",
+        (
+            f"{int(latest['Days_From_BB_Event_Start'])}"
+            "営業日目"
+        ),
     )
 
 
@@ -1830,21 +1923,12 @@ if bool(
 ):
 
     st.write(
-        "イベント観察状態：",
+        "観察状態：",
         latest[
             "Event_Observation_Status"
         ],
     )
 
-
-st.write(
-    "固定期間内の下落停止候補：",
-    yes_no(
-        latest[
-            "Fixed_Window_Decline_Stop_Candidate"
-        ]
-    ),
-)
 
 st.write(
     "イベント最初の下落停止確認：",
@@ -1855,15 +1939,24 @@ st.write(
     ),
 )
 
+st.write(
+    "イベント最初の反発開始確認：",
+    yes_no(
+        latest[
+            "First_Rebound_Start_In_Event"
+        ]
+    ),
+)
+
 
 # ============================================================
-# ⑪ 株価チャート
+# ⑨ 株価チャート
 # ============================================================
 
 st.divider()
 
 st.subheader(
-    "⑪ 株価とボリンジャーバンド"
+    "⑨ 株価とボリンジャーバンド"
 )
 
 max_chart_days = min(
@@ -1927,11 +2020,11 @@ st.line_chart(
 
 
 # ============================================================
-# ⑫ BandWidth
+# ⑩ BandWidthチャート
 # ============================================================
 
 st.subheader(
-    "⑫ BandWidth"
+    "⑩ BandWidth"
 )
 
 bandwidth_chart = (
@@ -1949,38 +2042,11 @@ st.line_chart(
 
 
 # ============================================================
-# ⑬ 正規化BandWidth
+# ⑪ 最新30営業日
 # ============================================================
 
 st.subheader(
-    "⑬ 正規化BandWidth"
-)
-
-normalized_chart = (
-    valid_df[
-        ["Normalized_BandWidth"]
-    ]
-    .tail(chart_days)
-    .copy()
-    * 100
-)
-
-normalized_chart.columns = [
-    "正規化BandWidth %",
-]
-
-st.line_chart(
-    normalized_chart,
-    use_container_width=True,
-)
-
-
-# ============================================================
-# ⑭ 最新30営業日
-# ============================================================
-
-st.subheader(
-    "⑭ 最新30営業日の状態確認"
+    "⑪ 最新30営業日の状態"
 )
 
 display_df = (
@@ -1988,42 +2054,63 @@ display_df = (
         [
             "Close",
             "Low",
+            "Prev_High",
             "BB_Lower",
-            "BandWidth",
-            "Normalized_BandWidth",
-            "Lower_Band_Event",
             "Higher_Low",
             "Close_Up",
-            "Bullish_Candle",
+            "Decline_Stop_Combo",
+            "Close_Above_Prev_High",
             "BB_Event_ID",
             "Days_From_BB_Event_Start",
             "Event_Observation_Status",
             "First_Decline_Stop_In_Event",
+            "First_Rebound_Start_In_Event",
         ]
     ]
     .tail(30)
     .copy()
 )
 
-display_df[
-    "Normalized_BandWidth"
-] *= 100
-
 display_df = display_df.rename(
     columns={
-        "Close": "終値",
-        "Low": "安値",
-        "BB_Lower": "BB下限",
-        "BandWidth": "BandWidth %",
-        "Normalized_BandWidth": "正規化BW %",
-        "Lower_Band_Event": "BB下限状態",
-        "Higher_Low": "安値切上",
-        "Close_Up": "終値上昇",
-        "Bullish_Candle": "陽線",
-        "BB_Event_ID": "イベントID",
-        "Days_From_BB_Event_Start": "開始から営業日",
-        "Event_Observation_Status": "観察状態",
-        "First_Decline_Stop_In_Event": "最初確認",
+        "Close":
+            "終値",
+
+        "Low":
+            "安値",
+
+        "Prev_High":
+            "前日高値",
+
+        "BB_Lower":
+            "BB下限",
+
+        "Higher_Low":
+            "安値切上",
+
+        "Close_Up":
+            "終値上昇",
+
+        "Decline_Stop_Combo":
+            "下落停止条件",
+
+        "Close_Above_Prev_High":
+            "前日高値超え",
+
+        "BB_Event_ID":
+            "イベントID",
+
+        "Days_From_BB_Event_Start":
+            "開始から営業日",
+
+        "Event_Observation_Status":
+            "観察状態",
+
+        "First_Decline_Stop_In_Event":
+            "最初の下落停止",
+
+        "First_Rebound_Start_In_Event":
+            "最初の反発開始",
     }
 )
 
@@ -2034,157 +2121,9 @@ st.dataframe(
 
 
 # ============================================================
-# ⑮ 基本分類件数
+# ⑫ 観察完了イベント準備
 # ============================================================
 
-st.subheader(
-    "⑮ 基本分類件数"
-)
-
-research_df = valid_df.dropna(
-    subset=[
-        "Normalized_BandWidth",
-    ]
-).copy()
-
-
-if research_df.empty:
-
-    st.info(
-        "分類集計に必要なデータがありません。"
-    )
-
-else:
-
-    total_count = len(
-        research_df
-    )
-
-    official_count = int(
-        research_df[
-            "Official_Squeeze"
-        ].sum()
-    )
-
-    low_bw_count = int(
-        research_df[
-            "Low_BandWidth_Zone"
-        ].sum()
-    )
-
-    touch_count = int(
-        research_df[
-            "BB_Lower_Touch"
-        ].sum()
-    )
-
-    reclaim_count = int(
-        research_df[
-            "BB_Lower_Reclaim"
-        ].sum()
-    )
-
-    close_below_count = int(
-        research_df[
-            "BB_Lower_Close_Below"
-        ].sum()
-    )
-
-
-    col1, col2, col3 = st.columns(3)
-
-    with col1:
-        st.metric(
-            "判定可能日",
-            f"{total_count}日",
-        )
-
-    with col2:
-        st.metric(
-            "125日最低BW基準日",
-            f"{official_count}日",
-        )
-
-    with col3:
-        st.metric(
-            "研究用 低BWゾーン",
-            f"{low_bw_count}日",
-        )
-
-
-    col4, col5, col6 = st.columns(3)
-
-    with col4:
-        st.metric(
-            "BB下限タッチ",
-            f"{touch_count}日",
-        )
-
-    with col5:
-        st.metric(
-            "下抜け後BB内復帰",
-            f"{reclaim_count}日",
-        )
-
-    with col6:
-        st.metric(
-            "BB下限より下で終値",
-            f"{close_below_count}日",
-        )
-
-
-# ============================================================
-# ⑯ v1.3 従来集計
-# ============================================================
-
-st.subheader(
-    "⑯ v1.3 下落停止条件の発生件数"
-)
-
-if not research_df.empty:
-
-    st.write(
-        "前日安値を割らない：",
-        f"{int(research_df['No_Lower_Low'].sum())}日",
-    )
-
-    st.write(
-        "安値切り上げ：",
-        f"{int(research_df['Higher_Low'].sum())}日",
-    )
-
-    st.write(
-        "前日終値より上昇：",
-        f"{int(research_df['Close_Up'].sum())}日",
-    )
-
-    st.write(
-        "陽線：",
-        f"{int(research_df['Bullish_Candle'].sum())}日",
-    )
-
-    st.write(
-        "安値切上＋終値上昇：",
-        f"{int(research_df['Decline_Stop_Combo'].sum())}日",
-    )
-
-    st.write(
-        "v1.3 下落停止候補日：",
-        f"{int(research_df['Decline_Stop_Candidate'].sum())}日",
-    )
-
-
-# ============================================================
-# ⑰ v1.3.3
-# 観察完了・未完了イベント集計
-# ============================================================
-
-st.subheader(
-    "⑰ v1.3.3 観察完了・未完了イベント集計"
-)
-
-
-# イベント開始行
 event_start_df = valid_df[
     valid_df[
         "New_BB_Lower_Event"
@@ -2192,13 +2131,6 @@ event_start_df = valid_df[
 ].copy()
 
 
-# 全イベント
-all_event_count = len(
-    event_start_df
-)
-
-
-# 観察完了イベント
 completed_event_start_df = (
     event_start_df[
         event_start_df[
@@ -2209,7 +2141,6 @@ completed_event_start_df = (
 )
 
 
-# 観察未完了イベント
 incomplete_event_start_df = (
     event_start_df[
         ~event_start_df[
@@ -2220,16 +2151,6 @@ incomplete_event_start_df = (
 )
 
 
-completed_event_count = len(
-    completed_event_start_df
-)
-
-incomplete_event_count = len(
-    incomplete_event_start_df
-)
-
-
-# 観察完了イベントID
 completed_event_ids = set(
     completed_event_start_df[
         "BB_Event_ID"
@@ -2240,51 +2161,93 @@ completed_event_ids = set(
 )
 
 
-# 完了イベントの最初の下落停止確認
-completed_first_stop_df = (
+completed_mask = (
     valid_df[
-        valid_df[
-            "First_Decline_Stop_In_Event"
-        ]
-        & valid_df[
-            "BB_Event_ID"
-        ]
-        .fillna(-1)
-        .astype(int)
-        .isin(
-            completed_event_ids
-        )
+        "BB_Event_ID"
+    ]
+    .fillna(-1)
+    .astype(int)
+    .isin(
+        completed_event_ids
+    )
+)
+
+
+completed_window_df = (
+    valid_df[
+        completed_mask
     ]
     .copy()
 )
 
 
-completed_confirmed_count = len(
+completed_first_stop_df = (
+    valid_df[
+        completed_mask
+        & valid_df[
+            "First_Decline_Stop_In_Event"
+        ]
+    ]
+    .copy()
+)
+
+
+completed_first_rebound_df = (
+    valid_df[
+        completed_mask
+        & valid_df[
+            "First_Rebound_Start_In_Event"
+        ]
+    ]
+    .copy()
+)
+
+
+# ============================================================
+# ⑫ v1.3.3 基準集計
+# ============================================================
+
+st.subheader(
+    "⑫ v1.3.3 基準・下落停止集計"
+)
+
+all_event_count = len(
+    event_start_df
+)
+
+completed_event_count = len(
+    completed_event_start_df
+)
+
+incomplete_event_count = len(
+    incomplete_event_start_df
+)
+
+stop_count = len(
     completed_first_stop_df
 )
 
-completed_unconfirmed_count = max(
+stop_no_count = max(
     0,
     completed_event_count
-    - completed_confirmed_count,
+    - stop_count,
 )
 
 
 if completed_event_count > 0:
 
-    confirmation_rate = (
-        completed_confirmed_count
+    stop_rate = (
+        stop_count
         / completed_event_count
         * 100
     )
 
 else:
 
-    confirmation_rate = np.nan
+    stop_rate = np.nan
 
 
 col1, col2, col3 = st.columns(3)
-
 
 with col1:
 
@@ -2293,14 +2256,12 @@ with col1:
         f"{all_event_count}回",
     )
 
-
 with col2:
 
     st.metric(
         "観察完了イベント",
         f"{completed_event_count}回",
     )
-
 
 with col3:
 
@@ -2312,127 +2273,512 @@ with col3:
 
 col4, col5, col6 = st.columns(3)
 
-
 with col4:
 
     st.metric(
-        "完了イベント・下落停止確認",
-        f"{completed_confirmed_count}回",
+        "下落停止確認",
+        f"{stop_count}回",
     )
-
 
 with col5:
 
     st.metric(
-        "完了イベント・下落停止未確認",
-        f"{completed_unconfirmed_count}回",
+        "下落停止未確認",
+        f"{stop_no_count}回",
     )
-
 
 with col6:
 
-    if pd.isna(
-        confirmation_rate
-    ):
-
-        rate_text = "計算不可"
-
-    else:
-
-        rate_text = (
-            f"{confirmation_rate:.1f}%"
-        )
-
     st.metric(
         "下落停止確認率",
-        rate_text,
+        (
+            "計算不可"
+            if pd.isna(stop_rate)
+            else f"{stop_rate:.1f}%"
+        ),
     )
 
 
-st.caption(
-    "確認率は利益率・勝率ではありません。"
-    "BB下限タッチから0～3営業日目までに、"
-    "研究中の『安値切り上げ＋前日終値より上昇』"
-    "が確認された割合です。"
-)
-
-
 # ============================================================
-# ⑱ 完了イベントの候補日重複
+# ⑬ v1.4 反発開始集計
 # ============================================================
 
 st.subheader(
-    "⑱ 観察完了イベントの候補日集計"
+    "⑬ v1.4 反発開始候補のイベント集計"
+)
+
+rebound_count = len(
+    completed_first_rebound_df
+)
+
+rebound_no_count = max(
+    0,
+    completed_event_count
+    - rebound_count,
 )
 
 
-completed_window_df = (
-    valid_df[
-        valid_df[
-            "BB_Event_ID"
-        ]
-        .fillna(-1)
-        .astype(int)
-        .isin(
-            completed_event_ids
-        )
-    ]
-    .copy()
-)
+if completed_event_count > 0:
+
+    rebound_rate = (
+        rebound_count
+        / completed_event_count
+        * 100
+    )
+
+else:
+
+    rebound_rate = np.nan
 
 
-completed_candidate_count = int(
+rebound_candidate_days = int(
     completed_window_df[
-        "Fixed_Window_Decline_Stop_Candidate"
+        "Fixed_Window_Rebound_Start_Candidate"
     ].sum()
 )
 
 
-completed_duplicate_count = max(
+rebound_duplicate_days = max(
     0,
-    completed_candidate_count
-    - completed_confirmed_count,
+    rebound_candidate_days
+    - rebound_count,
 )
 
 
-col1, col2 = st.columns(2)
-
+col1, col2, col3 = st.columns(3)
 
 with col1:
 
     st.metric(
-        "完了イベント内の候補日数",
-        f"{completed_candidate_count}日",
+        "反発開始確認イベント",
+        f"{rebound_count}回",
     )
-
 
 with col2:
 
     st.metric(
-        "イベント内の重複候補日",
-        f"{completed_duplicate_count}日",
+        "反発開始未確認イベント",
+        f"{rebound_no_count}回",
+    )
+
+with col3:
+
+    st.metric(
+        "反発開始確認率",
+        (
+            "計算不可"
+            if pd.isna(rebound_rate)
+            else f"{rebound_rate:.1f}%"
+        ),
     )
 
 
+col4, col5 = st.columns(2)
+
+with col4:
+
+    st.metric(
+        "反発開始候補日数",
+        f"{rebound_candidate_days}日",
+    )
+
+with col5:
+
+    st.metric(
+        "イベント内の重複候補日",
+        f"{rebound_duplicate_days}日",
+    )
+
+
+st.caption(
+    "反発開始確認率は勝率ではありません。"
+    "BB下限イベントの0～3営業日目に"
+    "終値が前日高値を上回ったイベントの割合です。"
+)
+
+
 # ============================================================
-# ⑲ 完了イベントの確認タイミング
+# ⑭ 下落停止 vs 反発開始
 # ============================================================
 
 st.subheader(
-    "⑲ 下落停止を何営業日目に確認したか"
+    "⑭ 下落停止候補 vs 反発開始候補"
+)
+
+
+comparison_rows = []
+
+
+for event_id in sorted(
+    completed_event_ids
+):
+
+    event_rows = completed_window_df[
+        completed_window_df[
+            "BB_Event_ID"
+        ]
+        == event_id
+    ]
+
+    stop_rows = event_rows[
+        event_rows[
+            "First_Decline_Stop_In_Event"
+        ]
+    ]
+
+    rebound_rows = event_rows[
+        event_rows[
+            "First_Rebound_Start_In_Event"
+        ]
+    ]
+
+    has_stop = not stop_rows.empty
+    has_rebound = not rebound_rows.empty
+
+    if has_stop:
+
+        stop_day = int(
+            stop_rows.iloc[0][
+                "Days_From_BB_Event_Start"
+            ]
+        )
+
+    else:
+
+        stop_day = np.nan
+
+    if has_rebound:
+
+        rebound_day = int(
+            rebound_rows.iloc[0][
+                "Days_From_BB_Event_Start"
+            ]
+        )
+
+    else:
+
+        rebound_day = np.nan
+
+    if (
+        has_stop
+        and has_rebound
+    ):
+
+        if rebound_day > stop_day:
+            relation = "反発開始が後"
+
+        elif rebound_day == stop_day:
+            relation = "同日"
+
+        else:
+            relation = "反発開始が先"
+
+    elif has_stop:
+        relation = "下落停止のみ"
+
+    elif has_rebound:
+        relation = "反発開始のみ"
+
+    else:
+        relation = "両方なし"
+
+    comparison_rows.append(
+        {
+            "イベントID": event_id,
+            "下落停止確認": has_stop,
+            "下落停止営業日": stop_day,
+            "反発開始確認": has_rebound,
+            "反発開始営業日": rebound_day,
+            "関係": relation,
+        }
+    )
+
+
+comparison_df = pd.DataFrame(
+    comparison_rows
+)
+
+
+if comparison_df.empty:
+
+    st.info(
+        "比較できる完了イベントがありません。"
+    )
+
+else:
+
+    both_count = int(
+        (
+            comparison_df[
+                "下落停止確認"
+            ]
+            & comparison_df[
+                "反発開始確認"
+            ]
+        ).sum()
+    )
+
+    stop_only_count = int(
+        (
+            comparison_df[
+                "下落停止確認"
+            ]
+            & ~comparison_df[
+                "反発開始確認"
+            ]
+        ).sum()
+    )
+
+    rebound_only_count = int(
+        (
+            ~comparison_df[
+                "下落停止確認"
+            ]
+            & comparison_df[
+                "反発開始確認"
+            ]
+        ).sum()
+    )
+
+    neither_count = int(
+        (
+            ~comparison_df[
+                "下落停止確認"
+            ]
+            & ~comparison_df[
+                "反発開始確認"
+            ]
+        ).sum()
+    )
+
+
+    col1, col2, col3, col4 = (
+        st.columns(4)
+    )
+
+
+    with col1:
+
+        st.metric(
+            "両方確認",
+            f"{both_count}回",
+        )
+
+
+    with col2:
+
+        st.metric(
+            "下落停止のみ",
+            f"{stop_only_count}回",
+        )
+
+
+    with col3:
+
+        st.metric(
+            "反発開始のみ",
+            f"{rebound_only_count}回",
+        )
+
+
+    with col4:
+
+        st.metric(
+            "両方なし",
+            f"{neither_count}回",
+        )
+
+
+# ============================================================
+# ⑮ 反発開始のタイミング
+# ============================================================
+
+st.subheader(
+    "⑮ 反発開始を何営業日目に確認したか"
+)
+
+
+if completed_first_rebound_df.empty:
+
+    st.info(
+        "反発開始確認イベントがありません。"
+    )
+
+else:
+
+    rebound_day_0 = int(
+        (
+            completed_first_rebound_df[
+                "Days_From_BB_Event_Start"
+            ]
+            == 0
+        ).sum()
+    )
+
+    rebound_day_1 = int(
+        (
+            completed_first_rebound_df[
+                "Days_From_BB_Event_Start"
+            ]
+            == 1
+        ).sum()
+    )
+
+    rebound_day_2 = int(
+        (
+            completed_first_rebound_df[
+                "Days_From_BB_Event_Start"
+            ]
+            == 2
+        ).sum()
+    )
+
+    rebound_day_3 = int(
+        (
+            completed_first_rebound_df[
+                "Days_From_BB_Event_Start"
+            ]
+            == 3
+        ).sum()
+    )
+
+
+    col1, col2, col3, col4 = (
+        st.columns(4)
+    )
+
+
+    with col1:
+
+        st.metric(
+            "0日目",
+            f"{rebound_day_0}回",
+        )
+
+
+    with col2:
+
+        st.metric(
+            "1営業日目",
+            f"{rebound_day_1}回",
+        )
+
+
+    with col3:
+
+        st.metric(
+            "2営業日目",
+            f"{rebound_day_2}回",
+        )
+
+
+    with col4:
+
+        st.metric(
+            "3営業日目",
+            f"{rebound_day_3}回",
+        )
+
+
+# ============================================================
+# ⑯ 両方確認された場合の順序
+# ============================================================
+
+st.subheader(
+    "⑯ 下落停止と反発開始の確認順序"
+)
+
+
+if comparison_df.empty:
+
+    st.info(
+        "比較データがありません。"
+    )
+
+else:
+
+    rebound_after_count = int(
+        (
+            comparison_df[
+                "関係"
+            ]
+            == "反発開始が後"
+        ).sum()
+    )
+
+    same_day_count = int(
+        (
+            comparison_df[
+                "関係"
+            ]
+            == "同日"
+        ).sum()
+    )
+
+    rebound_before_count = int(
+        (
+            comparison_df[
+                "関係"
+            ]
+            == "反発開始が先"
+        ).sum()
+    )
+
+
+    col1, col2, col3 = (
+        st.columns(3)
+    )
+
+
+    with col1:
+
+        st.metric(
+            "反発開始が後",
+            f"{rebound_after_count}回",
+        )
+
+
+    with col2:
+
+        st.metric(
+            "同日",
+            f"{same_day_count}回",
+        )
+
+
+    with col3:
+
+        st.metric(
+            "反発開始が先",
+            f"{rebound_before_count}回",
+        )
+
+
+st.caption(
+    "『反発開始が先』もエラーではありません。"
+    "現在の2条件は独立した研究条件なので、"
+    "前日高値超えが先に成立するケースも記録します。"
+)
+
+
+# ============================================================
+# ⑰ 下落停止確認タイミング
+# ============================================================
+
+st.subheader(
+    "⑰ 下落停止を何営業日目に確認したか"
 )
 
 
 if completed_first_stop_df.empty:
 
     st.info(
-        "観察完了イベント内に"
-        "下落停止確認がありません。"
+        "下落停止確認イベントがありません。"
     )
 
 else:
 
-    day_0_count = int(
+    stop_day_0 = int(
         (
             completed_first_stop_df[
                 "Days_From_BB_Event_Start"
@@ -2441,7 +2787,7 @@ else:
         ).sum()
     )
 
-    day_1_count = int(
+    stop_day_1 = int(
         (
             completed_first_stop_df[
                 "Days_From_BB_Event_Start"
@@ -2450,7 +2796,7 @@ else:
         ).sum()
     )
 
-    day_2_count = int(
+    stop_day_2 = int(
         (
             completed_first_stop_df[
                 "Days_From_BB_Event_Start"
@@ -2459,7 +2805,7 @@ else:
         ).sum()
     )
 
-    day_3_count = int(
+    stop_day_3 = int(
         (
             completed_first_stop_df[
                 "Days_From_BB_Event_Start"
@@ -2469,264 +2815,53 @@ else:
     )
 
 
-    col1, col2, col3, col4 = st.columns(4)
+    col1, col2, col3, col4 = (
+        st.columns(4)
+    )
 
 
     with col1:
+
         st.metric(
             "0日目",
-            f"{day_0_count}回",
+            f"{stop_day_0}回",
         )
 
+
     with col2:
+
         st.metric(
             "1営業日目",
-            f"{day_1_count}回",
+            f"{stop_day_1}回",
         )
 
+
     with col3:
+
         st.metric(
             "2営業日目",
-            f"{day_2_count}回",
+            f"{stop_day_2}回",
         )
+
 
     with col4:
+
         st.metric(
             "3営業日目",
-            f"{day_3_count}回",
+            f"{stop_day_3}回",
         )
 
 
 # ============================================================
-# ⑳ 完了イベント確認時のBB状態
+# ⑱ 反発開始確認時のBB状態
 # ============================================================
 
 st.subheader(
-    "⑳ 下落停止確認時のBB状態"
+    "⑱ 反発開始確認時のBB状態"
 )
 
 
-if completed_first_stop_df.empty:
-
-    st.info(
-        "集計対象がありません。"
-    )
-
-else:
-
-    below_count = int(
-        (
-            completed_first_stop_df[
-                "First_Stop_BB_State"
-            ]
-            == "BB下限より下で終値"
-        ).sum()
-    )
-
-    reclaim_count = int(
-        (
-            completed_first_stop_df[
-                "First_Stop_BB_State"
-            ]
-            == "下抜け後BB内復帰"
-        ).sum()
-    )
-
-    inside_count = int(
-        (
-            completed_first_stop_df[
-                "First_Stop_BB_State"
-            ]
-            == "終値はBB内"
-        ).sum()
-    )
-
-
-    col1, col2, col3 = st.columns(3)
-
-
-    with col1:
-        st.metric(
-            "BB下限より下で終値",
-            f"{below_count}回",
-        )
-
-    with col2:
-        st.metric(
-            "下抜け後BB内復帰",
-            f"{reclaim_count}回",
-        )
-
-    with col3:
-        st.metric(
-            "終値はBB内",
-            f"{inside_count}回",
-        )
-
-
-# ============================================================
-# ㉑ 観察完了イベント一覧
-# ============================================================
-
-st.subheader(
-    "㉑ 観察完了BB下限イベント一覧"
-)
-
-
-if completed_event_start_df.empty:
-
-    st.info(
-        "観察完了イベントがありません。"
-    )
-
-else:
-
-    completed_display = (
-        completed_event_start_df[
-            [
-                "BB_Event_ID",
-                "Close",
-                "Low",
-                "BB_Lower",
-                "BandWidth",
-                "Normalized_BandWidth",
-                "Squeeze_State",
-                "Event_End_Date",
-                "Event_Has_Decline_Stop",
-            ]
-        ]
-        .tail(50)
-        .copy()
-    )
-
-    completed_display[
-        "Normalized_BandWidth"
-    ] *= 100
-
-    completed_display = (
-        completed_display.rename(
-            columns={
-                "BB_Event_ID":
-                    "イベントID",
-
-                "Close":
-                    "開始日終値",
-
-                "Low":
-                    "開始日安値",
-
-                "BB_Lower":
-                    "開始日BB下限",
-
-                "BandWidth":
-                    "BandWidth %",
-
-                "Normalized_BandWidth":
-                    "正規化BW %",
-
-                "Squeeze_State":
-                    "BW環境",
-
-                "Event_End_Date":
-                    "観察終了日",
-
-                "Event_Has_Decline_Stop":
-                    "下落停止確認",
-            }
-        )
-    )
-
-    st.dataframe(
-        completed_display.round(2),
-        use_container_width=True,
-    )
-
-
-# ============================================================
-# ㉒ 観察未完了イベント一覧
-# ============================================================
-
-st.subheader(
-    "㉒ 観察未完了イベント一覧"
-)
-
-
-if incomplete_event_start_df.empty:
-
-    st.success(
-        "現在、観察未完了イベントはありません。"
-    )
-
-else:
-
-    incomplete_display = (
-        incomplete_event_start_df[
-            [
-                "BB_Event_ID",
-                "Close",
-                "Low",
-                "BB_Lower",
-                "BandWidth",
-                "Normalized_BandWidth",
-                "Squeeze_State",
-            ]
-        ]
-        .copy()
-    )
-
-    incomplete_display[
-        "Normalized_BandWidth"
-    ] *= 100
-
-    incomplete_display = (
-        incomplete_display.rename(
-            columns={
-                "BB_Event_ID":
-                    "イベントID",
-
-                "Close":
-                    "開始日終値",
-
-                "Low":
-                    "開始日安値",
-
-                "BB_Lower":
-                    "開始日BB下限",
-
-                "BandWidth":
-                    "BandWidth %",
-
-                "Normalized_BandWidth":
-                    "正規化BW %",
-
-                "Squeeze_State":
-                    "BW環境",
-            }
-        )
-    )
-
-    st.dataframe(
-        incomplete_display.round(2),
-        use_container_width=True,
-    )
-
-    st.warning(
-        "このイベントは0～3営業日目を"
-        "最後まで観察できていないため、"
-        "下落停止確認率の母数から除外しています。"
-    )
-
-
-# ============================================================
-# ㉓ 完了イベント最初の下落停止確認一覧
-# ============================================================
-
-st.subheader(
-    "㉓ 観察完了イベント・最初の下落停止確認一覧"
-)
-
-
-if completed_first_stop_df.empty:
+if completed_first_rebound_df.empty:
 
     st.info(
         "対象データがありません。"
@@ -2734,103 +2869,213 @@ if completed_first_stop_df.empty:
 
 else:
 
-    first_display = (
-        completed_first_stop_df[
-            [
-                "BB_Event_ID",
-                "BB_Event_Start_Date",
-                "Days_From_BB_Event_Start",
-                "Open",
-                "Close",
-                "Low",
-                "BB_Lower",
-                "Higher_Low",
-                "Close_Up",
-                "Bullish_Candle",
-                "BB_Lower_Reclaim",
-                "BB_Lower_Close_Below",
-                "First_Stop_BB_State",
-                "BandWidth",
-                "Normalized_BandWidth",
-                "Squeeze_State",
+    rebound_below_count = int(
+        (
+            completed_first_rebound_df[
+                "First_Rebound_BB_State"
             ]
-        ]
-        .tail(50)
-        .copy()
+            == "BB下限より下で終値"
+        ).sum()
     )
 
-    first_display[
-        "Normalized_BandWidth"
-    ] *= 100
-
-    first_display = first_display.rename(
-        columns={
-            "BB_Event_ID":
-                "イベントID",
-
-            "BB_Event_Start_Date":
-                "イベント開始日",
-
-            "Days_From_BB_Event_Start":
-                "確認営業日",
-
-            "Open":
-                "始値",
-
-            "Close":
-                "終値",
-
-            "Low":
-                "安値",
-
-            "BB_Lower":
-                "BB下限",
-
-            "Higher_Low":
-                "安値切上",
-
-            "Close_Up":
-                "終値上昇",
-
-            "Bullish_Candle":
-                "陽線",
-
-            "BB_Lower_Reclaim":
-                "BB内復帰",
-
-            "BB_Lower_Close_Below":
-                "BB下終値",
-
-            "First_Stop_BB_State":
-                "確認時BB状態",
-
-            "BandWidth":
-                "BandWidth %",
-
-            "Normalized_BandWidth":
-                "正規化BW %",
-
-            "Squeeze_State":
-                "BW環境",
-        }
+    rebound_reclaim_count = int(
+        (
+            completed_first_rebound_df[
+                "First_Rebound_BB_State"
+            ]
+            == "下抜け後BB内復帰"
+        ).sum()
     )
+
+    rebound_inside_count = int(
+        (
+            completed_first_rebound_df[
+                "First_Rebound_BB_State"
+            ]
+            == "終値はBB内"
+        ).sum()
+    )
+
+
+    col1, col2, col3 = (
+        st.columns(3)
+    )
+
+
+    with col1:
+
+        st.metric(
+            "BB下限より下で終値",
+            f"{rebound_below_count}回",
+        )
+
+
+    with col2:
+
+        st.metric(
+            "下抜け後BB内復帰",
+            f"{rebound_reclaim_count}回",
+        )
+
+
+    with col3:
+
+        st.metric(
+            "終値はBB内",
+            f"{rebound_inside_count}回",
+        )
+
+
+# ============================================================
+# ⑲ イベント比較一覧
+# ============================================================
+
+st.subheader(
+    "⑲ イベントごとの下落停止・反発開始比較"
+)
+
+
+if comparison_df.empty:
+
+    st.info(
+        "比較データがありません。"
+    )
+
+else:
 
     st.dataframe(
-        first_display.round(2),
+        comparison_df.tail(60),
         use_container_width=True,
     )
 
 
 # ============================================================
-# ㉔ 完了イベントの下落停止未確認一覧
+# ⑳ 反発開始確認日の詳細
 # ============================================================
 
 st.subheader(
-    "㉔ 観察完了・下落停止未確認イベント一覧"
+    "⑳ イベント最初の反発開始確認一覧"
 )
 
 
-confirmed_event_ids = set(
+if completed_first_rebound_df.empty:
+
+    st.info(
+        "反発開始確認イベントがありません。"
+    )
+
+else:
+
+    rebound_display = (
+        completed_first_rebound_df[
+            [
+                "BB_Event_ID",
+                "BB_Event_Start_Date",
+                "Days_From_BB_Event_Start",
+                "Open",
+                "High",
+                "Low",
+                "Close",
+                "Prev_High",
+                "BB_Lower",
+                "Close_Above_Prev_High",
+                "Higher_Low",
+                "Close_Up",
+                "Decline_Stop_Combo",
+                "BB_Lower_Reclaim",
+                "First_Rebound_BB_State",
+                "BandWidth",
+                "Normalized_BandWidth",
+                "Squeeze_State",
+            ]
+        ]
+        .tail(60)
+        .copy()
+    )
+
+
+    rebound_display[
+        "Normalized_BandWidth"
+    ] *= 100
+
+
+    rebound_display = (
+        rebound_display.rename(
+            columns={
+                "BB_Event_ID":
+                    "イベントID",
+
+                "BB_Event_Start_Date":
+                    "イベント開始日",
+
+                "Days_From_BB_Event_Start":
+                    "確認営業日",
+
+                "Open":
+                    "始値",
+
+                "High":
+                    "高値",
+
+                "Low":
+                    "安値",
+
+                "Close":
+                    "終値",
+
+                "Prev_High":
+                    "前日高値",
+
+                "BB_Lower":
+                    "BB下限",
+
+                "Close_Above_Prev_High":
+                    "前日高値超え",
+
+                "Higher_Low":
+                    "安値切上",
+
+                "Close_Up":
+                    "終値上昇",
+
+                "Decline_Stop_Combo":
+                    "下落停止条件",
+
+                "BB_Lower_Reclaim":
+                    "BB内復帰",
+
+                "First_Rebound_BB_State":
+                    "反発確認時BB状態",
+
+                "BandWidth":
+                    "BandWidth %",
+
+                "Normalized_BandWidth":
+                    "正規化BW %",
+
+                "Squeeze_State":
+                    "BW環境",
+            }
+        )
+    )
+
+
+    st.dataframe(
+        rebound_display.round(2),
+        use_container_width=True,
+    )
+
+
+# ============================================================
+# ㉑ 観察完了・下落停止未確認
+# ============================================================
+
+st.subheader(
+    "㉑ 観察完了・下落停止未確認イベント"
+)
+
+
+stop_event_ids = set(
     completed_first_stop_df[
         "BB_Event_ID"
     ]
@@ -2840,31 +3085,89 @@ confirmed_event_ids = set(
 )
 
 
-completed_unconfirmed_df = (
+stop_unconfirmed_df = (
     completed_event_start_df[
         ~completed_event_start_df[
             "BB_Event_ID"
         ]
         .astype(int)
         .isin(
-            confirmed_event_ids
+            stop_event_ids
         )
     ]
     .copy()
 )
 
 
-if completed_unconfirmed_df.empty:
+if stop_unconfirmed_df.empty:
 
     st.info(
-        "観察完了イベントの中に"
         "下落停止未確認イベントはありません。"
     )
 
 else:
 
-    unconfirmed_display = (
-        completed_unconfirmed_df[
+    st.dataframe(
+        stop_unconfirmed_df[
+            [
+                "BB_Event_ID",
+                "Close",
+                "Low",
+                "BB_Lower",
+                "BandWidth",
+                "Normalized_BandWidth",
+                "Squeeze_State",
+                "Downside_Expansion_State",
+            ]
+        ]
+        .round(2),
+        use_container_width=True,
+    )
+
+
+# ============================================================
+# ㉒ 観察完了・反発開始未確認
+# ============================================================
+
+st.subheader(
+    "㉒ 観察完了・反発開始未確認イベント"
+)
+
+
+rebound_event_ids = set(
+    completed_first_rebound_df[
+        "BB_Event_ID"
+    ]
+    .dropna()
+    .astype(int)
+    .tolist()
+)
+
+
+rebound_unconfirmed_df = (
+    completed_event_start_df[
+        ~completed_event_start_df[
+            "BB_Event_ID"
+        ]
+        .astype(int)
+        .isin(
+            rebound_event_ids
+        )
+    ]
+    .copy()
+)
+
+
+if rebound_unconfirmed_df.empty:
+
+    st.info(
+        "反発開始未確認イベントはありません。"
+    )
+
+else:
+
+    rebound_unconfirmed_display = (
+        rebound_unconfirmed_df[
             [
                 "BB_Event_ID",
                 "Close",
@@ -2876,18 +3179,17 @@ else:
                 "Normalized_BandWidth",
                 "Squeeze_State",
                 "Downside_Expansion_State",
-                "Event_End_Date",
             ]
         ]
         .copy()
     )
 
-    unconfirmed_display[
+    rebound_unconfirmed_display[
         "Normalized_BandWidth"
     ] *= 100
 
-    unconfirmed_display = (
-        unconfirmed_display.rename(
+    rebound_unconfirmed_display = (
+        rebound_unconfirmed_display.rename(
             columns={
                 "BB_Event_ID":
                     "イベントID",
@@ -2918,27 +3220,24 @@ else:
 
                 "Downside_Expansion_State":
                     "下方向拡大状態",
-
-                "Event_End_Date":
-                    "観察終了日",
             }
         )
     )
 
     st.dataframe(
-        unconfirmed_display.round(2),
+        rebound_unconfirmed_display.round(2),
         use_container_width=True,
     )
 
 
 # ============================================================
-# ㉕ 現在の研究段階
+# ㉓ 現在の研究段階
 # ============================================================
 
 st.divider()
 
 st.subheader(
-    "㉕ 現在の研究段階"
+    "㉓ 現在の研究段階"
 )
 
 st.write(
@@ -2950,11 +3249,7 @@ st.write(
 )
 
 st.write(
-    "【実装済み】BandWidth"
-)
-
-st.write(
-    "【実装済み】125営業日BandWidth正規化"
+    "【実装済み】BandWidth・125営業日正規化"
 )
 
 st.write(
@@ -2962,15 +3257,15 @@ st.write(
 )
 
 st.write(
-    "【実装済み】BandWidth収縮・拡大分類"
+    "【実装済み】BB下限タッチ・下抜け・BB内復帰"
 )
 
 st.write(
-    "【v1.2 実装済み】BB下限タッチ・下抜け・BB内復帰"
+    "【正常動作確認済み】0～3営業日の固定イベント"
 )
 
 st.write(
-    "【v1.3 実装済み】安値切り上げ・終値上昇・陽線"
+    "【正常動作確認済み】観察完了・未完了分離"
 )
 
 st.write(
@@ -2978,27 +3273,15 @@ st.write(
 )
 
 st.write(
-    "【v1.3.2 正常動作確認済み】0～3営業日固定観察"
+    "【v1.4 検証中】終値が前日高値を上回る＝反発開始候補"
 )
 
 st.write(
-    "【v1.3.2 正常動作確認済み】再タッチによる期間延長なし"
+    "【v1.4 実装】下落停止と反発開始をイベント単位で比較"
 )
 
 st.write(
-    "【v1.3.3 実装】観察完了・未完了イベント分離"
-)
-
-st.write(
-    "【v1.3.3 実装】完了イベントだけで確認率を計算"
-)
-
-st.write(
-    "【未検証】下落停止確認に利益上の優位性があるか"
-)
-
-st.write(
-    "【未実装】反発開始候補"
+    "【未検証】反発開始まで待つことに利益上の優位性があるか"
 )
 
 st.write(
@@ -3010,7 +3293,11 @@ st.write(
 )
 
 st.write(
-    "【未実装】次営業日エントリーによるイベントバックテスト"
+    "【未実装】次営業日エントリー"
+)
+
+st.write(
+    "【未実装】イベント単位Rバックテスト"
 )
 
 
@@ -3021,22 +3308,22 @@ st.write(
 st.divider()
 
 st.warning(
-    "重要：下落停止確認率は勝率ではありません。"
-    "現在調べているのは、BB下限タッチ後の"
-    "0～3営業日目に『安値切り上げ＋終値上昇』"
-    "が確認されたかどうかだけです。"
+    "重要：下落停止確認率や反発開始確認率は"
+    "勝率ではありません。"
+    "現在はBB下限イベント後に各価格条件が"
+    "何回成立したかを調べている段階です。"
 )
 
 st.info(
-    "将来バックテストするときは、"
-    "その日の終値を使って下落停止を確認した場合、"
+    "今後のRバックテストでは、"
+    "その日の終値を使って条件成立を確認した場合、"
     "同じ日の終値で買ったことにはしません。"
-    "原則として次営業日以降の価格を使い、"
-    "未来情報を使った成績の水増しを防ぎます。"
+    "原則として次営業日の価格から検証し、"
+    "未来情報の混入を防ぎます。"
 )
 
 st.caption(
     "このプログラムは研究・検証用です。"
-    "表示された状態は将来の株価上昇・下落を"
-    "保証するものではありません。"
+    "反発開始候補は買いシグナルとして"
+    "正式採用したものではありません。"
 )
