@@ -2,15 +2,24 @@
 # GOOG / NVDA
 # Bollinger Band Lower-Band Research Program
 #
-# Version : 1.1
+# Version : 1.2
 #
-# v1.1 追加内容
+# v1.1 から継続
 # ・125営業日 BandWidth 正規化
 # ・公式Squeeze基準の確認
 # ・研究用「低BandWidthゾーン」
 # ・BandWidth 収縮 / 拡大分類
 # ・Squeezeからの拡大開始候補
 # ・過去の状態一覧
+#
+# v1.2 追加内容
+# ・BB下限タッチ判定
+# ・日中BB下限下抜け判定
+# ・下抜け後の終値BB内復帰判定
+# ・BB下限より下での終値確定判定
+# ・低BandWidthから下方向へ拡大開始候補
+# ・過去30営業日のBB下限状態一覧
+# ・各状態の発生件数
 #
 # 注意
 # 現段階では売買判断を行わない
@@ -37,7 +46,7 @@ st.set_page_config(
 # 定数
 # ============================================================
 
-APP_VERSION = "1.1"
+APP_VERSION = "1.2"
 
 BB_PERIOD = 20
 BB_STD = 2.0
@@ -189,6 +198,7 @@ def calculate_lower_band_distance(
 
     df = data.copy()
 
+    # 終値とBB下限との距離
     df["Lower_Distance_Close"] = np.where(
         df["BB_Lower"] != 0,
         (
@@ -202,6 +212,7 @@ def calculate_lower_band_distance(
         np.nan,
     )
 
+    # 当日安値とBB下限との距離
     df["Lower_Distance_Low"] = np.where(
         df["BB_Lower"] != 0,
         (
@@ -293,7 +304,7 @@ def calculate_bandwidth_state(
     )
 
     # --------------------------------------------------------
-    # 公式Squeeze
+    # 公式Squeeze基準
     #
     # 現在のBandWidthが125期間最低値
     # --------------------------------------------------------
@@ -361,16 +372,14 @@ def classify_bandwidth_direction(
     ):
         return "拡大中"
 
-    # 5日では縮小していたが、
-    # 直近1日で拡大
+    # 5日では縮小していたが直近1日で拡大
     if (
         change_5d < 0
         and change_1d > 0
     ):
         return "拡大開始候補"
 
-    # 5日では拡大していたが、
-    # 直近1日で縮小
+    # 5日では拡大していたが直近1日で縮小
     if (
         change_5d > 0
         and change_1d < 0
@@ -410,6 +419,185 @@ def classify_squeeze_state(
 
 
 # ============================================================
+# v1.2
+# BB下限イベント判定
+# ============================================================
+
+def calculate_lower_band_events(
+    data: pd.DataFrame,
+) -> pd.DataFrame:
+
+    df = data.copy()
+
+    # --------------------------------------------------------
+    # 1. BB下限タッチ
+    #
+    # 当日安値がBB下限以下になった場合
+    # --------------------------------------------------------
+
+    df["BB_Lower_Touch"] = (
+        df["BB_Lower"].notna()
+        & (df["Low"] <= df["BB_Lower"])
+    )
+
+    # --------------------------------------------------------
+    # 2. 日中BB下限下抜け
+    #
+    # 当日安値がBB下限を明確に下回った場合
+    # --------------------------------------------------------
+
+    df["BB_Lower_Intraday_Break"] = (
+        df["BB_Lower"].notna()
+        & (df["Low"] < df["BB_Lower"])
+    )
+
+    # --------------------------------------------------------
+    # 3. 下抜け後、終値でBB内へ復帰
+    #
+    # 日中安値はBB下限を下回ったが、
+    # 終値はBB下限以上
+    # --------------------------------------------------------
+
+    df["BB_Lower_Reclaim"] = (
+        df["BB_Lower_Intraday_Break"]
+        & (df["Close"] >= df["BB_Lower"])
+    )
+
+    # --------------------------------------------------------
+    # 4. BB下限より下で終値確定
+    # --------------------------------------------------------
+
+    df["BB_Lower_Close_Below"] = (
+        df["BB_Lower"].notna()
+        & (df["Close"] < df["BB_Lower"])
+    )
+
+    return df
+
+
+# ============================================================
+# v1.2
+# BB下限状態の文字分類
+# ============================================================
+
+def classify_lower_band_event(
+    row,
+) -> str:
+
+    if pd.isna(row["BB_Lower"]):
+        return "判定不可"
+
+    # 終値までBB下限より下
+    if bool(row["BB_Lower_Close_Below"]):
+        return "BB下限より下で終値"
+
+    # 日中下抜け後、終値でBB内へ復帰
+    if bool(row["BB_Lower_Reclaim"]):
+        return "下抜け後BB内復帰"
+
+    # BB下限に到達
+    if bool(row["BB_Lower_Touch"]):
+        return "BB下限タッチ"
+
+    return "BB下限未到達"
+
+
+# ============================================================
+# v1.2
+# 低BandWidthから下方向へ拡大開始候補
+# ============================================================
+
+def calculate_downside_expansion(
+    data: pd.DataFrame,
+) -> pd.DataFrame:
+
+    df = data.copy()
+
+    # --------------------------------------------------------
+    # 前日の低BandWidth状態を保存
+    #
+    # 「低い状態から拡大した」を見るため、
+    # 当日だけでなく前日の状態を見る。
+    # --------------------------------------------------------
+
+    df["Prev_Low_BandWidth_Zone"] = (
+        df["Low_BandWidth_Zone"]
+        .shift(1)
+        .fillna(False)
+        .astype(bool)
+    )
+
+    # --------------------------------------------------------
+    # 前日からBandWidthが拡大したか
+    # --------------------------------------------------------
+
+    df["BandWidth_Expanding_1D"] = (
+        df["BandWidth_Change_1D"] > 0
+    )
+
+    # --------------------------------------------------------
+    # 下方向への拡大開始候補
+    #
+    # 条件
+    # ・前日が低BandWidthゾーン
+    # ・当日のBandWidthが前日より拡大
+    # ・当日安値がBB下限に到達または下抜け
+    #
+    # これは研究用分類。
+    # 売買シグナルではない。
+    # --------------------------------------------------------
+
+    df["Downside_Expansion_Candidate"] = (
+        df["Prev_Low_BandWidth_Zone"]
+        & df["BandWidth_Expanding_1D"]
+        & df["BB_Lower_Touch"]
+    )
+
+    # --------------------------------------------------------
+    # より強い下方向拡大候補
+    #
+    # 上記に加えて終値もBB下限より下
+    # --------------------------------------------------------
+
+    df["Downside_Expansion_Close_Below"] = (
+        df["Downside_Expansion_Candidate"]
+        & df["BB_Lower_Close_Below"]
+    )
+
+    # --------------------------------------------------------
+    # 下方向へ動いたがBB内へ復帰
+    # --------------------------------------------------------
+
+    df["Downside_Expansion_Reclaim"] = (
+        df["Downside_Expansion_Candidate"]
+        & df["BB_Lower_Reclaim"]
+    )
+
+    return df
+
+
+# ============================================================
+# v1.2
+# 下方向拡大状態の文字分類
+# ============================================================
+
+def classify_downside_expansion(
+    row,
+) -> str:
+
+    if bool(row["Downside_Expansion_Close_Below"]):
+        return "低BW→下方向拡大・BB下で終値"
+
+    if bool(row["Downside_Expansion_Reclaim"]):
+        return "低BW→下方向拡大・BB内復帰"
+
+    if bool(row["Downside_Expansion_Candidate"]):
+        return "低BW→下方向拡大候補"
+
+    return "該当なし"
+
+
+# ============================================================
 # 全データ準備
 # ============================================================
 
@@ -426,28 +614,50 @@ def prepare_data(
     if df.empty:
         return df
 
+    # 1. BB
     df = calculate_bollinger_bands(
         df,
         BB_PERIOD,
         BB_STD,
     )
 
+    # 2. BandWidth
     df = calculate_bandwidth(df)
 
+    # 3. BB下限との距離
     df = calculate_lower_band_distance(df)
 
+    # 4. BandWidth状態
     df = calculate_bandwidth_state(
         df,
         SQUEEZE_LOOKBACK,
     )
 
+    # 5. BandWidth方向
     df["BandWidth_Direction"] = df.apply(
         classify_bandwidth_direction,
         axis=1,
     )
 
+    # 6. Squeeze状態
     df["Squeeze_State"] = df.apply(
         classify_squeeze_state,
+        axis=1,
+    )
+
+    # 7. v1.2 BB下限イベント
+    df = calculate_lower_band_events(df)
+
+    df["Lower_Band_Event"] = df.apply(
+        classify_lower_band_event,
+        axis=1,
+    )
+
+    # 8. v1.2 下方向拡大
+    df = calculate_downside_expansion(df)
+
+    df["Downside_Expansion_State"] = df.apply(
+        classify_downside_expansion,
         axis=1,
     )
 
@@ -469,6 +679,14 @@ def format_number(
     return f"{value:,.{digits}f}"
 
 
+def yes_no(value) -> str:
+
+    if bool(value):
+        return "はい"
+
+    return "いいえ"
+
+
 # ============================================================
 # タイトル
 # ============================================================
@@ -479,14 +697,13 @@ st.title(
 
 st.caption(
     f"Version {APP_VERSION} ｜ "
-    "スクイーズ状態分類版"
+    "BB下限イベント・下方向拡大分類版"
 )
 
 st.info(
     "現在は研究段階です。"
-    "スクイーズやBandWidthの状態を分類し、"
-    "GOOG・NVDAの実際の値動きと一致しているか"
-    "確認するためのプログラムです。"
+    "BB下限、スクイーズ、BandWidth、"
+    "下方向への拡大状態を分類します。"
     "まだ買い・売り判断は行いません。"
 )
 
@@ -649,7 +866,7 @@ with col2:
 
 
 # ============================================================
-# BB下限
+# BB下限との位置関係
 # ============================================================
 
 st.subheader(
@@ -706,7 +923,7 @@ st.caption(
 
 
 # ============================================================
-# Squeeze
+# スクイーズ状態
 # ============================================================
 
 st.subheader(
@@ -870,13 +1087,146 @@ st.write(
 
 
 # ============================================================
+# v1.2 BB下限イベント
+# ============================================================
+
+st.subheader(
+    "⑦ BB下限イベント"
+)
+
+st.write(
+    "現在のBB下限状態：",
+    latest["Lower_Band_Event"],
+)
+
+
+event_col1, event_col2 = st.columns(2)
+
+
+with event_col1:
+
+    st.write(
+        "BB下限タッチ：",
+        yes_no(latest["BB_Lower_Touch"]),
+    )
+
+    st.write(
+        "日中BB下限下抜け：",
+        yes_no(latest["BB_Lower_Intraday_Break"]),
+    )
+
+
+with event_col2:
+
+    st.write(
+        "下抜け後、終値でBB内復帰：",
+        yes_no(latest["BB_Lower_Reclaim"]),
+    )
+
+    st.write(
+        "BB下限より下で終値：",
+        yes_no(latest["BB_Lower_Close_Below"]),
+    )
+
+
+if bool(latest["BB_Lower_Reclaim"]):
+
+    st.info(
+        "研究上の注目状態："
+        "日中はBB下限を下抜けしましたが、"
+        "終値ではBB内へ戻っています。"
+    )
+
+
+if bool(latest["BB_Lower_Close_Below"]):
+
+    st.warning(
+        "研究上の注目状態："
+        "終値がBB下限より下です。"
+        "反転とは決めず、"
+        "下方向への継続可能性も含めて研究します。"
+    )
+
+
+# ============================================================
+# v1.2 下方向拡大
+# ============================================================
+
+st.subheader(
+    "⑧ 低BandWidthからの下方向拡大"
+)
+
+downside_state = latest[
+    "Downside_Expansion_State"
+]
+
+st.write(
+    "現在の分類：",
+    downside_state,
+)
+
+
+if bool(
+    latest["Downside_Expansion_Close_Below"]
+):
+
+    st.warning(
+        "前日は低BandWidthゾーンで、"
+        "BandWidthが拡大し、"
+        "価格はBB下限方向へ動き、"
+        "終値もBB下限より下です。"
+        "下方向への拡大候補として記録します。"
+    )
+
+
+elif bool(
+    latest["Downside_Expansion_Reclaim"]
+):
+
+    st.info(
+        "前日は低BandWidthゾーンで、"
+        "BandWidthが拡大しました。"
+        "日中はBB下限を下抜けしましたが、"
+        "終値ではBB内へ復帰しました。"
+        "下抜け失敗候補として記録します。"
+    )
+
+
+elif bool(
+    latest["Downside_Expansion_Candidate"]
+):
+
+    st.info(
+        "前日は低BandWidthゾーンで、"
+        "BandWidthが拡大し、"
+        "当日安値がBB下限に到達しています。"
+        "下方向への拡大開始候補です。"
+    )
+
+
+else:
+
+    st.write(
+        "現在は研究用の"
+        "『低BandWidthから下方向拡大』"
+        "条件には該当していません。"
+    )
+
+
+st.caption(
+    "この分類は研究用です。"
+    "買い・売りシグナルではありません。"
+)
+
+
+# ============================================================
 # チャート
 # ============================================================
 
 st.divider()
 
 st.subheader(
-    "⑦ 株価とボリンジャーバンド"
+    "⑨ 株価とボリンジャーバンド"
 )
 
 
@@ -947,7 +1297,7 @@ st.line_chart(
 # ============================================================
 
 st.subheader(
-    "⑧ BandWidth"
+    "⑩ BandWidth"
 )
 
 
@@ -978,7 +1328,7 @@ st.line_chart(
 # ============================================================
 
 st.subheader(
-    "⑨ 正規化BandWidth"
+    "⑪ 正規化BandWidth"
 )
 
 
@@ -1010,7 +1360,7 @@ st.line_chart(
 # ============================================================
 
 st.subheader(
-    "⑩ 最新30営業日の状態確認"
+    "⑫ 最新30営業日の状態確認"
 )
 
 
@@ -1018,12 +1368,15 @@ display_df = (
     valid_df[
         [
             "Close",
+            "Low",
             "BB_Lower",
             "Lower_Distance_Close",
             "BandWidth",
             "Normalized_BandWidth",
             "BandWidth_Direction",
             "Squeeze_State",
+            "Lower_Band_Event",
+            "Downside_Expansion_State",
         ]
     ]
     .tail(30)
@@ -1046,6 +1399,9 @@ display_df = display_df.rename(
         "Close":
             "終値",
 
+        "Low":
+            "安値",
+
         "BB_Lower":
             "BB下限",
 
@@ -1063,12 +1419,19 @@ display_df = display_df.rename(
 
         "Squeeze_State":
             "スクイーズ状態",
+
+        "Lower_Band_Event":
+            "BB下限イベント",
+
+        "Downside_Expansion_State":
+            "下方向拡大状態",
     }
 )
 
 
 numeric_columns = [
     "終値",
+    "安値",
     "BB下限",
     "終値→BB下限 %",
     "BandWidth %",
@@ -1097,7 +1460,7 @@ st.dataframe(
 # ============================================================
 
 st.subheader(
-    "⑪ 現在取得している期間の分類件数"
+    "⑬ 現在取得している期間の分類件数"
 )
 
 
@@ -1128,9 +1491,46 @@ else:
         ].sum()
     )
 
+    touch_count = int(
+        research_df[
+            "BB_Lower_Touch"
+        ].sum()
+    )
+
+    reclaim_count = int(
+        research_df[
+            "BB_Lower_Reclaim"
+        ].sum()
+    )
+
+    close_below_count = int(
+        research_df[
+            "BB_Lower_Close_Below"
+        ].sum()
+    )
+
+    downside_count = int(
+        research_df[
+            "Downside_Expansion_Candidate"
+        ].sum()
+    )
+
+    downside_reclaim_count = int(
+        research_df[
+            "Downside_Expansion_Reclaim"
+        ].sum()
+    )
+
+    downside_close_below_count = int(
+        research_df[
+            "Downside_Expansion_Close_Below"
+        ].sum()
+    )
+
     total_count = len(
         research_df
     )
+
 
     col1, col2, col3 = st.columns(3)
 
@@ -1159,10 +1559,182 @@ else:
         )
 
 
+    col4, col5, col6 = st.columns(3)
+
+
+    with col4:
+
+        st.metric(
+            "BB下限タッチ",
+            f"{touch_count}日",
+        )
+
+
+    with col5:
+
+        st.metric(
+            "下抜け後BB内復帰",
+            f"{reclaim_count}日",
+        )
+
+
+    with col6:
+
+        st.metric(
+            "BB下限より下で終値",
+            f"{close_below_count}日",
+        )
+
+
+    col7, col8, col9 = st.columns(3)
+
+
+    with col7:
+
+        st.metric(
+            "低BW→下方向拡大候補",
+            f"{downside_count}日",
+        )
+
+
+    with col8:
+
+        st.metric(
+            "低BW→拡大・BB内復帰",
+            f"{downside_reclaim_count}日",
+        )
+
+
+    with col9:
+
+        st.metric(
+            "低BW→拡大・BB下終値",
+            f"{downside_close_below_count}日",
+        )
+
+
     st.caption(
         "件数は売買成績ではありません。"
-        "現段階では各状態がどの程度発生するかを"
-        "確認するための数字です。"
+        "現在は各状態がどの程度発生するかを"
+        "確認するための集計です。"
+    )
+
+
+# ============================================================
+# v1.2
+# 注目イベントだけ抽出
+# ============================================================
+
+st.subheader(
+    "⑭ BB下限の注目イベント"
+)
+
+
+event_df = valid_df[
+    (
+        valid_df["BB_Lower_Touch"]
+        | valid_df["Downside_Expansion_Candidate"]
+    )
+].copy()
+
+
+if event_df.empty:
+
+    st.info(
+        "選択した期間には"
+        "BB下限の注目イベントがありません。"
+    )
+
+
+else:
+
+    event_display = (
+        event_df[
+            [
+                "Close",
+                "Low",
+                "BB_Lower",
+                "BandWidth",
+                "Normalized_BandWidth",
+                "Squeeze_State",
+                "Lower_Band_Event",
+                "Downside_Expansion_State",
+            ]
+        ]
+        .tail(50)
+        .copy()
+    )
+
+
+    event_display[
+        "Normalized_BandWidth"
+    ] = (
+        event_display[
+            "Normalized_BandWidth"
+        ]
+        * 100
+    )
+
+
+    event_display = event_display.rename(
+        columns={
+            "Close":
+                "終値",
+
+            "Low":
+                "安値",
+
+            "BB_Lower":
+                "BB下限",
+
+            "BandWidth":
+                "BandWidth %",
+
+            "Normalized_BandWidth":
+                "正規化BW %",
+
+            "Squeeze_State":
+                "スクイーズ状態",
+
+            "Lower_Band_Event":
+                "BB下限イベント",
+
+            "Downside_Expansion_State":
+                "下方向拡大状態",
+        }
+    )
+
+
+    event_numeric_columns = [
+        "終値",
+        "安値",
+        "BB下限",
+        "BandWidth %",
+        "正規化BW %",
+    ]
+
+
+    event_display[
+        event_numeric_columns
+    ] = (
+        event_display[
+            event_numeric_columns
+        ]
+        .round(2)
+    )
+
+
+    st.dataframe(
+        event_display,
+        use_container_width=True,
+    )
+
+
+    st.caption(
+        "ここでは過去のBB下限関連イベントを"
+        "抽出しているだけです。"
+        "その後上昇したかどうかは"
+        "まだ評価していません。"
     )
 
 
@@ -1173,7 +1745,7 @@ else:
 st.divider()
 
 st.subheader(
-    "⑫ 現在の研究段階"
+    "⑮ 現在の研究段階"
 )
 
 
@@ -1222,7 +1794,27 @@ st.write(
 )
 
 st.write(
-    "【未実装】BB下限からの下落停止判定"
+    "【v1.2 実装済み】BB下限タッチ"
+)
+
+st.write(
+    "【v1.2 実装済み】日中BB下限下抜け"
+)
+
+st.write(
+    "【v1.2 実装済み】下抜け後BB内復帰"
+)
+
+st.write(
+    "【v1.2 実装済み】BB下限より下で終値"
+)
+
+st.write(
+    "【v1.2 研究分類】低BandWidthから下方向拡大"
+)
+
+st.write(
+    "【未実装】正式な下落停止判定"
 )
 
 st.write(
@@ -1250,11 +1842,11 @@ st.divider()
 
 st.warning(
     "重要："
-    "『公式Squeeze基準』と"
-    "『研究用 低BandWidthゾーン』は別物です。"
-    "研究用ゾーンは今後GOOG・NVDAの"
-    "過去実績を比較するための仮分類であり、"
-    "売買条件として正式採用したものではありません。"
+    "今回追加したBB下限タッチ、BB内復帰、"
+    "BB下限より下での終値、下方向拡大は、"
+    "すべて研究用の状態分類です。"
+    "現段階では買い・売りシグナルとして"
+    "正式採用していません。"
 )
 
 
