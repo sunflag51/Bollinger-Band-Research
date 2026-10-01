@@ -2,7 +2,7 @@
 # GOOG / NVDA
 # Bollinger Band Lower-Band Research Program
 #
-# Version : 1.6
+# Version : 1.7
 #
 # v1.4まで
 # ・BB下限イベント
@@ -37,9 +37,19 @@
 # ・期間末で必要日数が足りない未決着イベントは「将来データ不足」として分離
 # ・1R率による除外は行わない
 #
+# v1.7
+# ・v1.6の先着判定を維持
+# ・Target先着 = +Target R、Stop先着 = -1R としてR損益化
+# ・期間内未到達は5 / 10 / 20営業日目の終値で期間末決済
+# ・期間末決済R = (期間末終値 - Entry) / 1R
+# ・同日両方到達・順序不明はR損益から除外して別枠維持
+# ・将来データ不足もR損益から除外して別枠維持
+# ・全件と「1R率1%以上」の参考診断を並べる
+# ・1R率1%以上は正式フィルターではない
+#
 # 重要
-# v1.6は「価格水準の先着判定」まで。
-# コスト・スリッページを含む最終的な売買成績や
+# v1.7は「コスト前のルールベースR損益」まで。
+# 手数料・スリッページ・ギャップ時の実約定差はまだ含めない。
 # 正式な売買ルールはまだ確定しない。
 # ============================================================
 
@@ -64,7 +74,7 @@ st.set_page_config(
 # 定数
 # ============================================================
 
-APP_VERSION = "1.6"
+APP_VERSION = "1.7"
 
 BB_PERIOD = 20
 BB_STD = 2.0
@@ -1618,6 +1628,256 @@ def make_first_hit_copy_text(
     return "\n".join(lines)
 
 
+
+# ============================================================
+# v1.7
+# R損益計算
+#
+# Target先着 -> +Target R
+# Stop先着   -> -1R
+# 期間内未到達 -> 指定保有期間の最終営業日終値で決済し、
+#                 (Exit Close - Entry) / 1R を計算
+# 同日両方到達・順序不明 / 将来データ不足はR損益計算から除外。
+#
+# 注意：Target / Stop先着時は設定した価格水準で決済した
+# ルールベースRとして扱う。ギャップによる実約定差、
+# 手数料、スリッページはまだ反映しない。
+# ============================================================
+
+def calculate_r_pnl_results(
+    data: pd.DataFrame,
+    first_hit_results: pd.DataFrame,
+) -> pd.DataFrame:
+
+    if first_hit_results is None or first_hit_results.empty:
+        return pd.DataFrame()
+
+    results = first_hit_results.copy()
+
+    results["Exit_Type"] = ""
+    results["Exit_Date"] = pd.NaT
+    results["Exit_Price"] = np.nan
+    results["Realized_R"] = np.nan
+    results["R_PnL_Valid"] = False
+    results["R_PnL_Status"] = "計算不可"
+
+    for idx, row in results.iterrows():
+
+        outcome = row.get("Outcome", "")
+        target_r = row.get("Target_R", np.nan)
+        target_price = row.get("Target_Price", np.nan)
+        stop_price = row.get("Stop_Price", np.nan)
+        entry_price = row.get("Entry_Price", np.nan)
+        risk_1r = row.get("Risk_1R", np.nan)
+        entry_date = row.get("Entry_Date", pd.NaT)
+        horizon = row.get("Horizon", np.nan)
+
+        if outcome == "Target先着":
+            results.at[idx, "Exit_Type"] = "Target決済"
+            results.at[idx, "Exit_Date"] = row.get(
+                "Outcome_Date", pd.NaT
+            )
+            results.at[idx, "Exit_Price"] = float(target_price)
+            results.at[idx, "Realized_R"] = float(target_r)
+            results.at[idx, "R_PnL_Valid"] = True
+            results.at[idx, "R_PnL_Status"] = "R損益計算可能"
+            continue
+
+        if outcome == "Stop先着":
+            results.at[idx, "Exit_Type"] = "Stop決済"
+            results.at[idx, "Exit_Date"] = row.get(
+                "Outcome_Date", pd.NaT
+            )
+            results.at[idx, "Exit_Price"] = float(stop_price)
+            results.at[idx, "Realized_R"] = -1.0
+            results.at[idx, "R_PnL_Valid"] = True
+            results.at[idx, "R_PnL_Status"] = "R損益計算可能"
+            continue
+
+        if outcome == "同日両方到達・順序不明":
+            results.at[idx, "Exit_Type"] = "順序不明"
+            results.at[idx, "R_PnL_Status"] = "同日両方到達・順序不明"
+            continue
+
+        if outcome == "将来データ不足":
+            results.at[idx, "Exit_Type"] = "データ不足"
+            results.at[idx, "R_PnL_Status"] = "将来データ不足"
+            continue
+
+        if outcome == "期間内未到達":
+
+            if (
+                pd.isna(entry_date)
+                or pd.isna(entry_price)
+                or pd.isna(risk_1r)
+                or pd.isna(horizon)
+                or float(risk_1r) <= 0
+            ):
+                results.at[idx, "Exit_Type"] = "期間末決済不可"
+                results.at[idx, "R_PnL_Status"] = "期間末価格計算不可"
+                continue
+
+            try:
+                entry_position = data.index.get_loc(entry_date)
+            except KeyError:
+                results.at[idx, "Exit_Type"] = "期間末決済不可"
+                results.at[idx, "R_PnL_Status"] = "Entry日なし"
+                continue
+
+            if not isinstance(entry_position, (int, np.integer)):
+                results.at[idx, "Exit_Type"] = "期間末決済不可"
+                results.at[idx, "R_PnL_Status"] = "Entry日重複"
+                continue
+
+            exit_position = (
+                int(entry_position)
+                + int(horizon)
+                - 1
+            )
+
+            if exit_position >= len(data):
+                results.at[idx, "Exit_Type"] = "データ不足"
+                results.at[idx, "R_PnL_Status"] = "将来データ不足"
+                continue
+
+            exit_date = data.index[exit_position]
+            exit_close = pd.to_numeric(
+                pd.Series([data.iloc[exit_position]["Close"]]),
+                errors="coerce",
+            ).iloc[0]
+
+            if pd.isna(exit_close):
+                results.at[idx, "Exit_Type"] = "期間末決済不可"
+                results.at[idx, "R_PnL_Status"] = "期間末終値なし"
+                continue
+
+            realized_r = (
+                float(exit_close)
+                - float(entry_price)
+            ) / float(risk_1r)
+
+            results.at[idx, "Exit_Type"] = "期間末終値決済"
+            results.at[idx, "Exit_Date"] = exit_date
+            results.at[idx, "Exit_Price"] = float(exit_close)
+            results.at[idx, "Realized_R"] = float(realized_r)
+            results.at[idx, "R_PnL_Valid"] = True
+            results.at[idx, "R_PnL_Status"] = "R損益計算可能"
+            continue
+
+        results.at[idx, "Exit_Type"] = "その他"
+        results.at[idx, "R_PnL_Status"] = "未定義結果"
+
+    return results
+
+
+def build_r_pnl_summary(
+    results: pd.DataFrame,
+) -> pd.DataFrame:
+
+    rows = []
+
+    if results is None or results.empty:
+        return pd.DataFrame()
+
+    for horizon in FIRST_HIT_HORIZONS:
+
+        horizon_df = results[
+            results["Horizon"] == horizon
+        ].copy()
+
+        total = len(horizon_df)
+
+        valid_df = horizon_df[
+            horizon_df["R_PnL_Valid"]
+        ].copy()
+
+        realized = pd.to_numeric(
+            valid_df["Realized_R"],
+            errors="coerce",
+        ).dropna()
+
+        row = {
+            "保有期間": f"{horizon}営業日",
+            "対象": total,
+            "R損益計算可能": len(realized),
+            "Target決済": int(
+                (horizon_df["Exit_Type"] == "Target決済").sum()
+            ),
+            "Stop決済": int(
+                (horizon_df["Exit_Type"] == "Stop決済").sum()
+            ),
+            "期間末終値決済": int(
+                (horizon_df["Exit_Type"] == "期間末終値決済").sum()
+            ),
+            "順序不明": int(
+                (horizon_df["Exit_Type"] == "順序不明").sum()
+            ),
+            "データ不足": int(
+                (horizon_df["Exit_Type"] == "データ不足").sum()
+            ),
+            "合計R": (
+                float(realized.sum())
+                if not realized.empty else np.nan
+            ),
+            "平均R": (
+                float(realized.mean())
+                if not realized.empty else np.nan
+            ),
+            "中央値R": (
+                float(realized.median())
+                if not realized.empty else np.nan
+            ),
+            "プラスR": int((realized > 0).sum()),
+            "マイナスR": int((realized < 0).sum()),
+            "ゼロR": int(np.isclose(realized, 0.0).sum()),
+        }
+
+        rows.append(row)
+
+    return pd.DataFrame(rows)
+
+
+def make_r_pnl_copy_text(
+    title: str,
+    summary_df: pd.DataFrame,
+) -> str:
+
+    lines = [title]
+
+    if summary_df is None or summary_df.empty:
+        lines.append("対象イベントなし")
+        return "\n".join(lines)
+
+    lines.append(
+        "保有期間,対象,R損益計算可能,Target決済,Stop決済,期間末終値決済,順序不明,データ不足,合計R,平均R,中央値R,プラスR,マイナスR,ゼロR"
+    )
+
+    for _, row in summary_df.iterrows():
+
+        def fmt(value):
+            if pd.isna(value):
+                return ""
+            return f"{float(value):.4f}"
+
+        lines.append(
+            f"{row['保有期間']},"
+            f"{int(row['対象'])},"
+            f"{int(row['R損益計算可能'])},"
+            f"{int(row['Target決済'])},"
+            f"{int(row['Stop決済'])},"
+            f"{int(row['期間末終値決済'])},"
+            f"{int(row['順序不明'])},"
+            f"{int(row['データ不足'])},"
+            f"{fmt(row['合計R'])},"
+            f"{fmt(row['平均R'])},"
+            f"{fmt(row['中央値R'])},"
+            f"{int(row['プラスR'])},"
+            f"{int(row['マイナスR'])},"
+            f"{int(row['ゼロR'])}"
+        )
+
+    return "\n".join(lines)
+
 # ============================================================
 # 全データ準備
 # ============================================================
@@ -1804,7 +2064,7 @@ st.title(
 
 st.caption(
     f"Version {APP_VERSION} ｜ "
-    "下落停止 vs 反発開始 ＋ R先着判定版"
+    "下落停止 vs 反発開始 ＋ R損益検証版"
 )
 
 st.info(
@@ -4300,14 +4560,290 @@ else:
     )
 
 
+
 # ============================================================
-# ㊳ 現在の研究段階
+# v1.7 R損益の準備
+# ============================================================
+
+r_pnl_result_sets = {}
+
+for key, first_hit_results in first_hit_result_sets.items():
+    r_pnl_result_sets[key] = calculate_r_pnl_results(
+        df,
+        first_hit_results,
+    )
+
+
+# ============================================================
+# ㊳ v1.7 R損益ルール
 # ============================================================
 
 st.divider()
 
 st.subheader(
-    "㊳ 現在の研究段階"
+    "㊳ v1.7 期間末決済を含むR損益ルール"
+)
+
+st.write(
+    "【Target先着】+1.5Rまたは+2Rとして計算します。"
+)
+
+st.write(
+    "【Stop先着】-1Rとして計算します。"
+)
+
+st.write(
+    "【期間内未到達】5・10・20営業日目の終値で決済したと仮定します。"
+)
+
+st.write(
+    "【期間末R】(期間末終値 − Entry) ÷ 1R で計算します。"
+)
+
+st.write(
+    "【同日両方到達】日足では順序が分からないため、R損益には入れず別枠のまま残します。"
+)
+
+st.write(
+    "【将来データ不足】R損益には入れず別枠のまま残します。"
+)
+
+st.write(
+    "【1R率】全件を本体集計とし、1R率1%以上は参考診断として別表示します。正式フィルターではありません。"
+)
+
+st.warning(
+    "v1.7の平均Rは手数料・スリッページ前です。"
+    "Target / Stop先着時は設定水準で決済したルールベースRとして計算し、"
+    "ギャップによる実際の約定価格差はまだ反映しません。"
+)
+
+
+def show_r_pnl_section(
+    section_title: str,
+    results: pd.DataFrame,
+):
+
+    st.subheader(section_title)
+
+    if results is None or results.empty:
+        st.info("対象イベントがありません。")
+        return
+
+    summary_all = build_r_pnl_summary(
+        results
+    )
+
+    display_cols = [
+        "保有期間",
+        "対象",
+        "R損益計算可能",
+        "Target決済",
+        "Stop決済",
+        "期間末終値決済",
+        "順序不明",
+        "データ不足",
+        "合計R",
+        "平均R",
+        "中央値R",
+        "プラスR",
+        "マイナスR",
+        "ゼロR",
+    ]
+
+    st.write("全R計算可能イベント")
+
+    st.dataframe(
+        summary_all[display_cols].round(4),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    st.write("📋 コピー用R損益集計")
+
+    st.code(
+        make_r_pnl_copy_text(
+            section_title,
+            summary_all,
+        ),
+        language=None,
+    )
+
+    diagnostic = results[
+        pd.to_numeric(
+            results["Risk_1R_Percent"],
+            errors="coerce",
+        ) >= 1.0
+    ].copy()
+
+    diagnostic_summary = build_r_pnl_summary(
+        diagnostic
+    )
+
+    st.write(
+        "参考診断：1R率1%以上のみ（正式フィルターではありません）"
+    )
+
+    st.dataframe(
+        diagnostic_summary[display_cols].round(4),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    st.write("📋 コピー用・1R率1%以上参考診断")
+
+    st.code(
+        make_r_pnl_copy_text(
+            f"{section_title}・1R率1%以上参考診断",
+            diagnostic_summary,
+        ),
+        language=None,
+    )
+
+
+# ============================================================
+# ㊴ 下落停止 1.5R R損益
+# ============================================================
+
+show_r_pnl_section(
+    "㊴ v1.7 下落停止・1.5R R損益",
+    r_pnl_result_sets[("Stop", 1.5)],
+)
+
+
+# ============================================================
+# ㊵ 下落停止 2R R損益
+# ============================================================
+
+show_r_pnl_section(
+    "㊵ v1.7 下落停止・2R R損益",
+    r_pnl_result_sets[("Stop", 2.0)],
+)
+
+
+# ============================================================
+# ㊶ 反発開始 1.5R R損益
+# ============================================================
+
+show_r_pnl_section(
+    "㊶ v1.7 反発開始・1.5R R損益",
+    r_pnl_result_sets[("Rebound", 1.5)],
+)
+
+
+# ============================================================
+# ㊷ 反発開始 2R R損益
+# ============================================================
+
+show_r_pnl_section(
+    "㊷ v1.7 反発開始・2R R損益",
+    r_pnl_result_sets[("Rebound", 2.0)],
+)
+
+
+# ============================================================
+# ㊸ v1.7 20営業日 R損益詳細
+# ============================================================
+
+st.subheader(
+    "㊸ v1.7 20営業日・イベント別R損益詳細"
+)
+
+v17_strategy_label = st.radio(
+    "R損益詳細を表示するシグナル",
+    options=["下落停止", "反発開始"],
+    horizontal=True,
+    key="v17_detail_strategy",
+)
+
+v17_target_label = st.radio(
+    "R損益詳細を表示するTarget",
+    options=["+1.5R", "+2R"],
+    horizontal=True,
+    key="v17_detail_target",
+)
+
+v17_prefix = (
+    "Stop"
+    if v17_strategy_label == "下落停止"
+    else "Rebound"
+)
+
+v17_target_r = (
+    1.5
+    if v17_target_label == "+1.5R"
+    else 2.0
+)
+
+v17_detail = r_pnl_result_sets[
+    (v17_prefix, v17_target_r)
+]
+
+if v17_detail.empty:
+    st.info("R損益詳細を表示できるイベントがありません。")
+else:
+    v17_detail_20 = v17_detail[
+        v17_detail["Horizon"] == 20
+    ].copy()
+
+    v17_detail_20 = v17_detail_20[
+        [
+            "BB_Event_ID",
+            "Signal_Date",
+            "Entry_Date",
+            "Entry_Price",
+            "Stop_Price",
+            "Risk_1R",
+            "Risk_1R_Percent",
+            "Target_Price",
+            "Outcome",
+            "Exit_Type",
+            "Exit_Date",
+            "Exit_Price",
+            "Realized_R",
+            "R_PnL_Status",
+        ]
+    ]
+
+    v17_detail_20.columns = [
+        "イベントID",
+        "シグナル日",
+        "Entry日",
+        "Entry",
+        "Stop",
+        "1R",
+        "1R率 %",
+        "Target",
+        "先着判定",
+        "決済方法",
+        "決済日",
+        "決済価格",
+        "R損益",
+        "R損益状態",
+    ]
+
+    st.dataframe(
+        v17_detail_20.round(4),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    st.write("📋 コピー用20営業日R損益詳細")
+
+    st.code(
+        v17_detail_20.to_csv(index=False),
+        language=None,
+    )
+
+
+# ============================================================
+# ㊹ 現在の研究段階
+# ============================================================
+
+st.divider()
+
+st.subheader(
+    "㊹ 現在の研究段階"
 )
 
 st.write(
@@ -4375,6 +4911,22 @@ st.write(
 )
 
 st.write(
+    "【v1.7 実装】期間内未到達を5・10・20営業日目の終値で期間末決済"
+)
+
+st.write(
+    "【v1.7 実装】Target / Stop / 期間末決済をR損益へ統合"
+)
+
+st.write(
+    "【v1.7 実装】全件と1R率1%以上の参考診断を並列表示"
+)
+
+st.write(
+    "【未採用】1R率1%以上を正式な売買フィルターにすること"
+)
+
+st.write(
     "【未実装】コスト・スリッページを含む約定損益"
 )
 
@@ -4405,6 +4957,16 @@ st.info(
     "v1.6でも1R率が小さいイベントは削除しません。"
     "まず全R計算可能イベントで先着結果を確認し、"
     "極小1Rが結果へ与える影響はその後に分けて検証します。"
+)
+
+st.info(
+    "v1.7の平均Rは、Target先着・Stop先着・期間末終値決済を統合した"
+    "コスト前の研究値です。同日順序不明と将来データ不足は平均Rから除外します。"
+)
+
+st.info(
+    "1R率1%以上の結果は、極小1Rの影響を見るための参考診断です。"
+    "過去結果を見て1%を正式採用したものではありません。"
 )
 
 st.caption(
