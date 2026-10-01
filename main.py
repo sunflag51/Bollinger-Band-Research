@@ -106,6 +106,15 @@
 # ・同じEntry日でもStop起点が異なる場合のR設計差を表示
 # ・新しいEntry条件は追加せず、イベント定義と二重計上だけを検証
 #
+# v2.6
+# ・v2.5.1までの全機能を維持
+# ・完了したBB下限イベントを「1イベント=1行」の独立イベント台帳へ統一
+# ・固定day0～day3内の下落停止/反発開始だけを、そのイベント自身のシグナルとして記録
+# ・固定窓後の遅い反発は元イベントへ追加せず、新しいBBイベントがあれば別IDとして扱う
+# ・各イベントに20営業日・2Rの下落停止/反発開始R結果を横並びで記録
+# ・イベントID重複、欠落、台帳行数を監査し、二重計上がないことを確認
+# ・旧方針Cは診断履歴として残すが、独立イベント台帳の正式研究母集団には混ぜない
+#
 # v2.5.1
 # ・新しいBB下限イベントが発生したら、旧イベントの追跡を終了して新イベントへリセット
 # ・新イベントありは新イベント側の既存Rebound R設計を使用
@@ -116,7 +125,7 @@
 # ・リセット方式は研究候補であり、正式売買ルールには採用しない
 #
 # 重要
-# v2.5も「コスト前のルールベースR損益・意思決定比較」まで。
+# v2.6も「コスト前のルールベースR損益・イベント研究」まで。
 # 手数料・スリッページ・ギャップ時の実約定差はまだ含めない。
 # 正式な売買ルールはまだ確定しない。
 # ============================================================
@@ -142,7 +151,7 @@ st.set_page_config(
 # 定数
 # ============================================================
 
-APP_VERSION = "2.5.1"
+APP_VERSION = "2.6"
 
 BB_PERIOD = 20
 BB_STD = 2.0
@@ -4259,6 +4268,211 @@ def make_v25_copy_text(title: str, data: pd.DataFrame) -> str:
 
 
 # ============================================================
+# v2.6
+# 独立BBイベント台帳
+# ============================================================
+
+def build_v26_event_ledger(
+    data: pd.DataFrame,
+    completed_event_start_df: pd.DataFrame,
+    stop_pnl_20_2r: pd.DataFrame,
+    rebound_pnl_20_2r: pd.DataFrame,
+) -> pd.DataFrame:
+    """完了BBイベントを1イベント=1行で整理する。
+
+    固定day0～day3のイベント境界を唯一のイベント境界として使う。
+    固定窓後の遅い反発は元イベントへ追加しない。新しいBB下限タッチが
+    起きた場合は、その新しいBB_Event_IDの独立イベントとしてのみ扱う。
+    """
+    if (
+        data is None or data.empty
+        or completed_event_start_df is None or completed_event_start_df.empty
+    ):
+        return pd.DataFrame()
+
+    def pnl_map(frame):
+        result = {}
+        if frame is None or frame.empty:
+            return result
+        w = frame.copy()
+        if "Horizon" in w.columns:
+            w = w[pd.to_numeric(w["Horizon"], errors="coerce").eq(20)]
+        if "Target_R" in w.columns:
+            w = w[np.isclose(pd.to_numeric(w["Target_R"], errors="coerce"), 2.0)]
+        for _, r in w.iterrows():
+            eid = pd.to_numeric(pd.Series([r.get("BB_Event_ID")]), errors="coerce").iloc[0]
+            if pd.notna(eid):
+                result[int(eid)] = r
+        return result
+
+    stop_map = pnl_map(stop_pnl_20_2r)
+    rebound_map = pnl_map(rebound_pnl_20_2r)
+    rows = []
+
+    starts = completed_event_start_df.copy().sort_index()
+    for start_date, start_row in starts.iterrows():
+        eid_val = pd.to_numeric(pd.Series([start_row.get("BB_Event_ID")]), errors="coerce").iloc[0]
+        if pd.isna(eid_val):
+            continue
+        eid = int(eid_val)
+
+        event_rows = data[
+            pd.to_numeric(data["BB_Event_ID"], errors="coerce").eq(eid)
+        ].copy()
+        if event_rows.empty:
+            continue
+
+        stop_rows = event_rows[event_rows["First_Decline_Stop_In_Event"].eq(True)]
+        rebound_rows = event_rows[event_rows["First_Rebound_Start_In_Event"].eq(True)]
+        stop_row = stop_rows.iloc[0] if not stop_rows.empty else None
+        rebound_row = rebound_rows.iloc[0] if not rebound_rows.empty else None
+        stop_date = stop_rows.index[0] if not stop_rows.empty else pd.NaT
+        rebound_date = rebound_rows.index[0] if not rebound_rows.empty else pd.NaT
+
+        has_stop = stop_row is not None
+        has_rebound = rebound_row is not None
+        if has_stop and has_rebound:
+            if pd.Timestamp(stop_date) == pd.Timestamp(rebound_date):
+                event_type = "両方確認・同日"
+            elif pd.Timestamp(stop_date) < pd.Timestamp(rebound_date):
+                event_type = "両方確認・反発が後"
+            else:
+                event_type = "両方確認・反発が先"
+        elif has_stop:
+            event_type = "下落停止のみ"
+        elif has_rebound:
+            event_type = "反発開始のみ"
+        else:
+            event_type = "両方未確認"
+
+        sp = stop_map.get(eid)
+        rp = rebound_map.get(eid)
+
+        rows.append({
+            "イベントID": eid,
+            "イベント開始日": pd.to_datetime(start_date, errors="coerce"),
+            "固定窓終了日": pd.to_datetime(start_row.get("Event_End_Date", pd.NaT), errors="coerce"),
+            "イベント種別": event_type,
+            "下落停止確認": has_stop,
+            "下落停止day": (
+                pd.to_numeric(pd.Series([stop_row.get("Days_From_BB_Event_Start")]), errors="coerce").iloc[0]
+                if has_stop else np.nan
+            ),
+            "下落停止日": pd.to_datetime(stop_date, errors="coerce"),
+            "反発開始確認": has_rebound,
+            "反発開始day": (
+                pd.to_numeric(pd.Series([rebound_row.get("Days_From_BB_Event_Start")]), errors="coerce").iloc[0]
+                if has_rebound else np.nan
+            ),
+            "反発開始日": pd.to_datetime(rebound_date, errors="coerce"),
+            "開始日終値": pd.to_numeric(pd.Series([start_row.get("Close")]), errors="coerce").iloc[0],
+            "開始日BB下限": pd.to_numeric(pd.Series([start_row.get("BB_Lower")]), errors="coerce").iloc[0],
+            "開始日BandWidth_%": pd.to_numeric(pd.Series([start_row.get("BandWidth")]), errors="coerce").iloc[0],
+            "下落停止_20日2R決済": sp.get("Exit_Type", "") if sp is not None else "シグナルなし",
+            "下落停止_20日2R実現R": sp.get("Realized_R", np.nan) if sp is not None else np.nan,
+            "下落停止_20日2R状態": sp.get("R_PnL_Status", "シグナルなし") if sp is not None else "シグナルなし",
+            "反発開始_20日2R決済": rp.get("Exit_Type", "") if rp is not None else "シグナルなし",
+            "反発開始_20日2R実現R": rp.get("Realized_R", np.nan) if rp is not None else np.nan,
+            "反発開始_20日2R状態": rp.get("R_PnL_Status", "シグナルなし") if rp is not None else "シグナルなし",
+        })
+
+    ledger = pd.DataFrame(rows)
+    if ledger.empty:
+        return ledger
+    return ledger.sort_values(["イベント開始日", "イベントID"]).reset_index(drop=True)
+
+
+def build_v26_audit_summary(
+    ledger: pd.DataFrame,
+    completed_event_start_df: pd.DataFrame,
+) -> pd.DataFrame:
+    completed_count = 0 if completed_event_start_df is None else len(completed_event_start_df)
+    ledger_count = 0 if ledger is None else len(ledger)
+    unique_count = 0 if ledger is None or ledger.empty else int(ledger["イベントID"].nunique())
+    duplicate_rows = max(0, ledger_count - unique_count)
+
+    expected_ids = set()
+    if completed_event_start_df is not None and not completed_event_start_df.empty:
+        expected_ids = set(
+            pd.to_numeric(completed_event_start_df["BB_Event_ID"], errors="coerce")
+            .dropna().astype(int).tolist()
+        )
+    actual_ids = set() if ledger is None or ledger.empty else set(ledger["イベントID"].astype(int).tolist())
+    missing_ids = sorted(expected_ids - actual_ids)
+    extra_ids = sorted(actual_ids - expected_ids)
+
+    rows = [
+        {"監査項目": "観察完了BBイベント", "値": completed_count, "状態": "基準"},
+        {"監査項目": "独立イベント台帳行数", "値": ledger_count, "状態": "OK" if ledger_count == completed_count else "要確認"},
+        {"監査項目": "ユニークイベントID", "値": unique_count, "状態": "OK" if unique_count == ledger_count else "要確認"},
+        {"監査項目": "重複イベントID行", "値": duplicate_rows, "状態": "OK" if duplicate_rows == 0 else "要確認"},
+        {"監査項目": "台帳に欠落した完了イベントID", "値": len(missing_ids), "状態": "OK" if not missing_ids else "要確認"},
+        {"監査項目": "完了母集団外の余分なイベントID", "値": len(extra_ids), "状態": "OK" if not extra_ids else "要確認"},
+    ]
+    return pd.DataFrame(rows)
+
+
+def build_v26_event_type_summary(ledger: pd.DataFrame) -> pd.DataFrame:
+    if ledger is None or ledger.empty:
+        return pd.DataFrame()
+    order = [
+        "両方確認・同日",
+        "両方確認・反発が後",
+        "両方確認・反発が先",
+        "下落停止のみ",
+        "反発開始のみ",
+        "両方未確認",
+    ]
+    total = len(ledger)
+    rows = []
+    for label in order:
+        count = int(ledger["イベント種別"].eq(label).sum())
+        if count == 0:
+            continue
+        rows.append({
+            "イベント種別": label,
+            "件数": count,
+            "割合_%": count / total * 100.0 if total else np.nan,
+        })
+    return pd.DataFrame(rows)
+
+
+def build_v26_20d_2r_summary(ledger: pd.DataFrame) -> pd.DataFrame:
+    if ledger is None or ledger.empty:
+        return pd.DataFrame()
+    rows = []
+    for label, prefix, signal_col in [
+        ("下落停止", "下落停止", "下落停止確認"),
+        ("反発開始", "反発開始", "反発開始確認"),
+    ]:
+        w = ledger[ledger[signal_col].eq(True)].copy()
+        realized = pd.to_numeric(w[f"{prefix}_20日2R実現R"], errors="coerce")
+        valid = realized.notna()
+        exits = w[f"{prefix}_20日2R決済"].astype(str)
+        vals = realized[valid]
+        rows.append({
+            "シグナル": label,
+            "確認イベント": len(w),
+            "R損益計算可能": int(valid.sum()),
+            "Target決済": int(exits.eq("Target決済").sum()),
+            "Stop決済": int(exits.eq("Stop決済").sum()),
+            "期間末決済": int(exits.eq("期間末終値決済").sum()),
+            "順序不明": int(exits.eq("順序不明").sum()),
+            "データ不足": int(exits.eq("データ不足").sum()),
+            "合計R": float(vals.sum()) if not vals.empty else np.nan,
+            "平均R": float(vals.mean()) if not vals.empty else np.nan,
+            "中央値R": float(vals.median()) if not vals.empty else np.nan,
+        })
+    return pd.DataFrame(rows)
+
+
+def make_v26_copy_text(title: str, data: pd.DataFrame) -> str:
+    if data is None or data.empty:
+        return title + "\n対象イベントなし"
+    return title + "\n" + data.to_csv(index=False, float_format="%.4f").rstrip()
+
+
+# ============================================================
 # 全データ準備
 # ============================================================
 
@@ -4455,14 +4669,14 @@ st.title(
 
 st.caption(
     f"Version {APP_VERSION} ｜ "
-    "固定観察窓・反発確認タイミング診断版"
+    "独立BBイベント台帳・二重計上整理版"
 )
 
 st.info(
-    "v2.2ではv2.1までの研究結果をすべて維持したまま、"
-    "v2.1で反発未確認・見送りとなったイベントを固定イベント終了後20営業日まで追跡します。"
-    "day0～day3という現在の固定観察窓に結果が依存していないかを確認する診断で、"
-    "新しい売買条件は追加しません。"
+    "v2.6ではv2.5.1までの研究結果をすべて維持したまま、"
+    "観察完了したBB下限イベントを『1イベント=1行』の独立イベント台帳へ統一します。"
+    "固定窓後の遅い反発を元イベントへ追加せず、新しいBBイベントは別IDとして扱い、"
+    "二重計上のない研究母集団を確認します。新しい売買条件は追加しません。"
 )
 
 # v2.5.1: 実際の結果は後段で計算されるため、ここに空の表示場所だけ作り、
@@ -8750,7 +8964,115 @@ st.write(
 
 
 # ============================================================
-# v2.5.1 番号選択・クイックコピー
+# v2.6 独立BBイベント台帳
+# ============================================================
+
+st.divider()
+
+st.subheader(
+    "87 v2.6 独立BBイベント台帳・研究ルール"
+)
+st.write(
+    "【正式採用・研究データ管理】1つの観察完了BBイベントを1つの独立した研究単位として扱います。"
+)
+st.write(
+    "【イベント境界】最初のBB下限タッチをday0とし、day0～day3の固定窓だけをそのイベント自身の観察期間とします。"
+)
+st.write(
+    "【二重計上防止】固定窓後の遅い反発は元イベントへ追加しません。新しいBB下限イベントが始まれば、新しいイベントIDの別イベントとしてのみ記録します。"
+)
+st.write(
+    "【R結果】台帳には固定窓内で確認された下落停止・反発開始について、既存の20営業日・2R結果を横並びで記録します。"
+)
+st.warning(
+    "v2.6は研究母集団の整理です。下落停止・反発開始・新イベント発生のどれかを正式な売買条件として採用する変更ではありません。"
+)
+
+v26_ledger = build_v26_event_ledger(
+    df,
+    completed_event_start_df,
+    r_pnl_result_sets[("Stop", 2.0)],
+    r_pnl_result_sets[("Rebound", 2.0)],
+)
+
+v26_audit_summary = build_v26_audit_summary(
+    v26_ledger,
+    completed_event_start_df,
+)
+
+st.subheader(
+    "88 v2.6 独立BBイベント台帳・監査サマリー"
+)
+st.dataframe(v26_audit_summary, use_container_width=True, hide_index=True)
+st.write("📋 コピー用・v2.6独立イベント監査")
+st.code(
+    make_v26_copy_text(
+        "【88 v2.6 独立BBイベント台帳・監査サマリー】",
+        v26_audit_summary,
+    ),
+    language=None,
+)
+
+st.subheader(
+    "89 v2.6 独立BBイベント台帳・全イベント"
+)
+if v26_ledger.empty:
+    st.info("観察完了した独立BBイベントがありません。")
+else:
+    st.dataframe(v26_ledger.round(4), use_container_width=True, hide_index=True)
+    st.write("📋 コピー用・v2.6独立BBイベント台帳")
+    st.code(
+        make_v26_copy_text(
+            "【89 v2.6 独立BBイベント台帳・全イベント】",
+            v26_ledger,
+        ),
+        language=None,
+    )
+
+v26_type_summary = build_v26_event_type_summary(v26_ledger)
+st.subheader(
+    "90 v2.6 独立BBイベント・シグナル構成"
+)
+st.dataframe(v26_type_summary.round(4), use_container_width=True, hide_index=True)
+st.write("📋 コピー用・v2.6イベント種別")
+st.code(
+    make_v26_copy_text(
+        "【90 v2.6 独立BBイベント・シグナル構成】",
+        v26_type_summary,
+    ),
+    language=None,
+)
+
+v26_20d_2r_summary = build_v26_20d_2r_summary(v26_ledger)
+st.subheader(
+    "91 v2.6 独立BBイベント・20日保有・2R集計"
+)
+st.dataframe(v26_20d_2r_summary.round(4), use_container_width=True, hide_index=True)
+st.write("📋 コピー用・v2.6独立イベント20日2R")
+st.code(
+    make_v26_copy_text(
+        "【91 v2.6 独立BBイベント・20日保有・2R集計】",
+        v26_20d_2r_summary,
+    ),
+    language=None,
+)
+
+st.subheader(
+    "92 v2.6 旧延長追跡の扱い"
+)
+st.write(
+    "【研究母集団から分離】v2.2～v2.5の固定窓後追跡は、観察窓の感度と二重計上を確認する診断履歴として残します。"
+)
+st.write(
+    "【正式採用・研究データ管理】今後の基本集計では89番の独立イベント台帳を母集団とし、旧イベントの固定窓後反発を同じイベントへ追加しません。"
+)
+st.write(
+    "【未採用】固定窓後の遅い反発をEntry条件として使うこと。"
+)
+
+
+# ============================================================
+# v2.6 番号選択・クイックコピー
 # ============================================================
 
 # 長いページをスクロールしなくても、サイドバーから番号を選んで
@@ -8825,6 +9147,18 @@ quick_copy_results = {
         "85 v2.5 v2.3旧イベント基準 vs リセット基準・20日保有・2R",
         v25_compare_20_2r,
     ),
+    "88 v2.6 独立BBイベント台帳・監査サマリー": _quick_copy_text(
+        "88 v2.6 独立BBイベント台帳・監査サマリー", v26_audit_summary
+    ),
+    "89 v2.6 独立BBイベント台帳・全イベント": _quick_copy_text(
+        "89 v2.6 独立BBイベント台帳・全イベント", v26_ledger
+    ),
+    "90 v2.6 独立BBイベント・シグナル構成": _quick_copy_text(
+        "90 v2.6 独立BBイベント・シグナル構成", v26_type_summary
+    ),
+    "91 v2.6 独立BBイベント・20日保有・2R集計": _quick_copy_text(
+        "91 v2.6 独立BBイベント・20日保有・2R集計", v26_20d_2r_summary
+    ),
 }
 
 with quick_copy_top_placeholder.container():
@@ -8836,25 +9170,25 @@ with quick_copy_top_placeholder.container():
     quick_copy_choice = st.selectbox(
         "結果番号を選択",
         options=list(quick_copy_results.keys()),
-        index=list(quick_copy_results.keys()).index("84 v2.5 リセット方式・2R"),
-        key="quick_copy_choice_v251",
+        index=list(quick_copy_results.keys()).index("88 v2.6 独立BBイベント台帳・監査サマリー"),
+        key="quick_copy_choice_v26",
     )
 
     if st.button(
         "選択した結果のコピー欄を表示",
         use_container_width=True,
-        key="quick_copy_button_v251",
+        key="quick_copy_button_v26",
     ):
-        st.session_state["quick_copy_selected_title_v251"] = quick_copy_choice
-        st.session_state["quick_copy_selected_text_v251"] = quick_copy_results[quick_copy_choice]
+        st.session_state["quick_copy_selected_title_v26"] = quick_copy_choice
+        st.session_state["quick_copy_selected_text_v26"] = quick_copy_results[quick_copy_choice]
 
-    if st.session_state.get("quick_copy_selected_text_v251"):
+    if st.session_state.get("quick_copy_selected_text_v26"):
         st.success(
-            f"表示中：{st.session_state.get('quick_copy_selected_title_v251', '')}"
+            f"表示中：{st.session_state.get('quick_copy_selected_title_v26', '')}"
         )
         st.caption("下のコピー欄の右上にあるコピーアイコンを押すと全文をコピーできます。")
         st.code(
-            st.session_state["quick_copy_selected_text_v251"],
+            st.session_state["quick_copy_selected_text_v26"],
             language=None,
         )
 
@@ -9048,6 +9382,18 @@ st.write(
 
 st.write(
     "【未採用】v2.5リセット方式を正式な売買ルールにすること"
+)
+
+st.write(
+    "【v2.6 正式採用・研究データ管理】観察完了BBイベントを1イベント=1行の独立イベント台帳で管理"
+)
+
+st.write(
+    "【v2.6 正式採用・研究データ管理】固定窓後の遅い反発を元イベントへ追加せず、新BBイベントは別IDとして集計"
+)
+
+st.write(
+    "【v2.6 実装】独立イベントIDの重複・欠落監査と20日2R結果の統合集計"
 )
 
 st.write(
