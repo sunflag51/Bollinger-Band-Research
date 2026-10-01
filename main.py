@@ -2,7 +2,7 @@
 # GOOG / NVDA
 # Bollinger Band Lower-Band Research Program
 #
-# Version : 1.9
+# Version : 2.1
 #
 # v1.4まで
 # ・BB下限イベント
@@ -73,8 +73,16 @@
 # ・比較不可イベントを理由別に集計
 # ・新しい売買条件は追加せず、v1.9の原因分解だけを行う
 #
+# v2.1
+# ・下落停止シグナル確定時点で既に観測できた情報だけを比較
+# ・方針Bの33 Entryを「同日反発」と「後日反発」に分離
+# ・同日反発を除外し、後日反発 vs 反発未確認・見送りを比較
+# ・BB位置、BandWidth、価格反応などの数値特徴を比較
+# ・BB状態、Squeeze、BandWidth方向などのカテゴリ/真偽特徴を比較
+# ・未来情報を新しいEntry条件として使用せず、事前情報の記述統計だけを行う
+#
 # 重要
-# v2.0も「コスト前のルールベースR損益・意思決定比較」まで。
+# v2.1も「コスト前のルールベースR損益・意思決定比較」まで。
 # 手数料・スリッページ・ギャップ時の実約定差はまだ含めない。
 # 正式な売買ルールはまだ確定しない。
 # ============================================================
@@ -100,7 +108,7 @@ st.set_page_config(
 # 定数
 # ============================================================
 
-APP_VERSION = "2.0"
+APP_VERSION = "2.1"
 
 BB_PERIOD = 20
 BB_STD = 2.0
@@ -2747,6 +2755,295 @@ def make_v20_copy_text(title: str, df: pd.DataFrame) -> str:
 
 
 # ============================================================
+# v2.1
+# 下落停止シグナル時点の事前情報比較
+# ============================================================
+
+V21_NUMERIC_FEATURES = [
+    ("イベント開始からの日数", "Days_From_BB_Event_Start"),
+    ("終値-BB下限距離_%", "Lower_Distance_Close"),
+    ("安値-BB下限距離_%", "Lower_Distance_Low"),
+    ("BandWidth_%", "BandWidth"),
+    ("正規化BandWidth_0to1", "Normalized_BandWidth"),
+    ("BandWidth変化_1D", "BandWidth_Change_1D"),
+    ("BandWidth変化_3D", "BandWidth_Change_3D"),
+    ("BandWidth変化_5D", "BandWidth_Change_5D"),
+    ("終値-BB中央距離_%", "V21_Close_vs_BB_Middle_Pct"),
+    ("終値-前日高値距離_%", "V21_Close_vs_Prev_High_Pct"),
+    ("終値前日比_%", "V21_Close_vs_Prev_Close_Pct"),
+    ("安値前日比_%", "V21_Low_vs_Prev_Low_Pct"),
+    ("ローソク実体_%", "V21_Candle_Body_Pct"),
+    ("日中レンジ内終値位置_%", "V21_Close_Location_In_Range_Pct"),
+]
+
+V21_BOOLEAN_FEATURES = [
+    ("BB下限を下抜け後にBB内復帰", "BB_Lower_Reclaim"),
+    ("BB下限より下で終値", "BB_Lower_Close_Below"),
+    ("陽線", "Bullish_Candle"),
+    ("低BandWidthゾーン", "Low_BandWidth_Zone"),
+    ("公式Squeeze基準", "Official_Squeeze"),
+    ("前日が低BandWidthゾーン", "Prev_Low_BandWidth_Zone"),
+    ("低BWから下方向拡大候補", "Downside_Expansion_Candidate"),
+]
+
+V21_CATEGORY_FEATURES = [
+    ("下落停止時BB状態", "First_Stop_BB_State"),
+    ("BandWidth方向", "BandWidth_Direction"),
+    ("Squeeze状態", "Squeeze_State"),
+    ("下方向拡大状態", "Downside_Expansion_State"),
+]
+
+
+def build_v21_signal_dataset(
+    stop_rows: pd.DataFrame,
+    wait_rebound_rows: pd.DataFrame,
+) -> pd.DataFrame:
+    """Completed eventの最初の下落停止行だけを1イベント1行にする。
+
+    説明変数はすべて下落停止シグナル日の終値確定時点までの値。
+    結果ラベルだけが、その後固定イベント終了まで反発条件が出たかを表す。
+    """
+
+    if stop_rows is None or stop_rows.empty:
+        return pd.DataFrame()
+
+    base = stop_rows.copy()
+    base = base.dropna(subset=["BB_Event_ID"]).copy()
+    base["BB_Event_ID"] = base["BB_Event_ID"].astype(int)
+    base["V21_Stop_Signal_Date"] = base.index
+
+    wait_map = {}
+    if wait_rebound_rows is not None and not wait_rebound_rows.empty:
+        for idx, row in wait_rebound_rows.iterrows():
+            event_id = row.get("BB_Event_ID", np.nan)
+            if pd.isna(event_id):
+                continue
+            wait_map[int(event_id)] = {
+                "date": idx,
+                "days": row.get("Wait_Rebound_Days_From_Stop", np.nan),
+            }
+
+    groups = []
+    rebound_dates = []
+    wait_days_list = []
+
+    for _, row in base.iterrows():
+        event_id = int(row["BB_Event_ID"])
+        info = wait_map.get(event_id)
+
+        if info is None:
+            groups.append("反発未確認・見送り")
+            rebound_dates.append(pd.NaT)
+            wait_days_list.append(np.nan)
+            continue
+
+        wait_days = pd.to_numeric(pd.Series([info["days"]]), errors="coerce").iloc[0]
+        rebound_dates.append(info["date"])
+        wait_days_list.append(wait_days)
+
+        if pd.notna(wait_days) and int(wait_days) == 0:
+            groups.append("同日反発確認")
+        else:
+            groups.append("後日反発確認")
+
+    base["V21_Outcome_Group"] = groups
+    base["V21_Rebound_Confirm_Date"] = rebound_dates
+    base["V21_Wait_Days"] = wait_days_list
+
+    def pct(numerator, denominator):
+        num = pd.to_numeric(numerator, errors="coerce")
+        den = pd.to_numeric(denominator, errors="coerce")
+        return np.where(den != 0, num / den * 100.0, np.nan)
+
+    base["V21_Close_vs_BB_Middle_Pct"] = pct(
+        base["Close"] - base["BB_Middle"], base["BB_Middle"]
+    )
+    base["V21_Close_vs_Prev_High_Pct"] = pct(
+        base["Close"] - base["Prev_High"], base["Prev_High"]
+    )
+    base["V21_Close_vs_Prev_Close_Pct"] = pct(
+        base["Close"] - base["Prev_Close"], base["Prev_Close"]
+    )
+    base["V21_Low_vs_Prev_Low_Pct"] = pct(
+        base["Low"] - base["Prev_Low"], base["Prev_Low"]
+    )
+    base["V21_Candle_Body_Pct"] = pct(
+        base["Close"] - base["Open"], base["Open"]
+    )
+
+    daily_range = pd.to_numeric(base["High"], errors="coerce") - pd.to_numeric(
+        base["Low"], errors="coerce"
+    )
+    base["V21_Close_Location_In_Range_Pct"] = np.where(
+        daily_range > 0,
+        (
+            pd.to_numeric(base["Close"], errors="coerce")
+            - pd.to_numeric(base["Low"], errors="coerce")
+        )
+        / daily_range
+        * 100.0,
+        np.nan,
+    )
+
+    return base.sort_values("BB_Event_ID").reset_index(drop=True)
+
+
+def build_v21_group_count_summary(signal_df: pd.DataFrame) -> pd.DataFrame:
+    if signal_df is None or signal_df.empty:
+        return pd.DataFrame()
+
+    order = ["同日反発確認", "後日反発確認", "反発未確認・見送り"]
+    total = len(signal_df)
+    rows = []
+
+    for group in order:
+        count = int((signal_df["V21_Outcome_Group"] == group).sum())
+        rows.append(
+            {
+                "結果グループ": group,
+                "イベント数": count,
+                "全下落停止に占める割合_%": (count / total * 100.0) if total else np.nan,
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
+def build_v21_numeric_summary(signal_df: pd.DataFrame) -> pd.DataFrame:
+    """同日反発を除外し、後日反発6件 vs 見送り12件を記述比較する。"""
+
+    if signal_df is None or signal_df.empty:
+        return pd.DataFrame()
+
+    later = signal_df[signal_df["V21_Outcome_Group"] == "後日反発確認"].copy()
+    skip = signal_df[signal_df["V21_Outcome_Group"] == "反発未確認・見送り"].copy()
+
+    rows = []
+    for label, col in V21_NUMERIC_FEATURES:
+        if col not in signal_df.columns:
+            continue
+
+        a = pd.to_numeric(later[col], errors="coerce").dropna()
+        b = pd.to_numeric(skip[col], errors="coerce").dropna()
+
+        rows.append(
+            {
+                "事前情報": label,
+                "後日反発_n": len(a),
+                "後日反発_平均": float(a.mean()) if not a.empty else np.nan,
+                "後日反発_中央値": float(a.median()) if not a.empty else np.nan,
+                "見送り_n": len(b),
+                "見送り_平均": float(b.mean()) if not b.empty else np.nan,
+                "見送り_中央値": float(b.median()) if not b.empty else np.nan,
+                "平均差_後日反発-見送り": (
+                    float(a.mean() - b.mean()) if (not a.empty and not b.empty) else np.nan
+                ),
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
+def build_v21_boolean_summary(signal_df: pd.DataFrame) -> pd.DataFrame:
+    if signal_df is None or signal_df.empty:
+        return pd.DataFrame()
+
+    later = signal_df[signal_df["V21_Outcome_Group"] == "後日反発確認"].copy()
+    skip = signal_df[signal_df["V21_Outcome_Group"] == "反発未確認・見送り"].copy()
+
+    rows = []
+    for label, col in V21_BOOLEAN_FEATURES:
+        if col not in signal_df.columns:
+            continue
+
+        later_true = int(later[col].eq(True).sum())
+        skip_true = int(skip[col].eq(True).sum())
+        later_n = len(later)
+        skip_n = len(skip)
+        later_rate = later_true / later_n * 100.0 if later_n else np.nan
+        skip_rate = skip_true / skip_n * 100.0 if skip_n else np.nan
+
+        rows.append(
+            {
+                "事前情報": label,
+                "後日反発_該当": later_true,
+                "後日反発_n": later_n,
+                "後日反発_該当率_%": later_rate,
+                "見送り_該当": skip_true,
+                "見送り_n": skip_n,
+                "見送り_該当率_%": skip_rate,
+                "該当率差_後日反発-見送り_pp": (
+                    later_rate - skip_rate
+                    if pd.notna(later_rate) and pd.notna(skip_rate)
+                    else np.nan
+                ),
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
+def build_v21_category_summary(signal_df: pd.DataFrame) -> pd.DataFrame:
+    if signal_df is None or signal_df.empty:
+        return pd.DataFrame()
+
+    core = signal_df[
+        signal_df["V21_Outcome_Group"].isin(["後日反発確認", "反発未確認・見送り"])
+    ].copy()
+
+    later_n = int((core["V21_Outcome_Group"] == "後日反発確認").sum())
+    skip_n = int((core["V21_Outcome_Group"] == "反発未確認・見送り").sum())
+    rows = []
+
+    for feature_label, col in V21_CATEGORY_FEATURES:
+        if col not in core.columns:
+            continue
+
+        categories = [str(x) for x in core[col].dropna().astype(str).unique()]
+        categories = sorted(categories)
+
+        for category in categories:
+            later_count = int(
+                (
+                    (core["V21_Outcome_Group"] == "後日反発確認")
+                    & (core[col].astype(str) == category)
+                ).sum()
+            )
+            skip_count = int(
+                (
+                    (core["V21_Outcome_Group"] == "反発未確認・見送り")
+                    & (core[col].astype(str) == category)
+                ).sum()
+            )
+            later_rate = later_count / later_n * 100.0 if later_n else np.nan
+            skip_rate = skip_count / skip_n * 100.0 if skip_n else np.nan
+
+            rows.append(
+                {
+                    "事前情報": feature_label,
+                    "状態": category,
+                    "後日反発_件数": later_count,
+                    "後日反発_割合_%": later_rate,
+                    "見送り_件数": skip_count,
+                    "見送り_割合_%": skip_rate,
+                    "割合差_後日反発-見送り_pp": (
+                        later_rate - skip_rate
+                        if pd.notna(later_rate) and pd.notna(skip_rate)
+                        else np.nan
+                    ),
+                }
+            )
+
+    return pd.DataFrame(rows)
+
+
+def make_v21_copy_text(title: str, data: pd.DataFrame) -> str:
+    if data is None or data.empty:
+        return title + "\n対象イベントなし"
+    return title + "\n" + data.to_csv(index=False, float_format="%.4f").rstrip()
+
+
+# ============================================================
 # 全データ準備
 # ============================================================
 
@@ -2947,7 +3244,7 @@ st.caption(
 )
 
 st.info(
-    "v2.0ではv1.9までの研究結果を維持したまま、"
+    "v2.1ではv2.0までの研究結果を維持したまま、"
     "方針Aと方針BのR差が、どのイベントから生じたのかを分解します。"
     "方針Bが見送ったイベント、待ち営業日、A/B結果差、比較不可理由を別々に確認します。"
     "新しい売買条件は追加しません。"
@@ -6376,6 +6673,188 @@ else:
 
 
 # ============================================================
+# v2.1 下落停止時点の事前情報比較
+# ============================================================
+
+st.divider()
+
+st.subheader(
+    "57 v2.1 下落停止時点の事前情報比較ルール"
+)
+
+st.write(
+    "【目的】v2.0で見えた『反発未確認を見送る効果』について、下落停止シグナル日の終値確定時点で既に分かっていた情報に違いがあったかを調べます。"
+)
+
+st.write(
+    "【重要】結果ラベルは固定イベント終了までの反発確認有無ですが、比較するBB・BandWidth・OHLC情報はすべて下落停止シグナル日までの値だけです。"
+)
+
+st.write(
+    "【3グループ】同日反発確認 / 後日反発確認 / 反発未確認・見送り に分けます。"
+)
+
+st.write(
+    "【中心比較】同日反発27件は、下落停止日の時点ですでに反発条件も成立しているため、未来の識別研究から外します。中心比較は『その日はまだ反発していない』イベントだけで、後日反発 vs 見送りを比べます。"
+)
+
+st.warning(
+    "v2.1は差を発見するための記述統計です。今回のGOOG標本を見て閾値を作り、そのまま同じ標本で有効性を主張することはしません。新しい売買フィルターはまだ採用しません。"
+)
+
+v21_signal_df = build_v21_signal_dataset(
+    completed_first_stop_df,
+    completed_wait_rebound_df,
+)
+
+st.subheader(
+    "58 v2.1 下落停止45イベントの反発確認グループ"
+)
+
+v21_group_summary = build_v21_group_count_summary(v21_signal_df)
+st.dataframe(
+    v21_group_summary.round(4),
+    use_container_width=True,
+    hide_index=True,
+)
+st.write("📋 コピー用・反発確認グループ")
+st.code(
+    make_v21_copy_text(
+        "【v2.1 下落停止45イベントの反発確認グループ】",
+        v21_group_summary,
+    ),
+    language=None,
+)
+
+st.subheader(
+    "59 v2.1 同日反発を除外・後日反発 vs 見送り 数値事前情報"
+)
+
+st.caption(
+    "中心比較は、下落停止日に反発開始条件がまだ成立していなかったイベントだけです。後日反発と見送りの差は、売買条件ではなく次の検証候補を探すための観察値です。"
+)
+
+v21_numeric_summary = build_v21_numeric_summary(v21_signal_df)
+st.dataframe(
+    v21_numeric_summary.round(4),
+    use_container_width=True,
+    hide_index=True,
+)
+st.write("📋 コピー用・数値事前情報")
+st.code(
+    make_v21_copy_text(
+        "【v2.1 後日反発 vs 見送り・数値事前情報】",
+        v21_numeric_summary,
+    ),
+    language=None,
+)
+
+st.subheader(
+    "60 v2.1 同日反発を除外・真偽事前情報"
+)
+
+v21_boolean_summary = build_v21_boolean_summary(v21_signal_df)
+st.dataframe(
+    v21_boolean_summary.round(4),
+    use_container_width=True,
+    hide_index=True,
+)
+st.write("📋 コピー用・真偽事前情報")
+st.code(
+    make_v21_copy_text(
+        "【v2.1 後日反発 vs 見送り・真偽事前情報】",
+        v21_boolean_summary,
+    ),
+    language=None,
+)
+
+st.subheader(
+    "61 v2.1 同日反発を除外・状態別事前情報"
+)
+
+v21_category_summary = build_v21_category_summary(v21_signal_df)
+st.dataframe(
+    v21_category_summary.round(4),
+    use_container_width=True,
+    hide_index=True,
+)
+st.write("📋 コピー用・状態別事前情報")
+st.code(
+    make_v21_copy_text(
+        "【v2.1 後日反発 vs 見送り・状態別事前情報】",
+        v21_category_summary,
+    ),
+    language=None,
+)
+
+st.subheader(
+    "62 v2.1 後日反発6件 / 見送り12件・イベント詳細"
+)
+
+v21_core_detail = v21_signal_df[
+    v21_signal_df["V21_Outcome_Group"].isin(["後日反発確認", "反発未確認・見送り"])
+].copy()
+
+if v21_core_detail.empty:
+    st.info("中心比較の対象イベントはありません。")
+else:
+    v21_detail_display = v21_core_detail[
+        [
+            "BB_Event_ID",
+            "V21_Stop_Signal_Date",
+            "V21_Outcome_Group",
+            "V21_Rebound_Confirm_Date",
+            "V21_Wait_Days",
+            "Days_From_BB_Event_Start",
+            "Lower_Distance_Close",
+            "Lower_Distance_Low",
+            "BandWidth",
+            "Normalized_BandWidth",
+            "BandWidth_Change_1D",
+            "V21_Close_vs_Prev_High_Pct",
+            "V21_Candle_Body_Pct",
+            "V21_Close_Location_In_Range_Pct",
+            "First_Stop_BB_State",
+            "BandWidth_Direction",
+            "Squeeze_State",
+            "Downside_Expansion_State",
+        ]
+    ].copy()
+
+    v21_detail_display.columns = [
+        "イベントID",
+        "下落停止シグナル日",
+        "結果グループ",
+        "反発確認日",
+        "待ち営業日",
+        "イベント開始からの日数",
+        "終値-BB下限距離_%",
+        "安値-BB下限距離_%",
+        "BandWidth_%",
+        "正規化BandWidth_0to1",
+        "BandWidth変化_1D",
+        "終値-前日高値距離_%",
+        "ローソク実体_%",
+        "日中レンジ内終値位置_%",
+        "下落停止時BB状態",
+        "BandWidth方向",
+        "Squeeze状態",
+        "下方向拡大状態",
+    ]
+
+    st.dataframe(
+        v21_detail_display.round(4),
+        use_container_width=True,
+        hide_index=True,
+    )
+    st.write("📋 コピー用・v2.1中心比較イベント詳細")
+    st.code(
+        v21_detail_display.to_csv(index=False, float_format="%.4f"),
+        language=None,
+    )
+
+
+# ============================================================
 # 現在の研究段階
 # ============================================================
 
@@ -6522,6 +7001,22 @@ st.write(
 )
 
 st.write(
+    "【v2.1 実装】下落停止シグナル確定時点までの事前情報だけで反発確認グループを比較"
+)
+
+st.write(
+    "【v2.1 実装】同日反発を除外し、後日反発 vs 反発未確認・見送りを比較"
+)
+
+st.write(
+    "【v2.1 実装】BB位置・BandWidth・価格反応・状態分類を記述統計で比較"
+)
+
+st.write(
+    "【未採用】v2.1で見つかった差をそのまま新しいEntry / 見送り条件にすること"
+)
+
+st.write(
     "【未実装】コスト・スリッページを含む約定損益"
 )
 
@@ -6582,6 +7077,12 @@ st.info(
 st.info(
     "v2.0はv1.9の平均R差を、見送り・待ち営業日・差グループ・比較不可理由に分解します。"
     "原因を確認するための診断であり、結果を見て特定の待ち日数や見送り条件を正式採用するものではありません。"
+)
+
+st.info(
+    "v2.1は下落停止シグナル日の終値確定時点までに観測できた情報だけを使い、"
+    "同日反発を除いた『後日反発 vs 反発未確認・見送り』を比較します。"
+    "ここで見つかった差は次の検証候補であり、同じ標本内で新しい売買ルールとして採用しません。"
 )
 
 st.caption(
