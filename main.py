@@ -2,7 +2,7 @@
 # GOOG / NVDA
 # Bollinger Band Lower-Band Research Program
 #
-# Version : 2.3
+# Version : 2.4
 #
 # v1.4まで
 # ・BB下限イベント
@@ -98,8 +98,16 @@
 # ・反発までに新規BBイベントが発生したケースを別集計
 # ・方針Cは研究候補であり、正式売買ルールには採用しない
 #
+# v2.4
+# ・v2.3で「反発までに新規BBイベントあり」となったケースのイベント連結を診断
+# ・元イベント → 新規BBイベント → 遅い反発確認日の関係を明示
+# ・遅い反発が新規BBイベント側の既存「最初の反発開始」と同一かを確認
+# ・同一シグナルを元イベント由来と新イベント由来で二重計上しないための診断を追加
+# ・同じEntry日でもStop起点が異なる場合のR設計差を表示
+# ・新しいEntry条件は追加せず、イベント定義と二重計上だけを検証
+#
 # 重要
-# v2.3も「コスト前のルールベースR損益・意思決定比較」まで。
+# v2.4も「コスト前のルールベースR損益・意思決定比較」まで。
 # 手数料・スリッページ・ギャップ時の実約定差はまだ含めない。
 # 正式な売買ルールはまだ確定しない。
 # ============================================================
@@ -125,7 +133,7 @@ st.set_page_config(
 # 定数
 # ============================================================
 
-APP_VERSION = "2.3"
+APP_VERSION = "2.4"
 
 BB_PERIOD = 20
 BB_STD = 2.0
@@ -3620,6 +3628,288 @@ def build_v23_new_bb_split_summary(
 
 
 def make_v23_copy_text(title: str, data: pd.DataFrame) -> str:
+    if data is None or data.empty:
+        return title + "\n対象イベントなし"
+    return title + "\n" + data.to_csv(index=False, float_format="%.4f").rstrip()
+
+
+# ============================================================
+# v2.4
+# 元見送りイベントと、その後に始まった新規BBイベントの連結診断
+# ============================================================
+
+def build_v24_event_linkage(
+    data: pd.DataFrame,
+    tracking_df: pd.DataFrame,
+    design_df: pd.DataFrame,
+) -> pd.DataFrame:
+    """元イベント → 新規BBイベント → 遅い反発の関係を1行ずつ作る。
+
+    新規BBイベントが複数ある場合は、遅い反発日の行が属しているイベントを
+    優先して「連結先」とする。反発日が固定窓外なら、反発前の最新新規イベントを
+    連結先にする。これによりイベントIDの二重計上を診断する。
+    """
+
+    if data is None or data.empty or tracking_df is None or tracking_df.empty:
+        return pd.DataFrame()
+
+    index_ts = pd.to_datetime(pd.Index(data.index), errors="coerce")
+
+    def resolve_position(date_value):
+        ts = pd.to_datetime(date_value, errors="coerce")
+        if pd.isna(ts):
+            return None
+        target = ts.date()
+        for pos, idx_ts in enumerate(index_ts):
+            if pd.notna(idx_ts) and idx_ts.date() == target:
+                return int(pos)
+        return None
+
+    design_map = {}
+    if design_df is not None and not design_df.empty:
+        for _, r in design_df.iterrows():
+            eid = pd.to_numeric(pd.Series([r.get("BB_Event_ID")]), errors="coerce").iloc[0]
+            if pd.notna(eid):
+                design_map[int(eid)] = r
+
+    rows = []
+
+    for _, tr in tracking_df.iterrows():
+        source_id_value = pd.to_numeric(
+            pd.Series([tr.get("BB_Event_ID")]), errors="coerce"
+        ).iloc[0]
+        if pd.isna(source_id_value):
+            continue
+        source_id = int(source_id_value)
+
+        source_start = pd.to_datetime(tr.get("V22_Event_Start_Date", pd.NaT), errors="coerce")
+        source_end = pd.to_datetime(tr.get("V22_Event_End_Date", pd.NaT), errors="coerce")
+        late_rebound = pd.to_datetime(tr.get("V22_First_Rebound_Date", pd.NaT), errors="coerce")
+
+        end_pos = resolve_position(source_end)
+        rebound_pos = resolve_position(late_rebound)
+
+        new_event_starts = []
+        if end_pos is not None and rebound_pos is not None and rebound_pos > end_pos:
+            for pos in range(end_pos + 1, rebound_pos + 1):
+                if bool(data.iloc[pos].get("New_BB_Lower_Event", False)):
+                    eid = pd.to_numeric(
+                        pd.Series([data.iloc[pos].get("BB_Event_ID", np.nan)]),
+                        errors="coerce",
+                    ).iloc[0]
+                    if pd.notna(eid):
+                        new_event_starts.append((int(eid), int(pos), data.index[pos]))
+
+        new_ids = [x[0] for x in new_event_starts]
+        linked_id = None
+        linked_start_pos = None
+        linked_start_date = pd.NaT
+
+        # 反発日の行が新規イベント固定窓に属していれば、そのイベントを優先。
+        if rebound_pos is not None:
+            rebound_event_id = pd.to_numeric(
+                pd.Series([data.iloc[rebound_pos].get("BB_Event_ID", np.nan)]),
+                errors="coerce",
+            ).iloc[0]
+            if pd.notna(rebound_event_id) and int(rebound_event_id) in new_ids:
+                linked_id = int(rebound_event_id)
+                for eid, pos, dt in new_event_starts:
+                    if eid == linked_id:
+                        linked_start_pos = pos
+                        linked_start_date = dt
+                        break
+
+        # 固定窓外で反発した場合は、反発前に始まった最新イベントを連結先にする。
+        if linked_id is None and new_event_starts:
+            linked_id, linked_start_pos, linked_start_date = new_event_starts[-1]
+
+        linked_end_date = pd.NaT
+        linked_complete = False
+        linked_stop_date = pd.NaT
+        linked_stop_day = np.nan
+        linked_rebound_date = pd.NaT
+        linked_rebound_day = np.nan
+        linked_relation = "新規BBイベントなし"
+        late_is_first_rebound = False
+        late_inside_linked_window = False
+        linked_rebound_entry_date = pd.NaT
+        linked_rebound_entry_price = np.nan
+        linked_rebound_stop_price = np.nan
+        linked_rebound_r_pct = np.nan
+        linked_rebound_r_valid = False
+        linked_rebound_r_status = "対象外"
+
+        if linked_id is not None:
+            event_rows = data[
+                pd.to_numeric(data["BB_Event_ID"], errors="coerce").eq(linked_id)
+            ].copy()
+            if not event_rows.empty:
+                linked_end_values = pd.to_datetime(
+                    event_rows.get("Event_End_Date", pd.Series(dtype="datetime64[ns]")),
+                    errors="coerce",
+                ).dropna()
+                if not linked_end_values.empty:
+                    linked_end_date = linked_end_values.iloc[0]
+                linked_complete = bool(
+                    event_rows.get(
+                        "Event_Observation_Complete", pd.Series(False, index=event_rows.index)
+                    ).eq(True).any()
+                )
+
+                stop_rows = event_rows[
+                    event_rows.get(
+                        "First_Decline_Stop_In_Event", pd.Series(False, index=event_rows.index)
+                    ).eq(True)
+                ]
+                rebound_rows = event_rows[
+                    event_rows.get(
+                        "First_Rebound_Start_In_Event", pd.Series(False, index=event_rows.index)
+                    ).eq(True)
+                ]
+
+                if not stop_rows.empty:
+                    linked_stop_date = stop_rows.index[0]
+                    linked_stop_day = pd.to_numeric(
+                        pd.Series([stop_rows.iloc[0].get("Days_From_BB_Event_Start", np.nan)]),
+                        errors="coerce",
+                    ).iloc[0]
+                if not rebound_rows.empty:
+                    rr = rebound_rows.iloc[0]
+                    linked_rebound_date = rebound_rows.index[0]
+                    linked_rebound_day = pd.to_numeric(
+                        pd.Series([rr.get("Days_From_BB_Event_Start", np.nan)]),
+                        errors="coerce",
+                    ).iloc[0]
+                    linked_rebound_entry_date = pd.to_datetime(
+                        rr.get("Rebound_Entry_Date", pd.NaT), errors="coerce"
+                    )
+                    linked_rebound_entry_price = rr.get("Rebound_Entry_Price", np.nan)
+                    linked_rebound_stop_price = rr.get("Rebound_Stop_Price", np.nan)
+                    linked_rebound_r_pct = rr.get("Rebound_Risk_1R_Percent", np.nan)
+                    linked_rebound_r_valid = bool(rr.get("Rebound_R_Valid", False))
+                    linked_rebound_r_status = rr.get("Rebound_R_Status", "")
+
+                has_stop = not stop_rows.empty
+                has_rebound = not rebound_rows.empty
+                if has_stop and has_rebound:
+                    if linked_rebound_day > linked_stop_day:
+                        linked_relation = "両方確認・反発が後"
+                    elif linked_rebound_day == linked_stop_day:
+                        linked_relation = "両方確認・同日"
+                    else:
+                        linked_relation = "両方確認・反発が先"
+                elif has_stop:
+                    linked_relation = "下落停止のみ"
+                elif has_rebound:
+                    linked_relation = "反発開始のみ"
+                else:
+                    linked_relation = "両方なし"
+
+                if pd.notna(late_rebound) and pd.notna(linked_rebound_date):
+                    late_is_first_rebound = (
+                        pd.Timestamp(late_rebound).date()
+                        == pd.Timestamp(linked_rebound_date).date()
+                    )
+
+            if linked_start_pos is not None and rebound_pos is not None:
+                late_inside_linked_window = bool(
+                    0 <= rebound_pos - linked_start_pos <= LOWER_EVENT_OBSERVATION_DAYS
+                )
+
+        old_design = design_map.get(source_id)
+        old_entry_date = pd.NaT
+        old_entry_price = np.nan
+        old_stop_price = np.nan
+        old_r_pct = np.nan
+        if old_design is not None:
+            old_entry_date = pd.to_datetime(
+                old_design.get("V23Late_Entry_Date", pd.NaT), errors="coerce"
+            )
+            old_entry_price = old_design.get("V23Late_Entry_Price", np.nan)
+            old_stop_price = old_design.get("V23Late_Stop_Price", np.nan)
+            old_r_pct = old_design.get("V23Late_Risk_1R_Percent", np.nan)
+
+        same_entry_date = False
+        if pd.notna(old_entry_date) and pd.notna(linked_rebound_entry_date):
+            same_entry_date = (
+                pd.Timestamp(old_entry_date).date()
+                == pd.Timestamp(linked_rebound_entry_date).date()
+            )
+
+        same_entry_price = False
+        if pd.notna(old_entry_price) and pd.notna(linked_rebound_entry_price):
+            same_entry_price = bool(
+                np.isclose(float(old_entry_price), float(linked_rebound_entry_price))
+            )
+
+        same_stop_price = False
+        if pd.notna(old_stop_price) and pd.notna(linked_rebound_stop_price):
+            same_stop_price = bool(
+                np.isclose(float(old_stop_price), float(linked_rebound_stop_price))
+            )
+
+        rows.append({
+            "元イベントID": source_id,
+            "元イベント開始日": source_start,
+            "元固定窓終了日": source_end,
+            "遅い反発確認日": late_rebound,
+            "新規BBイベント数": len(new_event_starts),
+            "新規BBイベントID一覧": ",".join(str(x) for x in new_ids),
+            "連結先イベントID": linked_id if linked_id is not None else np.nan,
+            "連結先イベント開始日": linked_start_date,
+            "連結先イベント終了日": linked_end_date,
+            "連結先観察完了": linked_complete if linked_id is not None else np.nan,
+            "連結先下落停止日": linked_stop_date,
+            "連結先下落停止day": linked_stop_day,
+            "連結先最初の反発日": linked_rebound_date,
+            "連結先反発day": linked_rebound_day,
+            "連結先シグナル関係": linked_relation,
+            "遅い反発は連結先固定窓内": late_inside_linked_window if linked_id is not None else np.nan,
+            "遅い反発=連結先最初の反発": late_is_first_rebound if linked_id is not None else np.nan,
+            "v2.3_Entry日": old_entry_date,
+            "連結先Rebound_Entry日": linked_rebound_entry_date,
+            "Entry日同一": same_entry_date if linked_id is not None else np.nan,
+            "v2.3_Entry価格": old_entry_price,
+            "連結先Rebound_Entry価格": linked_rebound_entry_price,
+            "Entry価格同一": same_entry_price if linked_id is not None else np.nan,
+            "v2.3_Stop価格": old_stop_price,
+            "連結先Rebound_Stop価格": linked_rebound_stop_price,
+            "Stop価格同一": same_stop_price if linked_id is not None else np.nan,
+            "v2.3_1R率_%": old_r_pct,
+            "連結先Rebound_1R率_%": linked_rebound_r_pct,
+            "連結先Rebound_R設計可能": linked_rebound_r_valid if linked_id is not None else np.nan,
+            "連結先Rebound_R状態": linked_rebound_r_status if linked_id is not None else "対象外",
+        })
+
+    return pd.DataFrame(rows).sort_values("元イベントID").reset_index(drop=True)
+
+
+def build_v24_linkage_summary(linkage_df: pd.DataFrame) -> pd.DataFrame:
+    if linkage_df is None or linkage_df.empty:
+        return pd.DataFrame()
+
+    has_new = pd.to_numeric(linkage_df["新規BBイベント数"], errors="coerce").gt(0)
+    linked = linkage_df[has_new].copy()
+
+    def true_count(column):
+        if linked.empty or column not in linked.columns:
+            return 0
+        return int(linked[column].eq(True).sum())
+
+    rows = [
+        {"診断項目": "元見送りイベント", "件数": len(linkage_df)},
+        {"診断項目": "反発まで新規BBイベントなし", "件数": int((~has_new).sum())},
+        {"診断項目": "反発まで新規BBイベントあり", "件数": int(has_new.sum())},
+        {"診断項目": "遅い反発が連結先の固定窓内", "件数": true_count("遅い反発は連結先固定窓内")},
+        {"診断項目": "遅い反発=連結先の最初の反発", "件数": true_count("遅い反発=連結先最初の反発")},
+        {"診断項目": "v2.3と連結先ReboundのEntry日が同一", "件数": true_count("Entry日同一")},
+        {"診断項目": "v2.3と連結先ReboundのEntry価格が同一", "件数": true_count("Entry価格同一")},
+        {"診断項目": "v2.3と連結先ReboundのStop価格が同一", "件数": true_count("Stop価格同一")},
+    ]
+    return pd.DataFrame(rows)
+
+
+def make_v24_copy_text(title: str, data: pd.DataFrame) -> str:
     if data is None or data.empty:
         return title + "\n対象イベントなし"
     return title + "\n" + data.to_csv(index=False, float_format="%.4f").rstrip()
@@ -7787,6 +8077,165 @@ else:
     st.write("📋 コピー用・v2.3遅い反発Entry詳細")
     st.code(v23_detail.to_csv(index=False, float_format="%.4f"), language=None)
 
+
+# ============================================================
+# v2.4 イベント連結・二重計上診断
+# ============================================================
+
+st.divider()
+
+st.subheader(
+    "75 v2.4 元イベント→新規BBイベント連結・研究ルール"
+)
+
+st.write(
+    "【目的】v2.3で『反発までに新規BBイベントあり』となったケースを、元イベントの遅い反発として数えるべきか、新しいBBイベント側の既存反発として扱うべきかを確認します。"
+)
+st.write(
+    "【二重計上チェック】遅い反発確認日が、新規BBイベントのday0～day3固定窓内にあり、そのイベントの『最初の反発開始』と同じ日かを照合します。"
+)
+st.write(
+    "【R設計チェック】同じ反発日・同じ翌営業日Entryでも、v2.3は元イベントday0からStopを作り、既存Reboundは新イベントday0からStopを作るため、1Rが異なる可能性を表示します。"
+)
+st.warning(
+    "v2.4では新しいEntry条件を追加しません。イベントの所属と二重計上だけを診断します。"
+)
+
+v24_linkage_df = build_v24_event_linkage(
+    df,
+    v22_tracking_df,
+    v23_design_df,
+)
+
+st.subheader(
+    "76 v2.4 元見送りイベント・新規BBイベント連結一覧"
+)
+
+if v24_linkage_df.empty:
+    st.info("v2.4の連結診断対象がありません。")
+else:
+    v24_linkage_display = v24_linkage_df[
+        [
+            "元イベントID",
+            "元イベント開始日",
+            "元固定窓終了日",
+            "遅い反発確認日",
+            "新規BBイベント数",
+            "新規BBイベントID一覧",
+            "連結先イベントID",
+            "連結先イベント開始日",
+            "連結先イベント終了日",
+            "連結先観察完了",
+            "連結先下落停止日",
+            "連結先下落停止day",
+            "連結先最初の反発日",
+            "連結先反発day",
+            "連結先シグナル関係",
+            "遅い反発は連結先固定窓内",
+            "遅い反発=連結先最初の反発",
+        ]
+    ].copy()
+    st.dataframe(v24_linkage_display.round(4), use_container_width=True, hide_index=True)
+    st.write("📋 コピー用・v2.4イベント連結一覧")
+    st.code(
+        make_v24_copy_text(
+            "【v2.4 元見送りイベント・新規BBイベント連結一覧】",
+            v24_linkage_display,
+        ),
+        language=None,
+    )
+
+st.subheader(
+    "77 v2.4 新規BBイベントありケース・連結詳細"
+)
+
+v24_linked_only = pd.DataFrame()
+if not v24_linkage_df.empty:
+    v24_linked_only = v24_linkage_df[
+        pd.to_numeric(v24_linkage_df["新規BBイベント数"], errors="coerce").gt(0)
+    ].copy()
+
+if v24_linked_only.empty:
+    st.info("新規BBイベントありの対象はありません。")
+else:
+    v24_linked_detail = v24_linked_only[
+        [
+            "元イベントID",
+            "遅い反発確認日",
+            "連結先イベントID",
+            "連結先イベント開始日",
+            "連結先下落停止日",
+            "連結先下落停止day",
+            "連結先最初の反発日",
+            "連結先反発day",
+            "連結先シグナル関係",
+            "遅い反発は連結先固定窓内",
+            "遅い反発=連結先最初の反発",
+            "連結先観察完了",
+        ]
+    ].copy()
+    st.dataframe(v24_linked_detail.round(4), use_container_width=True, hide_index=True)
+    st.write("📋 コピー用・v2.4新規BBイベントあり連結詳細")
+    st.code(v24_linked_detail.to_csv(index=False, float_format="%.4f"), language=None)
+
+st.subheader(
+    "78 v2.4 二重計上診断サマリー"
+)
+
+v24_summary = build_v24_linkage_summary(v24_linkage_df)
+st.dataframe(v24_summary, use_container_width=True, hide_index=True)
+st.write("📋 コピー用・v2.4二重計上診断")
+st.code(
+    make_v24_copy_text(
+        "【v2.4 二重計上診断サマリー】",
+        v24_summary,
+    ),
+    language=None,
+)
+
+st.subheader(
+    "79 v2.4 同一反発シグナル・元イベントStop vs 新イベントStop"
+)
+
+if v24_linked_only.empty:
+    st.info("比較対象がありません。")
+else:
+    v24_r_design_compare = v24_linked_only[
+        [
+            "元イベントID",
+            "連結先イベントID",
+            "遅い反発確認日",
+            "v2.3_Entry日",
+            "連結先Rebound_Entry日",
+            "Entry日同一",
+            "v2.3_Entry価格",
+            "連結先Rebound_Entry価格",
+            "Entry価格同一",
+            "v2.3_Stop価格",
+            "連結先Rebound_Stop価格",
+            "Stop価格同一",
+            "v2.3_1R率_%",
+            "連結先Rebound_1R率_%",
+            "連結先Rebound_R設計可能",
+            "連結先Rebound_R状態",
+        ]
+    ].copy()
+    st.dataframe(v24_r_design_compare.round(4), use_container_width=True, hide_index=True)
+    st.write("📋 コピー用・v2.4同一反発シグナルR設計比較")
+    st.code(v24_r_design_compare.to_csv(index=False, float_format="%.4f"), language=None)
+
+st.subheader(
+    "80 v2.4 イベント連結の扱い"
+)
+st.write(
+    "【検証中】遅い反発が新規BBイベント側の最初の反発と同一なら、独立した2つの反発事例として数えず、同一シグナルの別R設計として扱う候補です。"
+)
+st.write(
+    "【未採用】新規BBイベントありをEntry条件にはしません。件数が少なく、同じ標本から条件を作ると過去データへの合わせ込みになるためです。"
+)
+st.write(
+    "【次の判断】77～79番で、4件が本当に既存の新イベント反発と重複しているかを確認してから次の検証へ進みます。"
+)
 
 # ============================================================
 # 現在の研究段階
