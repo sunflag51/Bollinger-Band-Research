@@ -2,7 +2,7 @@
 # GOOG / NVDA
 # Bollinger Band Lower-Band Research Program
 #
-# Version : 2.5
+# Version : 2.7
 #
 # v1.4まで
 # ・BB下限イベント
@@ -124,9 +124,18 @@
 # ・v2.3旧イベント基準とv2.5リセット基準の20日2R差をイベント別に表示
 # ・リセット方式は研究候補であり、正式売買ルールには採用しない
 #
+# v2.7
+# ・v2.6までの全機能を維持
+# ・Stop/Target到達日のOpenが価格水準を飛び越えたギャップを実約定差としてR損益へ反映
+# ・StopギャップはOpen約定で-1Rを超える損失、TargetギャップはOpen約定で+Target Rを超える利益として計算
+# ・日中にStop/Targetへ到達した場合は従来どおり設定水準で約定したものとして扱う
+# ・期間末決済は従来どおり期間末Closeを使用
+# ・旧ルールベースRとギャップ反映Rを並べ、差が出たイベントを個別表示
+# ・手数料・スリッページはまだ反映しない
+#
 # 重要
-# v2.6も「コスト前のルールベースR損益・イベント研究」まで。
-# 手数料・スリッページ・ギャップ時の実約定差はまだ含めない。
+# v2.7も「コスト前のR損益・イベント研究」まで。
+# ギャップ時は日足Openで約定できたと仮定するが、実市場のスリッページはまだ含めない。
 # 正式な売買ルールはまだ確定しない。
 # ============================================================
 
@@ -151,7 +160,7 @@ st.set_page_config(
 # 定数
 # ============================================================
 
-APP_VERSION = "2.6"
+APP_VERSION = "2.7"
 
 BB_PERIOD = 20
 BB_STD = 2.0
@@ -1962,6 +1971,280 @@ def make_r_pnl_copy_text(
         )
 
     return "\n".join(lines)
+
+# ============================================================
+# v2.7
+# ギャップ時の実約定差を反映したR損益
+#
+# first-hit判定では、Stop/TargetをOpenで飛び越えた場合に
+# Observed_Hit_Priceへその日のOpenを既に保存している。
+# v1.7は決済Rを常に-1R / +Target Rへ固定していたが、
+# v2.7ではObserved_Hit_Priceを実約定価格としてR損益へ反映する。
+#
+# 注意：これは日足Openで約定できたという研究上の仮定。
+# 手数料・スリッページ・板状況はまだ含めない。
+# ============================================================
+
+def calculate_gap_aware_r_pnl_results(
+    data: pd.DataFrame,
+    first_hit_results: pd.DataFrame,
+) -> pd.DataFrame:
+
+    if first_hit_results is None or first_hit_results.empty:
+        return pd.DataFrame()
+
+    results = first_hit_results.copy()
+    results["Exit_Type"] = ""
+    results["Exit_Date"] = pd.NaT
+    results["Exit_Price"] = np.nan
+    results["Realized_R"] = np.nan
+    results["R_PnL_Valid"] = False
+    results["R_PnL_Status"] = "計算不可"
+    results["Gap_Execution_Type"] = ""
+    results["Gap_Price_Difference"] = np.nan
+
+    for idx, row in results.iterrows():
+        outcome = row.get("Outcome", "")
+        target_price = row.get("Target_Price", np.nan)
+        stop_price = row.get("Stop_Price", np.nan)
+        entry_price = row.get("Entry_Price", np.nan)
+        risk_1r = row.get("Risk_1R", np.nan)
+        observed_hit = row.get("Observed_Hit_Price", np.nan)
+        entry_date = row.get("Entry_Date", pd.NaT)
+        horizon = row.get("Horizon", np.nan)
+
+        if (
+            outcome in ["Target先着", "Stop先着"]
+            and pd.notna(entry_price)
+            and pd.notna(risk_1r)
+            and float(risk_1r) > 0
+        ):
+            if outcome == "Target先着":
+                level_price = target_price
+                normal_type = "Target決済"
+            else:
+                level_price = stop_price
+                normal_type = "Stop決済"
+
+            if pd.isna(level_price):
+                results.at[idx, "Exit_Type"] = "決済価格計算不可"
+                results.at[idx, "R_PnL_Status"] = "Stop/Target価格なし"
+                continue
+
+            # first-hitでOpenギャップならObserved_Hit_Price=Open、
+            # 日中到達ならObserved_Hit_Price=設定水準。
+            exit_price = (
+                float(observed_hit)
+                if pd.notna(observed_hit)
+                else float(level_price)
+            )
+
+            price_diff = exit_price - float(level_price)
+            tolerance = max(1e-10, abs(float(level_price)) * 1e-10)
+
+            if outcome == "Stop先着" and exit_price < float(stop_price) - tolerance:
+                gap_type = "Stopギャップ"
+                exit_type = "StopギャップOpen決済"
+            elif outcome == "Target先着" and exit_price > float(target_price) + tolerance:
+                gap_type = "Targetギャップ"
+                exit_type = "TargetギャップOpen決済"
+            else:
+                gap_type = "価格水準決済"
+                exit_type = normal_type
+
+            realized_r = (
+                exit_price - float(entry_price)
+            ) / float(risk_1r)
+
+            results.at[idx, "Exit_Type"] = exit_type
+            results.at[idx, "Exit_Date"] = row.get("Outcome_Date", pd.NaT)
+            results.at[idx, "Exit_Price"] = exit_price
+            results.at[idx, "Realized_R"] = float(realized_r)
+            results.at[idx, "R_PnL_Valid"] = True
+            results.at[idx, "R_PnL_Status"] = "ギャップ反映R損益計算可能"
+            results.at[idx, "Gap_Execution_Type"] = gap_type
+            results.at[idx, "Gap_Price_Difference"] = float(price_diff)
+            continue
+
+        if outcome == "同日両方到達・順序不明":
+            results.at[idx, "Exit_Type"] = "順序不明"
+            results.at[idx, "R_PnL_Status"] = "同日両方到達・順序不明"
+            results.at[idx, "Gap_Execution_Type"] = "判定対象外"
+            continue
+
+        if outcome == "将来データ不足":
+            results.at[idx, "Exit_Type"] = "データ不足"
+            results.at[idx, "R_PnL_Status"] = "将来データ不足"
+            results.at[idx, "Gap_Execution_Type"] = "判定対象外"
+            continue
+
+        if outcome == "期間内未到達":
+            if (
+                pd.isna(entry_date)
+                or pd.isna(entry_price)
+                or pd.isna(risk_1r)
+                or pd.isna(horizon)
+                or float(risk_1r) <= 0
+            ):
+                results.at[idx, "Exit_Type"] = "期間末決済不可"
+                results.at[idx, "R_PnL_Status"] = "期間末価格計算不可"
+                continue
+
+            try:
+                entry_position = data.index.get_loc(entry_date)
+            except KeyError:
+                results.at[idx, "Exit_Type"] = "期間末決済不可"
+                results.at[idx, "R_PnL_Status"] = "Entry日なし"
+                continue
+
+            if not isinstance(entry_position, (int, np.integer)):
+                results.at[idx, "Exit_Type"] = "期間末決済不可"
+                results.at[idx, "R_PnL_Status"] = "Entry日重複"
+                continue
+
+            exit_position = int(entry_position) + int(horizon) - 1
+            if exit_position >= len(data):
+                results.at[idx, "Exit_Type"] = "データ不足"
+                results.at[idx, "R_PnL_Status"] = "将来データ不足"
+                continue
+
+            exit_date = data.index[exit_position]
+            exit_close = pd.to_numeric(
+                pd.Series([data.iloc[exit_position]["Close"]]),
+                errors="coerce",
+            ).iloc[0]
+            if pd.isna(exit_close):
+                results.at[idx, "Exit_Type"] = "期間末決済不可"
+                results.at[idx, "R_PnL_Status"] = "期間末終値なし"
+                continue
+
+            realized_r = (
+                float(exit_close) - float(entry_price)
+            ) / float(risk_1r)
+            results.at[idx, "Exit_Type"] = "期間末終値決済"
+            results.at[idx, "Exit_Date"] = exit_date
+            results.at[idx, "Exit_Price"] = float(exit_close)
+            results.at[idx, "Realized_R"] = float(realized_r)
+            results.at[idx, "R_PnL_Valid"] = True
+            results.at[idx, "R_PnL_Status"] = "ギャップ反映R損益計算可能"
+            results.at[idx, "Gap_Execution_Type"] = "期間末決済"
+            results.at[idx, "Gap_Price_Difference"] = 0.0
+            continue
+
+        results.at[idx, "Exit_Type"] = "その他"
+        results.at[idx, "R_PnL_Status"] = "未定義結果"
+
+    return results
+
+
+def build_v27_gap_comparison_summary(
+    legacy_results: pd.DataFrame,
+    gap_results: pd.DataFrame,
+    signal_label: str,
+) -> pd.DataFrame:
+    rows = []
+    if legacy_results is None or gap_results is None or legacy_results.empty or gap_results.empty:
+        return pd.DataFrame()
+
+    for horizon in FIRST_HIT_HORIZONS:
+        old = legacy_results[pd.to_numeric(legacy_results["Horizon"], errors="coerce").eq(horizon)].copy()
+        new = gap_results[pd.to_numeric(gap_results["Horizon"], errors="coerce").eq(horizon)].copy()
+
+        old_valid = old[old["R_PnL_Valid"].eq(True)].copy()
+        new_valid = new[new["R_PnL_Valid"].eq(True)].copy()
+        old_r = pd.to_numeric(old_valid["Realized_R"], errors="coerce").dropna()
+        new_r = pd.to_numeric(new_valid["Realized_R"], errors="coerce").dropna()
+
+        stop_gap = int((new["Gap_Execution_Type"] == "Stopギャップ").sum())
+        target_gap = int((new["Gap_Execution_Type"] == "Targetギャップ").sum())
+
+        old_total = float(old_r.sum()) if not old_r.empty else np.nan
+        new_total = float(new_r.sum()) if not new_r.empty else np.nan
+        old_mean = float(old_r.mean()) if not old_r.empty else np.nan
+        new_mean = float(new_r.mean()) if not new_r.empty else np.nan
+        old_median = float(old_r.median()) if not old_r.empty else np.nan
+        new_median = float(new_r.median()) if not new_r.empty else np.nan
+
+        rows.append({
+            "シグナル": signal_label,
+            "保有期間": f"{horizon}営業日",
+            "対象": len(new),
+            "R損益計算可能": len(new_r),
+            "Stopギャップ": stop_gap,
+            "Targetギャップ": target_gap,
+            "ギャップ合計": stop_gap + target_gap,
+            "旧合計R": old_total,
+            "ギャップ反映合計R": new_total,
+            "合計R差": new_total - old_total if pd.notna(old_total) and pd.notna(new_total) else np.nan,
+            "旧平均R": old_mean,
+            "ギャップ反映平均R": new_mean,
+            "平均R差": new_mean - old_mean if pd.notna(old_mean) and pd.notna(new_mean) else np.nan,
+            "旧中央値R": old_median,
+            "ギャップ反映中央値R": new_median,
+        })
+
+    return pd.DataFrame(rows)
+
+
+def build_v27_gap_changed_detail(
+    legacy_results: pd.DataFrame,
+    gap_results: pd.DataFrame,
+    signal_label: str,
+    horizon: int = 20,
+) -> pd.DataFrame:
+    if legacy_results is None or gap_results is None or legacy_results.empty or gap_results.empty:
+        return pd.DataFrame()
+
+    old = legacy_results[pd.to_numeric(legacy_results["Horizon"], errors="coerce").eq(horizon)].copy()
+    new = gap_results[pd.to_numeric(gap_results["Horizon"], errors="coerce").eq(horizon)].copy()
+
+    old = old[["BB_Event_ID", "Realized_R", "Exit_Type", "Exit_Price"]].rename(columns={
+        "Realized_R": "旧実現R",
+        "Exit_Type": "旧決済",
+        "Exit_Price": "旧決済価格",
+    })
+    new = new[[
+        "BB_Event_ID", "Signal_Date", "Entry_Date", "Entry_Price", "Stop_Price",
+        "Target_Price", "Outcome_Date", "Observed_Hit_Price", "Gap_Execution_Type",
+        "Exit_Type", "Exit_Price", "Realized_R", "Risk_1R_Percent"
+    ]].rename(columns={
+        "Exit_Type": "ギャップ反映決済",
+        "Exit_Price": "ギャップ反映決済価格",
+        "Realized_R": "ギャップ反映実現R",
+    })
+
+    merged = new.merge(old, on="BB_Event_ID", how="left", validate="one_to_one")
+    merged["R差"] = pd.to_numeric(merged["ギャップ反映実現R"], errors="coerce") - pd.to_numeric(merged["旧実現R"], errors="coerce")
+    changed = merged[
+        pd.to_numeric(merged["R差"], errors="coerce").abs().gt(1e-10)
+    ].copy()
+
+    if changed.empty:
+        return pd.DataFrame(columns=[
+            "シグナル", "イベントID", "シグナル日", "Entry日", "Entry価格", "1R率_%",
+            "到達日", "ギャップ種別", "Stop", "Target", "観測Open/到達価格",
+            "旧決済価格", "ギャップ反映決済価格", "旧実現R", "ギャップ反映実現R", "R差"
+        ])
+
+    changed.insert(0, "シグナル", signal_label)
+    changed = changed.rename(columns={
+        "BB_Event_ID": "イベントID",
+        "Signal_Date": "シグナル日",
+        "Entry_Date": "Entry日",
+        "Entry_Price": "Entry価格",
+        "Risk_1R_Percent": "1R率_%",
+        "Outcome_Date": "到達日",
+        "Gap_Execution_Type": "ギャップ種別",
+        "Stop_Price": "Stop",
+        "Target_Price": "Target",
+        "Observed_Hit_Price": "観測Open/到達価格",
+    })
+    return changed[[
+        "シグナル", "イベントID", "シグナル日", "Entry日", "Entry価格", "1R率_%",
+        "到達日", "ギャップ種別", "Stop", "Target", "観測Open/到達価格",
+        "旧決済価格", "ギャップ反映決済価格", "旧実現R", "ギャップ反映実現R", "R差"
+    ]].sort_values(["シグナル", "イベントID"]).reset_index(drop=True)
+
 
 # ============================================================
 # v1.8
@@ -4673,7 +4956,7 @@ st.caption(
 )
 
 st.info(
-    "v2.6ではv2.5.1までの研究結果をすべて維持したまま、"
+    "v2.7ではv2.6までの研究結果をすべて維持したまま、"
     "観察完了したBB下限イベントを『1イベント=1行』の独立イベント台帳へ統一します。"
     "固定窓後の遅い反発を元イベントへ追加せず、新しいBBイベントは別IDとして扱い、"
     "二重計上のない研究母集団を確認します。新しい売買条件は追加しません。"
@@ -9072,6 +9355,117 @@ st.write(
 
 
 # ============================================================
+# v2.7 ギャップ時の実約定差をR損益へ反映
+# ============================================================
+
+st.divider()
+
+st.subheader(
+    "93 v2.7 ギャップ約定差反映・研究ルール"
+)
+st.write(
+    "【目的】Stop / Target到達日の寄り付きが設定価格を飛び越えた場合、従来の固定-1R / +Target Rではなく、その日のOpenを決済価格としてR損益を再計算します。"
+)
+st.write(
+    "【Stopギャップ】OpenがStopより下なら、そのOpenで決済したと仮定するため損失は-1Rを下回る場合があります。"
+)
+st.write(
+    "【Targetギャップ】OpenがTargetより上なら、そのOpenで決済したと仮定するため利益は+2Rを上回る場合があります。"
+)
+st.write(
+    "【日中到達】OpenがStopとTargetの間にあり日中に水準へ到達した場合は、従来どおり設定Stop / Target価格で決済します。"
+)
+st.write(
+    "【期間末】期間内未到達は従来どおり指定保有期間の終値で決済します。"
+)
+st.warning(
+    "v2.7はギャップ時のOpen約定差だけを反映します。手数料・スリッページ・板状況はまだ含めないため、最終的な実運用損益ではありません。"
+)
+
+v27_gap_pnl_sets = {}
+for key, first_hit_results in first_hit_result_sets.items():
+    v27_gap_pnl_sets[key] = calculate_gap_aware_r_pnl_results(
+        df,
+        first_hit_results,
+    )
+
+v27_gap_compare_parts = []
+for prefix_name, label in [("Stop", "下落停止"), ("Rebound", "反発開始")]:
+    part = build_v27_gap_comparison_summary(
+        r_pnl_result_sets[(prefix_name, 2.0)],
+        v27_gap_pnl_sets[(prefix_name, 2.0)],
+        label,
+    )
+    if not part.empty:
+        v27_gap_compare_parts.append(part)
+
+v27_gap_compare_summary = (
+    pd.concat(v27_gap_compare_parts, ignore_index=True)
+    if v27_gap_compare_parts else pd.DataFrame()
+)
+
+st.subheader(
+    "94 v2.7 2R・ギャップ反映前後比較"
+)
+if v27_gap_compare_summary.empty:
+    st.info("ギャップ比較対象がありません。")
+else:
+    st.dataframe(v27_gap_compare_summary.round(4), use_container_width=True, hide_index=True)
+    st.write("📋 コピー用・v2.7ギャップ反映前後比較")
+    st.code(
+        "【94 v2.7 2R・ギャップ反映前後比較】\n"
+        + v27_gap_compare_summary.to_csv(index=False, float_format="%.4f").rstrip(),
+        language=None,
+    )
+
+v27_changed_parts = []
+for prefix_name, label in [("Stop", "下落停止"), ("Rebound", "反発開始")]:
+    part = build_v27_gap_changed_detail(
+        r_pnl_result_sets[(prefix_name, 2.0)],
+        v27_gap_pnl_sets[(prefix_name, 2.0)],
+        label,
+        horizon=20,
+    )
+    if not part.empty:
+        v27_changed_parts.append(part)
+
+v27_gap_changed_20d = (
+    pd.concat(v27_changed_parts, ignore_index=True)
+    if v27_changed_parts else pd.DataFrame()
+)
+
+st.subheader(
+    "95 v2.7 20日保有・2R・ギャップでRが変化したイベント"
+)
+if v27_gap_changed_20d.empty:
+    st.info("20日保有・2Rでは、ギャップによってR損益が変化したイベントはありません。")
+else:
+    st.dataframe(v27_gap_changed_20d.round(4), use_container_width=True, hide_index=True)
+    st.write("📋 コピー用・v2.7ギャップ差イベント")
+    st.code(
+        "【95 v2.7 20日保有・2R・ギャップでRが変化したイベント】\n"
+        + v27_gap_changed_20d.to_csv(index=False, float_format="%.4f").rstrip(),
+        language=None,
+    )
+
+st.subheader(
+    "96 v2.7 ギャップ反映の扱い"
+)
+st.write(
+    "【研究計算を改善】Stop / TargetをOpenで飛び越えた場合は、Openを決済価格としてR損益へ反映します。"
+)
+st.write(
+    "【維持】同日Stop/Target両方到達で順序不明のケースは、引き続きR損益から除外します。"
+)
+st.write(
+    "【未実装】手数料・スリッページを含むネットR損益。"
+)
+st.write(
+    "【未採用】ギャップ結果を見てEntry条件・Stop条件・Target条件を変更すること。"
+)
+
+
+# ============================================================
 # v2.6 番号選択・クイックコピー
 # ============================================================
 
@@ -9159,6 +9553,12 @@ quick_copy_results = {
     "91 v2.6 独立BBイベント・20日保有・2R集計": _quick_copy_text(
         "91 v2.6 独立BBイベント・20日保有・2R集計", v26_20d_2r_summary
     ),
+    "94 v2.7 2R・ギャップ反映前後比較": _quick_copy_text(
+        "94 v2.7 2R・ギャップ反映前後比較", v27_gap_compare_summary
+    ),
+    "95 v2.7 20日保有・2R・ギャップでRが変化したイベント": _quick_copy_text(
+        "95 v2.7 20日保有・2R・ギャップでRが変化したイベント", v27_gap_changed_20d
+    ),
 }
 
 with quick_copy_top_placeholder.container():
@@ -9170,25 +9570,25 @@ with quick_copy_top_placeholder.container():
     quick_copy_choice = st.selectbox(
         "結果番号を選択",
         options=list(quick_copy_results.keys()),
-        index=list(quick_copy_results.keys()).index("88 v2.6 独立BBイベント台帳・監査サマリー"),
-        key="quick_copy_choice_v26",
+        index=list(quick_copy_results.keys()).index("94 v2.7 2R・ギャップ反映前後比較"),
+        key="quick_copy_choice_v27",
     )
 
     if st.button(
         "選択した結果のコピー欄を表示",
         use_container_width=True,
-        key="quick_copy_button_v26",
+        key="quick_copy_button_v27",
     ):
-        st.session_state["quick_copy_selected_title_v26"] = quick_copy_choice
-        st.session_state["quick_copy_selected_text_v26"] = quick_copy_results[quick_copy_choice]
+        st.session_state["quick_copy_selected_title_v27"] = quick_copy_choice
+        st.session_state["quick_copy_selected_text_v27"] = quick_copy_results[quick_copy_choice]
 
-    if st.session_state.get("quick_copy_selected_text_v26"):
+    if st.session_state.get("quick_copy_selected_text_v27"):
         st.success(
-            f"表示中：{st.session_state.get('quick_copy_selected_title_v26', '')}"
+            f"表示中：{st.session_state.get('quick_copy_selected_title_v27', '')}"
         )
         st.caption("下のコピー欄の右上にあるコピーアイコンを押すと全文をコピーできます。")
         st.code(
-            st.session_state["quick_copy_selected_text_v26"],
+            st.session_state["quick_copy_selected_text_v27"],
             language=None,
         )
 
@@ -9397,7 +9797,11 @@ st.write(
 )
 
 st.write(
-    "【未実装】コスト・スリッページを含む約定損益"
+    "【v2.7 実装】Stop / TargetをOpenで飛び越えたギャップ時はOpen約定としてR損益へ反映"
+)
+
+st.write(
+    "【未実装】手数料・スリッページを含むネット約定損益"
 )
 
 st.write(
