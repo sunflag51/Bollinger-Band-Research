@@ -87,7 +87,7 @@
 # ・固定窓終了後1/2/3/5/10/20営業日以内の反発確認件数を表示
 # ・day3で見送る設計が結果に強く依存していないかを確認
 # ・固定窓終了後の反発は新しいEntry条件には使わず、観察窓感度の診断だけを行う
-# v2.2.1: 固定イベント終了日のindex型差異で追跡日数が0になる問題を修正
+# v2.2.2: イベントID再照合を廃止し、イベント開始日＋固定3営業日から終了位置を直接決定
 #
 # 重要
 # v2.2も「コスト前のルールベースR損益・意思決定比較」まで。
@@ -116,7 +116,7 @@ st.set_page_config(
 # 定数
 # ============================================================
 
-APP_VERSION = "2.2.1"
+APP_VERSION = "2.2.2"
 
 BB_PERIOD = 20
 BB_STD = 2.0
@@ -3069,7 +3069,8 @@ def build_v22_post_window_rebound_tracking(
     """v2.1で見送りとなったイベントを、固定イベント終了後だけ追跡する。
 
     反発条件は既存と同じ Close > Prev_High。
-    固定イベント day0～day3 の外側を診断するだけで、売買ルールは変更しない。
+    v2.2.2ではイベントIDの再照合に依存せず、イベント開始日の実データ位置を
+    day0として observation_days=3 行先を固定窓終了位置にする。
     """
 
     if data is None or data.empty or signal_df is None or signal_df.empty:
@@ -3086,6 +3087,19 @@ def build_v22_post_window_rebound_tracking(
     row_count = len(data)
     rows = []
 
+    # 日付型・timezone差に左右されず、同じ取引日を実データ上で探す。
+    index_timestamps = pd.to_datetime(pd.Index(data.index), errors="coerce")
+
+    def resolve_position(date_value):
+        ts = pd.to_datetime(date_value, errors="coerce")
+        if pd.isna(ts):
+            return None
+        target_date = ts.date()
+        for pos, idx_ts in enumerate(index_timestamps):
+            if pd.notna(idx_ts) and idx_ts.date() == target_date:
+                return int(pos)
+        return None
+
     for _, signal_row in skip.iterrows():
         event_id_value = signal_row.get("BB_Event_ID", np.nan)
         if pd.isna(event_id_value):
@@ -3100,44 +3114,51 @@ def build_v22_post_window_rebound_tracking(
             signal_row.get("BB_Event_Start_Date", pd.NaT),
             errors="coerce",
         )
-        event_end_date = pd.to_datetime(
-            signal_row.get("Event_End_Date", pd.NaT),
-            errors="coerce",
-        )
 
-        # v2.2.1 bug fix:
-        # Event_End_Date carried on the signal row can differ in dtype/timezone
-        # from the index used by the display dataframe.  Resolve the end of the
-        # fixed event directly from rows that share the same BB_Event_ID.
-        # This also guarantees that day0-day3 is the source of truth.
-        event_rows = data[
-            pd.to_numeric(data["BB_Event_ID"], errors="coerce").eq(event_id)
-        ]
-
-        if not event_rows.empty:
-            event_end_date = event_rows.index[-1]
-            end_position = int(data.index.get_indexer([event_end_date])[0])
-        else:
-            end_position = -1
-
-        if end_position < 0:
+        # v2.2.2 fix:
+        # 固定イベントは day0～day3。BB_Event_ID の再照合ではなく、
+        # イベント開始日の実データ位置 + 3営業日を終了位置とする。
+        start_position = resolve_position(event_start_date)
+        if start_position is None:
             rows.append(
                 {
                     "BB_Event_ID": event_id,
                     "V22_Event_Start_Date": event_start_date,
                     "V22_Stop_Signal_Date": stop_date,
-                    "V22_Event_End_Date": event_end_date,
+                    "V22_Event_End_Date": pd.NaT,
                     "V22_First_Rebound_Date": pd.NaT,
                     "V22_Days_After_Event_End": np.nan,
                     "V22_Days_From_Event_Start": np.nan,
                     "V22_Days_From_Stop": np.nan,
                     "V22_Available_Follow_Days": 0,
-                    "V22_20D_Status": "イベント終了位置取得不可",
+                    "V22_20D_Status": "イベント開始位置取得不可",
                     "V22_New_BB_Event_Before_Rebound": np.nan,
                     "V22_New_BB_Event_Count_To_Check_End": np.nan,
                 }
             )
             continue
+
+        end_position = start_position + LOWER_EVENT_OBSERVATION_DAYS
+        if end_position >= row_count:
+            rows.append(
+                {
+                    "BB_Event_ID": event_id,
+                    "V22_Event_Start_Date": event_start_date,
+                    "V22_Stop_Signal_Date": stop_date,
+                    "V22_Event_End_Date": pd.NaT,
+                    "V22_First_Rebound_Date": pd.NaT,
+                    "V22_Days_After_Event_End": np.nan,
+                    "V22_Days_From_Event_Start": np.nan,
+                    "V22_Days_From_Stop": np.nan,
+                    "V22_Available_Follow_Days": 0,
+                    "V22_20D_Status": "固定イベント未完了",
+                    "V22_New_BB_Event_Before_Rebound": np.nan,
+                    "V22_New_BB_Event_Count_To_Check_End": np.nan,
+                }
+            )
+            continue
+
+        event_end_date = data.index[end_position]
         available_follow_days = max(0, row_count - end_position - 1)
         search_days = min(max_follow_days, available_follow_days)
         search_end_position = end_position + search_days
@@ -3156,13 +3177,10 @@ def build_v22_post_window_rebound_tracking(
         if rebound_position is not None:
             first_rebound_date = data.index[rebound_position]
             days_after_end = int(rebound_position - end_position)
+            days_from_event_start = int(rebound_position - start_position)
 
-            if pd.notna(event_start_date) and event_start_date in data.index:
-                start_position = int(data.index.get_loc(event_start_date))
-                days_from_event_start = int(rebound_position - start_position)
-
-            if pd.notna(stop_date) and stop_date in data.index:
-                stop_position = int(data.index.get_loc(stop_date))
+            stop_position = resolve_position(stop_date)
+            if stop_position is not None:
                 days_from_stop = int(rebound_position - stop_position)
 
             status = "固定窓終了後20営業日以内に反発確認"
@@ -3205,7 +3223,6 @@ def build_v22_post_window_rebound_tracking(
         )
 
     return pd.DataFrame(rows).sort_values("BB_Event_ID").reset_index(drop=True)
-
 
 def build_v22_horizon_summary(
     tracking_df: pd.DataFrame,
