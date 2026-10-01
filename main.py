@@ -65,8 +65,16 @@
 # ・方針Bの待ち日数、Entry件数、見送り件数、機会平均Rを表示
 # ・将来「両方出たイベント」だけを後から選ぶペア比較の選別問題を避ける
 #
+# v2.0
+# ・v1.9の意思決定結果を「なぜ差が出たか」に分解
+# ・方針Bが見送ったイベントで、方針Aなら何Rだったかを集計
+# ・反発待ち0/1/2/3営業日ごとに、A/BのR損益と差を集計
+# ・B>A / A>B / 同じ の結果グループ別に平均R差を集計
+# ・比較不可イベントを理由別に集計
+# ・新しい売買条件は追加せず、v1.9の原因分解だけを行う
+#
 # 重要
-# v1.9も「コスト前のルールベースR損益・意思決定比較」まで。
+# v2.0も「コスト前のルールベースR損益・意思決定比較」まで。
 # 手数料・スリッページ・ギャップ時の実約定差はまだ含めない。
 # 正式な売買ルールはまだ確定しない。
 # ============================================================
@@ -92,7 +100,7 @@ st.set_page_config(
 # 定数
 # ============================================================
 
-APP_VERSION = "1.9"
+APP_VERSION = "2.0"
 
 BB_PERIOD = 20
 BB_STD = 2.0
@@ -2507,6 +2515,238 @@ def make_v19_decision_copy_text(
 
 
 # ============================================================
+# v2.0
+# v1.9 意思決定差の原因分解
+# ============================================================
+
+def build_v20_skip_summary(
+    results: pd.DataFrame,
+) -> pd.DataFrame:
+
+    if results is None or results.empty:
+        return pd.DataFrame()
+
+    rows = []
+
+    for horizon in FIRST_HIT_HORIZONS:
+        part = results[
+            (results["Horizon"] == int(horizon))
+            & (~results["Policy_B_Has_Rebound"])
+        ].copy()
+
+        if part.empty:
+            continue
+
+        a_valid = part[part["Policy_A_R_Valid"].eq(True)].copy()
+        a_r = pd.to_numeric(a_valid["Policy_A_R"], errors="coerce").dropna()
+
+        rows.append(
+            {
+                "保有期間": f"{horizon}営業日",
+                "方針B見送り": len(part),
+                "方針A_R計算可能": len(a_r),
+                "方針A合計R": float(a_r.sum()) if not a_r.empty else np.nan,
+                "方針A平均R": float(a_r.mean()) if not a_r.empty else np.nan,
+                "方針A中央値R": float(a_r.median()) if not a_r.empty else np.nan,
+                "方針AプラスR": int((a_r > 0).sum()),
+                "方針AマイナスR": int((a_r < 0).sum()),
+                "方針AゼロR": int(np.isclose(a_r, 0.0).sum()),
+                "方針A_Target決済": int((part["Policy_A_Exit_Type"] == "Target決済").sum()),
+                "方針A_Stop決済": int((part["Policy_A_Exit_Type"] == "Stop決済").sum()),
+                "方針A_期間末決済": int((part["Policy_A_Exit_Type"] == "期間末終値決済").sum()),
+                "方針A_比較不可": int((~part["Policy_A_R_Valid"].eq(True)).sum()),
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
+def build_v20_wait_day_summary(
+    results: pd.DataFrame,
+) -> pd.DataFrame:
+
+    if results is None or results.empty:
+        return pd.DataFrame()
+
+    rows = []
+
+    for horizon in FIRST_HIT_HORIZONS:
+        entered = results[
+            (results["Horizon"] == int(horizon))
+            & results["Policy_B_Has_Rebound"]
+        ].copy()
+
+        if entered.empty:
+            continue
+
+        waits = pd.to_numeric(
+            entered["Wait_Rebound_Days_From_Stop"],
+            errors="coerce",
+        )
+        entered = entered[waits.notna()].copy()
+        entered["Wait_Days_Int"] = pd.to_numeric(
+            entered["Wait_Rebound_Days_From_Stop"], errors="coerce"
+        ).astype(int)
+
+        for wait_days in sorted(entered["Wait_Days_Int"].unique()):
+            group = entered[entered["Wait_Days_Int"] == int(wait_days)].copy()
+            valid = group[group["Decision_Comparison_Valid"]].copy()
+
+            a_r = pd.to_numeric(valid["Policy_A_R"], errors="coerce").dropna()
+            b_r = pd.to_numeric(valid["Policy_B_Trade_R"], errors="coerce").dropna()
+            diff = pd.to_numeric(
+                valid["Decision_R_Difference_B_Minus_A"], errors="coerce"
+            ).dropna()
+
+            rows.append(
+                {
+                    "保有期間": f"{horizon}営業日",
+                    "待ち営業日": int(wait_days),
+                    "方針B_Entry": len(group),
+                    "比較可能": len(valid),
+                    "方針A平均R": float(a_r.mean()) if not a_r.empty else np.nan,
+                    "方針B平均R": float(b_r.mean()) if not b_r.empty else np.nan,
+                    "平均R差_B-A": float(diff.mean()) if not diff.empty else np.nan,
+                    "中央値R差_B-A": float(diff.median()) if not diff.empty else np.nan,
+                    "方針Bが高い": int((valid["Decision_Result"] == "方針Bが高い").sum()),
+                    "方針Aが高い": int((valid["Decision_Result"] == "方針Aが高い").sum()),
+                    "同じ": int((valid["Decision_Result"] == "同じ").sum()),
+                    "比較不可": int((~group["Decision_Comparison_Valid"]).sum()),
+                }
+            )
+
+    return pd.DataFrame(rows)
+
+
+def build_v20_difference_group_summary(
+    results: pd.DataFrame,
+) -> pd.DataFrame:
+
+    if results is None or results.empty:
+        return pd.DataFrame()
+
+    rows = []
+    group_order = ["方針Bが高い", "方針Aが高い", "同じ"]
+
+    for horizon in FIRST_HIT_HORIZONS:
+        part = results[
+            (results["Horizon"] == int(horizon))
+            & results["Decision_Comparison_Valid"]
+        ].copy()
+
+        for group_name in group_order:
+            group = part[part["Decision_Result"] == group_name].copy()
+            if group.empty:
+                continue
+
+            a_r = pd.to_numeric(group["Policy_A_R"], errors="coerce").dropna()
+            b_r = pd.to_numeric(group["Policy_B_Opportunity_R"], errors="coerce").dropna()
+            diff = pd.to_numeric(
+                group["Decision_R_Difference_B_Minus_A"], errors="coerce"
+            ).dropna()
+
+            rows.append(
+                {
+                    "保有期間": f"{horizon}営業日",
+                    "結果グループ": group_name,
+                    "イベント数": len(group),
+                    "方針B_Entry": int(group["Policy_B_Has_Rebound"].sum()),
+                    "方針B_見送り": int((~group["Policy_B_Has_Rebound"]).sum()),
+                    "方針A平均R": float(a_r.mean()) if not a_r.empty else np.nan,
+                    "方針B機会平均R": float(b_r.mean()) if not b_r.empty else np.nan,
+                    "平均R差_B-A": float(diff.mean()) if not diff.empty else np.nan,
+                    "中央値R差_B-A": float(diff.median()) if not diff.empty else np.nan,
+                }
+            )
+
+    return pd.DataFrame(rows)
+
+
+def v20_unavailable_reason(row: pd.Series) -> str:
+
+    if bool(row.get("Decision_Comparison_Valid", False)):
+        return "比較可能"
+
+    if not bool(row.get("Stop_R_Valid", False)):
+        status = row.get("Stop_R_Status", "")
+        return f"方針A_R設計不可: {status}"
+
+    if not bool(row.get("Policy_A_R_Valid", False)):
+        status = row.get("Policy_A_R_Status", "")
+        if pd.isna(status) or str(status).strip() == "":
+            status = "結果なし"
+        return f"方針A_R損益不可: {status}"
+
+    has_rebound = bool(row.get("Policy_B_Has_Rebound", False))
+    if not has_rebound:
+        return "見送りは比較可能のはず・要確認"
+
+    if not bool(row.get("WaitRebound_R_Valid", False)):
+        status = row.get("WaitRebound_R_Status", "")
+        return f"方針B_R設計不可: {status}"
+
+    if not bool(row.get("Policy_B_Trade_R_Valid", False)):
+        status = row.get("Policy_B_Trade_R_Status", "")
+        if pd.isna(status) or str(status).strip() == "":
+            status = "結果なし"
+        return f"方針B_R損益不可: {status}"
+
+    return "理由未分類・要確認"
+
+
+def build_v20_unavailable_summary(
+    results: pd.DataFrame,
+) -> pd.DataFrame:
+
+    if results is None or results.empty:
+        return pd.DataFrame()
+
+    rows = []
+
+    for horizon in FIRST_HIT_HORIZONS:
+        part = results[results["Horizon"] == int(horizon)].copy()
+        unavailable = part[~part["Decision_Comparison_Valid"]].copy()
+
+        if unavailable.empty:
+            rows.append(
+                {
+                    "保有期間": f"{horizon}営業日",
+                    "比較不可理由": "なし",
+                    "件数": 0,
+                    "イベントID": "",
+                }
+            )
+            continue
+
+        unavailable["Unavailable_Reason"] = unavailable.apply(
+            v20_unavailable_reason,
+            axis=1,
+        )
+
+        for reason, group in unavailable.groupby("Unavailable_Reason", dropna=False):
+            ids = ",".join(
+                str(int(x))
+                for x in pd.to_numeric(group["BB_Event_ID"], errors="coerce").dropna()
+            )
+            rows.append(
+                {
+                    "保有期間": f"{horizon}営業日",
+                    "比較不可理由": str(reason),
+                    "件数": len(group),
+                    "イベントID": ids,
+                }
+            )
+
+    return pd.DataFrame(rows)
+
+
+def make_v20_copy_text(title: str, df: pd.DataFrame) -> str:
+    if df is None or df.empty:
+        return title + "\n対象イベントなし"
+    return title + "\n" + df.to_csv(index=False, float_format="%.4f").rstrip()
+
+
+# ============================================================
 # 全データ準備
 # ============================================================
 
@@ -2703,14 +2943,14 @@ st.title(
 
 st.caption(
     f"Version {APP_VERSION} ｜ "
-    "下落停止時点からの意思決定比較版"
+    "v1.9意思決定差の原因分解版"
 )
 
 st.info(
-    "v1.9ではv1.8までの研究結果を維持したまま、"
-    "意思決定の起点を下落停止シグナル確認時点に固定します。"
-    "方針Aは下落停止後すぐEntry、方針Bは同じ固定イベント内で反発開始を待ち、"
-    "確認できなければ見送り0R機会として残します。"
+    "v2.0ではv1.9までの研究結果を維持したまま、"
+    "方針Aと方針BのR差が、どのイベントから生じたのかを分解します。"
+    "方針Bが見送ったイベント、待ち営業日、A/B結果差、比較不可理由を別々に確認します。"
+    "新しい売買条件は追加しません。"
 )
 
 
@@ -5978,6 +6218,164 @@ else:
 
 
 # ============================================================
+# v2.0 原因分解
+# ============================================================
+
+st.divider()
+
+st.subheader(
+    "51 v2.0 v1.9意思決定差の原因分解ルール"
+)
+
+st.write(
+    "【目的】v1.9で観測された方針Aと方針Bの平均R差が、どのイベントから生じたのかを分解します。新しいEntry条件は追加しません。"
+)
+
+st.write(
+    "【見送り診断】方針Bが反発未確認で見送ったイベントについて、同じイベントで方針Aなら何Rだったかを残します。"
+)
+
+st.write(
+    "【待ち日数診断】方針BがEntryしたイベントを、下落停止から反発確認まで0・1・2・3営業日に分けます。"
+)
+
+st.write(
+    "【差が出たイベント】方針Bが高い / 方針Aが高い / 同じ、の3グループに分けて平均R差を確認します。"
+)
+
+st.write(
+    "【比較不可診断】v1.9で比較不可だったイベントを、R設計不可・同日順序不明などの理由別に表示します。"
+)
+
+st.warning(
+    "この分解結果を見てから待ち日数や見送り条件を後付けで売買ルール化すると、過去データへの過適合になり得ます。"
+    "v2.0では原因を観察するだけで、正式なフィルターにはしません。"
+)
+
+
+def show_v20_analysis_for_target(target_r: float):
+    results = v19_decision_result_sets[target_r]
+    target_label = "+1.5R" if np.isclose(target_r, 1.5) else "+2R"
+
+    st.subheader(
+        f"52 v2.0 方針Bが見送ったイベント・方針A結果 {target_label}"
+    )
+    skip_summary = build_v20_skip_summary(results)
+    st.dataframe(skip_summary.round(4), use_container_width=True, hide_index=True)
+    st.write("📋 コピー用・見送りイベント診断")
+    st.code(
+        make_v20_copy_text(
+            f"【v2.0 方針B見送りイベント・方針A結果 {target_label}】",
+            skip_summary,
+        ),
+        language=None,
+    )
+
+    st.subheader(
+        f"53 v2.0 反発確認までの待ち営業日別診断 {target_label}"
+    )
+    wait_summary = build_v20_wait_day_summary(results)
+    st.dataframe(wait_summary.round(4), use_container_width=True, hide_index=True)
+    st.write("📋 コピー用・待ち営業日別診断")
+    st.code(
+        make_v20_copy_text(
+            f"【v2.0 待ち営業日別診断 {target_label}】",
+            wait_summary,
+        ),
+        language=None,
+    )
+
+    st.subheader(
+        f"54 v2.0 A/B結果差グループ診断 {target_label}"
+    )
+    difference_summary = build_v20_difference_group_summary(results)
+    st.dataframe(difference_summary.round(4), use_container_width=True, hide_index=True)
+    st.write("📋 コピー用・A/B結果差グループ診断")
+    st.code(
+        make_v20_copy_text(
+            f"【v2.0 A/B結果差グループ診断 {target_label}】",
+            difference_summary,
+        ),
+        language=None,
+    )
+
+    st.subheader(
+        f"55 v2.0 比較不可理由 {target_label}"
+    )
+    unavailable_summary = build_v20_unavailable_summary(results)
+    st.dataframe(unavailable_summary, use_container_width=True, hide_index=True)
+    st.write("📋 コピー用・比較不可理由")
+    st.code(
+        make_v20_copy_text(
+            f"【v2.0 比較不可理由 {target_label}】",
+            unavailable_summary,
+        ),
+        language=None,
+    )
+
+
+v20_target_label = st.radio(
+    "v2.0 原因分解で表示するTarget",
+    options=["+1.5R", "+2R"],
+    index=1,
+    horizontal=True,
+    key="v20_cause_target",
+)
+
+v20_target_r = 1.5 if v20_target_label == "+1.5R" else 2.0
+show_v20_analysis_for_target(v20_target_r)
+
+# 20営業日の「差が出たイベント」だけを個別確認できる表。
+st.subheader(
+    f"56 v2.0 20営業日・差が出たイベント詳細 {v20_target_label}"
+)
+
+v20_detail_source = v19_decision_result_sets[v20_target_r].copy()
+v20_detail = v20_detail_source[
+    (v20_detail_source["Horizon"] == 20)
+    & v20_detail_source["Decision_Comparison_Valid"]
+    & (v20_detail_source["Decision_Result"] != "同じ")
+].copy()
+
+if v20_detail.empty:
+    st.info("20営業日でA/BのR差が出たイベントはありません。")
+else:
+    v20_detail_display = v20_detail[
+        [
+            "BB_Event_ID",
+            "Stop_Signal_Date",
+            "Policy_A_R",
+            "Policy_A_Exit_Type",
+            "Policy_B_Action",
+            "WaitRebound_Signal_Date",
+            "Wait_Rebound_Days_From_Stop",
+            "Policy_B_Trade_R",
+            "Policy_B_Opportunity_R",
+            "Policy_B_Exit_Type",
+            "Decision_R_Difference_B_Minus_A",
+            "Decision_Result",
+        ]
+    ].copy()
+    v20_detail_display.columns = [
+        "イベントID",
+        "下落停止シグナル日",
+        "方針A_R",
+        "方針A決済",
+        "方針B行動",
+        "反発確認日",
+        "待ち営業日",
+        "方針B_Entry取引R",
+        "方針B_機会R",
+        "方針B決済",
+        "R差_B-A",
+        "比較結果",
+    ]
+    st.dataframe(v20_detail_display.round(4), use_container_width=True, hide_index=True)
+    st.write("📋 コピー用・20営業日差イベント詳細")
+    st.code(v20_detail_display.to_csv(index=False), language=None)
+
+
+# ============================================================
 # 現在の研究段階
 # ============================================================
 
@@ -6104,6 +6502,26 @@ st.write(
 )
 
 st.write(
+    "【v2.0 実装】方針Bが見送ったイベントで、方針Aなら何Rだったかを分離"
+)
+
+st.write(
+    "【v2.0 実装】反発確認までの待ち営業日0・1・2・3日別にR結果を分離"
+)
+
+st.write(
+    "【v2.0 実装】方針Bが高い / 方針Aが高い / 同じ、の原因グループを分離"
+)
+
+st.write(
+    "【v2.0 実装】比較不可イベントを理由別に表示"
+)
+
+st.write(
+    "【未採用】v2.0の原因分解結果を新しい売買フィルターとして使うこと"
+)
+
+st.write(
     "【未実装】コスト・スリッページを含む約定損益"
 )
 
@@ -6159,6 +6577,11 @@ st.info(
 st.info(
     "方針Bの機会平均Rには見送り0Rを含みます。Entry取引だけの平均Rも別列で表示し、"
     "『取引の質』と『見送りを含む意思決定全体』を混同しないようにしています。"
+)
+
+st.info(
+    "v2.0はv1.9の平均R差を、見送り・待ち営業日・差グループ・比較不可理由に分解します。"
+    "原因を確認するための診断であり、結果を見て特定の待ち日数や見送り条件を正式採用するものではありません。"
 )
 
 st.caption(
