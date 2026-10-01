@@ -141,8 +141,18 @@
 # ・20営業日・2Rについてイベント別のコストRとNet Rを表示
 # ・コスト設定は研究仮定であり、特定証券会社の実コストを意味しない
 #
+# v2.9
+# ・v2.8までの全機能を維持
+# ・完了BBイベント母集団をイベント開始日順に前半 / 後半へ固定分割
+# ・奇数件の場合は前半をfloor(N/2)、残りを後半とする
+# ・シグナルごとに境界を作り直さず、共通の独立イベント母集団で同じ境界を使用
+# ・5 / 10 / 20営業日・2RのNet Rを前半 / 後半で比較
+# ・20営業日・2Rは前半→後半の差も表示
+# ・過去5年全体を既に研究に使っているため、後半を真の未使用OOSとは呼ばない
+# ・時系列安定性の診断であり、正式な売買条件の採用判定ではない
+#
 # 重要
-# v2.8は日足ベースの研究用ネットR損益まで。
+# v2.9は日足ベースの研究用ネットR損益＋時系列安定性診断まで。
 # 板・出来高・部分約定・税金・為替コストなどはまだ含めない。
 # 正式な売買ルールはまだ確定しない。
 # ============================================================
@@ -168,7 +178,7 @@ st.set_page_config(
 # 定数
 # ============================================================
 
-APP_VERSION = "2.8"
+APP_VERSION = "2.9"
 
 BB_PERIOD = 20
 BB_STD = 2.0
@@ -2444,6 +2454,160 @@ def build_v28_cost_detail(
     })
     detail["R差"] = detail["Net実現R"] - detail["Gross実現R"]
     return detail.sort_values(["シグナル", "イベントID"]).reset_index(drop=True)
+
+
+# ============================================================
+# v2.9
+# 独立BBイベント母集団の固定時系列分割
+#
+# 重要:
+# ・分割境界はシグナル成績を見て決めない。
+# ・v2.6の独立イベント台帳をイベント開始日順に並べ、
+#   前半=floor(N/2)、後半=残り と機械的に分ける。
+# ・下落停止 / 反発開始で別々の境界を作らない。
+# ============================================================
+
+def build_v29_time_split_master(ledger: pd.DataFrame):
+    if ledger is None or ledger.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    master = ledger[["イベントID", "イベント開始日"]].copy()
+    master["イベントID"] = pd.to_numeric(master["イベントID"], errors="coerce")
+    master["イベント開始日"] = pd.to_datetime(master["イベント開始日"], errors="coerce")
+    master = (
+        master.dropna(subset=["イベントID", "イベント開始日"])
+        .drop_duplicates(subset=["イベントID"], keep="first")
+        .sort_values(["イベント開始日", "イベントID"])
+        .reset_index(drop=True)
+    )
+    if master.empty:
+        return master, pd.DataFrame()
+
+    master["イベントID"] = master["イベントID"].astype(int)
+    total = len(master)
+    first_count = total // 2
+    master["時系列区分"] = "後半"
+    if first_count > 0:
+        master.loc[: first_count - 1, "時系列区分"] = "前半"
+
+    audit_rows = []
+    for label in ["前半", "後半"]:
+        part = master[master["時系列区分"].eq(label)].copy()
+        if part.empty:
+            audit_rows.append({
+                "時系列区分": label,
+                "母集団イベント数": 0,
+                "最初のイベントID": np.nan,
+                "最後のイベントID": np.nan,
+                "開始日": pd.NaT,
+                "終了日": pd.NaT,
+            })
+        else:
+            audit_rows.append({
+                "時系列区分": label,
+                "母集団イベント数": len(part),
+                "最初のイベントID": int(part.iloc[0]["イベントID"]),
+                "最後のイベントID": int(part.iloc[-1]["イベントID"]),
+                "開始日": part["イベント開始日"].min(),
+                "終了日": part["イベント開始日"].max(),
+            })
+
+    audit = pd.DataFrame(audit_rows)
+    audit["全イベント数"] = total
+    audit["分割方式"] = "イベント開始日順・前半=floor(N/2)・後半=残り"
+    return master, audit
+
+
+def build_v29_time_split_net_summary(
+    net_results: pd.DataFrame,
+    split_master: pd.DataFrame,
+    signal_label: str,
+) -> pd.DataFrame:
+    if (
+        net_results is None or net_results.empty
+        or split_master is None or split_master.empty
+    ):
+        return pd.DataFrame()
+
+    work = net_results.copy()
+    work["BB_Event_ID"] = pd.to_numeric(work["BB_Event_ID"], errors="coerce")
+    split = split_master[["イベントID", "時系列区分"]].copy()
+    split["イベントID"] = pd.to_numeric(split["イベントID"], errors="coerce")
+    work = work.merge(
+        split,
+        left_on="BB_Event_ID",
+        right_on="イベントID",
+        how="left",
+        validate="many_to_one",
+    )
+
+    rows = []
+    for horizon in FIRST_HIT_HORIZONS:
+        horizon_part = work[
+            pd.to_numeric(work["Horizon"], errors="coerce").eq(horizon)
+        ].copy()
+        for period_label in ["前半", "後半"]:
+            part = horizon_part[horizon_part["時系列区分"].eq(period_label)].copy()
+            valid = part[part["Net_R_Valid"].eq(True)].copy()
+            net_r = pd.to_numeric(valid["Net_Realized_R"], errors="coerce").dropna()
+            gross_r = pd.to_numeric(valid["Gross_Realized_R"], errors="coerce").dropna()
+            cost_r = pd.to_numeric(valid["Cost_R"], errors="coerce").dropna()
+            population_count = int(split_master["時系列区分"].eq(period_label).sum())
+
+            rows.append({
+                "シグナル": signal_label,
+                "保有期間": f"{horizon}営業日",
+                "時系列区分": period_label,
+                "母集団イベント": population_count,
+                "シグナル対象": len(part),
+                "Net_R計算可能": len(net_r),
+                "Gross合計R": float(gross_r.sum()) if not gross_r.empty else np.nan,
+                "Net合計R": float(net_r.sum()) if not net_r.empty else np.nan,
+                "コスト合計R": float(cost_r.sum()) if not cost_r.empty else np.nan,
+                "Net平均R": float(net_r.mean()) if not net_r.empty else np.nan,
+                "Net中央値R": float(net_r.median()) if not net_r.empty else np.nan,
+                "NetプラスR": int((net_r > 0).sum()),
+                "NetマイナスR": int((net_r < 0).sum()),
+                "NetゼロR": int((net_r.abs() <= 1e-12).sum()),
+            })
+
+    return pd.DataFrame(rows)
+
+
+def build_v29_20d_difference(summary: pd.DataFrame) -> pd.DataFrame:
+    if summary is None or summary.empty:
+        return pd.DataFrame()
+
+    part = summary[summary["保有期間"].eq("20営業日")].copy()
+    rows = []
+    for signal_label in ["下落停止", "反発開始"]:
+        signal = part[part["シグナル"].eq(signal_label)].copy()
+        early = signal[signal["時系列区分"].eq("前半")]
+        late = signal[signal["時系列区分"].eq("後半")]
+        if early.empty or late.empty:
+            continue
+        e = early.iloc[0]
+        l = late.iloc[0]
+        rows.append({
+            "シグナル": signal_label,
+            "前半_Net_R計算可能": int(e["Net_R計算可能"]),
+            "後半_Net_R計算可能": int(l["Net_R計算可能"]),
+            "前半_Net合計R": e["Net合計R"],
+            "後半_Net合計R": l["Net合計R"],
+            "前半_Net平均R": e["Net平均R"],
+            "後半_Net平均R": l["Net平均R"],
+            "平均R差_後半-前半": (
+                float(l["Net平均R"]) - float(e["Net平均R"])
+                if pd.notna(l["Net平均R"]) and pd.notna(e["Net平均R"]) else np.nan
+            ),
+            "前半_Net中央値R": e["Net中央値R"],
+            "後半_Net中央値R": l["Net中央値R"],
+            "前半_プラスR": int(e["NetプラスR"]),
+            "後半_プラスR": int(l["NetプラスR"]),
+            "前半_マイナスR": int(e["NetマイナスR"]),
+            "後半_マイナスR": int(l["NetマイナスR"]),
+        })
+    return pd.DataFrame(rows)
 
 
 # ============================================================
@@ -5152,14 +5316,14 @@ st.title(
 
 st.caption(
     f"Version {APP_VERSION} ｜ "
-    "ギャップ＋取引コスト反映・ネットR研究版"
+    "時系列分割・Net R再現性診断版"
 )
 
 st.info(
-    "v2.8ではv2.7までの研究結果をすべて維持し、"
-    "ギャップ反映後の約定価格へ、Entry / Exit両方の手数料とスリッページを加えます。"
-    "Gross R（コスト前）とNet R（コスト後）を同じ1R基準で比較します。"
-    "新しい売買条件は追加しません。"
+    "v2.9ではv2.8までの研究結果をすべて維持し、"
+    "55件の独立BBイベントを時系列順の前半・後半へ固定分割します。"
+    "同じEntry / Stop / Target / ギャップ / コスト条件のままNet Rを比較し、"
+    "利益が特定時期だけに偏っていないかを診断します。新しい売買条件は追加しません。"
 )
 
 # v2.5.1: 実際の結果は後段で計算されるため、ここに空の表示場所だけ作り、
@@ -9824,6 +9988,103 @@ st.write(
 
 
 # ============================================================
+# v2.9 固定時系列分割・Net R安定性診断
+# ============================================================
+
+st.divider()
+
+st.subheader(
+    "101 v2.9 固定時系列分割・研究ルール"
+)
+st.write(
+    "【固定分割】v2.6の独立BBイベント台帳をイベント開始日順に並べ、前半=floor(N/2)、後半=残りとして機械的に分けます。"
+)
+st.write(
+    "【共通境界】下落停止と反発開始で別々の境界は作りません。55件の独立イベント母集団に対して同じ前半 / 後半を使います。"
+)
+st.write(
+    "【条件固定】Entry / Stop / Target / ギャップ約定 / 手数料 / スリッページはv2.8と同じままです。"
+)
+st.warning(
+    "後半データもこれまでの研究で既に見ているため、これは真の未使用OOS検証ではありません。過去結果の時系列安定性を診断するための分割です。"
+)
+
+v29_split_master, v29_split_audit = build_v29_time_split_master(v26_ledger)
+
+st.subheader(
+    "102 v2.9 固定時系列分割・監査サマリー"
+)
+if v29_split_audit.empty:
+    st.info("時系列分割の監査対象がありません。")
+else:
+    st.dataframe(v29_split_audit, use_container_width=True, hide_index=True)
+    st.write("📋 コピー用・v2.9時系列分割監査")
+    st.code(
+        "【102 v2.9 固定時系列分割・監査サマリー】\n"
+        + v29_split_audit.to_csv(index=False, date_format="%Y-%m-%d").rstrip(),
+        language=None,
+    )
+
+v29_time_summary_parts = []
+for prefix_name, label in [("Stop", "下落停止"), ("Rebound", "反発開始")]:
+    part = build_v29_time_split_net_summary(
+        v28_net_pnl_sets[(prefix_name, 2.0)],
+        v29_split_master,
+        label,
+    )
+    if not part.empty:
+        v29_time_summary_parts.append(part)
+
+v29_time_summary = (
+    pd.concat(v29_time_summary_parts, ignore_index=True)
+    if v29_time_summary_parts else pd.DataFrame()
+)
+
+st.subheader(
+    "103 v2.9 2R・コスト後Net R・前半後半比較"
+)
+if v29_time_summary.empty:
+    st.info("時系列比較対象がありません。")
+else:
+    st.dataframe(v29_time_summary.round(4), use_container_width=True, hide_index=True)
+    st.write("📋 コピー用・v2.9前半後半Net R")
+    st.code(
+        "【103 v2.9 2R・コスト後Net R・前半後半比較】\n"
+        + v29_time_summary.to_csv(index=False, float_format="%.4f").rstrip(),
+        language=None,
+    )
+
+v29_20d_difference = build_v29_20d_difference(v29_time_summary)
+
+st.subheader(
+    "104 v2.9 20日保有・2R・前半→後半差"
+)
+if v29_20d_difference.empty:
+    st.info("20日保有・2Rの前半後半比較対象がありません。")
+else:
+    st.dataframe(v29_20d_difference.round(4), use_container_width=True, hide_index=True)
+    st.write("📋 コピー用・v2.9 20日2R前半後半差")
+    st.code(
+        "【104 v2.9 20日保有・2R・前半→後半差】\n"
+        + v29_20d_difference.to_csv(index=False, float_format="%.4f").rstrip(),
+        language=None,
+    )
+
+st.subheader(
+    "105 v2.9 時系列分割の扱い"
+)
+st.write(
+    "【診断目的】全期間平均がプラスでも、前半または後半の一方だけで作られていないかを確認します。"
+)
+st.write(
+    "【未採用】前半 / 後半の結果を見て、良かった期間だけを選んだりEntry条件を後付け変更したりすること。"
+)
+st.write(
+    "【次段階候補】同じルールを変更せず別銘柄NVDAへ適用し、銘柄をまたいだ再現性を確認します。"
+)
+
+
+# ============================================================
 # v2.6 番号選択・クイックコピー
 # ============================================================
 
@@ -9923,6 +10184,15 @@ quick_copy_results = {
     "99 v2.8 20日保有・2R・イベント別コスト後Net R": _quick_copy_text(
         "99 v2.8 20日保有・2R・イベント別コスト後Net R", v28_cost_detail_20d
     ),
+    "102 v2.9 固定時系列分割・監査サマリー": _quick_copy_text(
+        "102 v2.9 固定時系列分割・監査サマリー", v29_split_audit
+    ),
+    "103 v2.9 2R・コスト後Net R・前半後半比較": _quick_copy_text(
+        "103 v2.9 2R・コスト後Net R・前半後半比較", v29_time_summary
+    ),
+    "104 v2.9 20日保有・2R・前半→後半差": _quick_copy_text(
+        "104 v2.9 20日保有・2R・前半→後半差", v29_20d_difference
+    ),
 }
 
 with quick_copy_top_placeholder.container():
@@ -9934,25 +10204,25 @@ with quick_copy_top_placeholder.container():
     quick_copy_choice = st.selectbox(
         "結果番号を選択",
         options=list(quick_copy_results.keys()),
-        index=list(quick_copy_results.keys()).index("98 v2.8 2R・ギャップ反映Gross vs コスト後Net比較"),
-        key="quick_copy_choice_v28",
+        index=list(quick_copy_results.keys()).index("102 v2.9 固定時系列分割・監査サマリー"),
+        key="quick_copy_choice_v29",
     )
 
     if st.button(
         "選択した結果のコピー欄を表示",
         use_container_width=True,
-        key="quick_copy_button_v28",
+        key="quick_copy_button_v29",
     ):
-        st.session_state["quick_copy_selected_title_v28"] = quick_copy_choice
-        st.session_state["quick_copy_selected_text_v28"] = quick_copy_results[quick_copy_choice]
+        st.session_state["quick_copy_selected_title_v29"] = quick_copy_choice
+        st.session_state["quick_copy_selected_text_v29"] = quick_copy_results[quick_copy_choice]
 
-    if st.session_state.get("quick_copy_selected_text_v28"):
+    if st.session_state.get("quick_copy_selected_text_v29"):
         st.success(
-            f"表示中：{st.session_state.get('quick_copy_selected_title_v28', '')}"
+            f"表示中：{st.session_state.get('quick_copy_selected_title_v29', '')}"
         )
         st.caption("下のコピー欄の右上にあるコピーアイコンを押すと全文をコピーできます。")
         st.code(
-            st.session_state["quick_copy_selected_text_v28"],
+            st.session_state["quick_copy_selected_text_v29"],
             language=None,
         )
 
@@ -10173,6 +10443,14 @@ st.write(
 )
 
 st.write(
+    "【v2.9 実装】独立BBイベント母集団を共通境界で前半 / 後半へ固定分割し、Net Rの時系列安定性を診断"
+)
+
+st.write(
+    "【v2.9 注意】後半は既に研究で見た期間を含むため、真の未使用OOSではない"
+)
+
+st.write(
     "【未実装】R期待値・最大ドローダウン等を含む本格バックテスト"
 )
 
@@ -10186,7 +10464,7 @@ st.divider()
 st.warning(
     "重要：Target先着率や平均Rだけで正式な売買ルールは決めません。"
     "同日順序不明・期間内未到達・将来データ不足を分離し、"
-    "v2.8では研究用の手数料・スリッページまで反映します。"
+    "v2.9では研究用の手数料・スリッページに加え、固定時系列分割で安定性を診断します。"
     "板・出来高・部分約定・税金・為替コストなどはまだ含みません。"
 )
 
