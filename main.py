@@ -87,6 +87,7 @@
 # ・固定窓終了後1/2/3/5/10/20営業日以内の反発確認件数を表示
 # ・day3で見送る設計が結果に強く依存していないかを確認
 # ・固定窓終了後の反発は新しいEntry条件には使わず、観察窓感度の診断だけを行う
+# v2.2.1: 固定イベント終了日のindex型差異で追跡日数が0になる問題を修正
 #
 # 重要
 # v2.2も「コスト前のルールベースR損益・意思決定比較」まで。
@@ -115,7 +116,7 @@ st.set_page_config(
 # 定数
 # ============================================================
 
-APP_VERSION = "2.2"
+APP_VERSION = "2.2.1"
 
 BB_PERIOD = 20
 BB_STD = 2.0
@@ -3104,18 +3105,22 @@ def build_v22_post_window_rebound_tracking(
             errors="coerce",
         )
 
-        if pd.isna(event_end_date):
-            event_rows = data[
-                pd.to_numeric(data["BB_Event_ID"], errors="coerce") == event_id
-            ]
-            if not event_rows.empty and "Event_End_Date" in event_rows.columns:
-                end_values = pd.to_datetime(
-                    event_rows["Event_End_Date"], errors="coerce"
-                ).dropna()
-                if not end_values.empty:
-                    event_end_date = end_values.iloc[0]
+        # v2.2.1 bug fix:
+        # Event_End_Date carried on the signal row can differ in dtype/timezone
+        # from the index used by the display dataframe.  Resolve the end of the
+        # fixed event directly from rows that share the same BB_Event_ID.
+        # This also guarantees that day0-day3 is the source of truth.
+        event_rows = data[
+            pd.to_numeric(data["BB_Event_ID"], errors="coerce").eq(event_id)
+        ]
 
-        if pd.isna(event_end_date) or event_end_date not in data.index:
+        if not event_rows.empty:
+            event_end_date = event_rows.index[-1]
+            end_position = int(data.index.get_indexer([event_end_date])[0])
+        else:
+            end_position = -1
+
+        if end_position < 0:
             rows.append(
                 {
                     "BB_Event_ID": event_id,
@@ -3127,14 +3132,12 @@ def build_v22_post_window_rebound_tracking(
                     "V22_Days_From_Event_Start": np.nan,
                     "V22_Days_From_Stop": np.nan,
                     "V22_Available_Follow_Days": 0,
-                    "V22_20D_Status": "イベント終了日取得不可",
+                    "V22_20D_Status": "イベント終了位置取得不可",
                     "V22_New_BB_Event_Before_Rebound": np.nan,
                     "V22_New_BB_Event_Count_To_Check_End": np.nan,
                 }
             )
             continue
-
-        end_position = int(data.index.get_loc(event_end_date))
         available_follow_days = max(0, row_count - end_position - 1)
         search_days = min(max_follow_days, available_follow_days)
         search_end_position = end_position + search_days
