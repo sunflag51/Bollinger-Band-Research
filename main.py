@@ -2,7 +2,7 @@
 # GOOG / NVDA
 # Bollinger Band Lower-Band Research Program
 #
-# Version : 1.5
+# Version : 1.5.1
 #
 # v1.4まで
 # ・BB下限イベント
@@ -18,8 +18,15 @@
 # ・下落停止 / 反発開始を別々にR設計
 # ・R計算不可ケースを分離
 #
+# v1.5.1
+# ・1R率 = 1R / Entry × 100 を追加
+# ・下落停止 / 反発開始それぞれの1R率を診断
+# ・最小 / 中央値 / 平均 / 最大を表示
+# ・1R率の分布を研究用区分で表示
+# ・1R率による除外はまだ行わない
+#
 # 重要
-# v1.5では「R価格設計の確認」まで。
+# v1.5.1では「R幅の診断」まで。
 # -1R / +1.5R / +2R の到達判定、勝率、期待値、
 # 売買判断はまだ行わない。
 # ============================================================
@@ -45,7 +52,7 @@ st.set_page_config(
 # 定数
 # ============================================================
 
-APP_VERSION = "1.5"
+APP_VERSION = "1.5.1"
 
 BB_PERIOD = 20
 BB_STD = 2.0
@@ -1144,6 +1151,10 @@ def calculate_r_design(
         f"{prefix}_Risk_1R"
     )
 
+    risk_percent_col = (
+        f"{prefix}_Risk_1R_Percent"
+    )
+
     target_15_col = (
         f"{prefix}_Target_1_5R"
     )
@@ -1166,6 +1177,7 @@ def calculate_r_design(
     df[entry_price_col] = np.nan
     df[stop_price_col] = np.nan
     df[risk_col] = np.nan
+    df[risk_percent_col] = np.nan
     df[target_15_col] = np.nan
     df[target_20_col] = np.nan
 
@@ -1293,6 +1305,12 @@ def calculate_r_design(
 
             continue
 
+        risk_1r_percent = (
+            risk_1r
+            / float(entry_price)
+            * 100
+        )
+
         target_15 = (
             float(entry_price)
             + 1.5 * risk_1r
@@ -1307,6 +1325,11 @@ def calculate_r_design(
             signal_date,
             risk_col,
         ] = risk_1r
+
+        df.at[
+            signal_date,
+            risk_percent_col,
+        ] = risk_1r_percent
 
         df.at[
             signal_date,
@@ -1517,14 +1540,14 @@ st.title(
 
 st.caption(
     f"Version {APP_VERSION} ｜ "
-    "下落停止 vs 反発開始 ＋ R設計確認版"
+    "下落停止 vs 反発開始 ＋ 1R率診断版"
 )
 
 st.info(
-    "v1.5ではv1.4の研究を維持したまま、"
-    "シグナル確認日の次営業日始値を仮Entry、"
-    "イベント開始日からシグナル確認日までの最安値を"
-    "仮Stopとして、1R・1.5R・2R価格を計算します。"
+    "v1.5.1ではv1.5のR設計を維持したまま、"
+    "1RがEntry価格の何％に相当するかを診断します。"
+    "極端に小さい1Rがどの程度あるかを確認する段階で、"
+    "1R率による除外条件はまだ設定しません。"
 )
 
 
@@ -2963,13 +2986,13 @@ else:
 
 
 # ============================================================
-# ㉓ v1.5 R設計ルール
+# ㉓ v1.5 / v1.5.1 R設計ルール
 # ============================================================
 
 st.divider()
 
 st.subheader(
-    "㉓ v1.5 R設計ルール"
+    "㉓ v1.5 / v1.5.1 R設計ルール"
 )
 
 st.write(
@@ -2994,6 +3017,14 @@ st.write(
 
 st.write(
     "【除外】Entry ≦ Stop は現在のロングR設計では計算不可"
+)
+
+st.write(
+    "【v1.5.1 診断】1R率 ＝ 1R ÷ Entry × 100"
+)
+
+st.write(
+    "【未採用】1R率による除外条件はまだ設定しない"
 )
 
 st.warning(
@@ -3133,6 +3164,7 @@ else:
                 "Stop_Entry_Price",
                 "Stop_Stop_Price",
                 "Stop_Risk_1R",
+                "Stop_Risk_1R_Percent",
                 "Stop_Target_1_5R",
                 "Stop_Target_2R",
                 "Stop_R_Status",
@@ -3150,6 +3182,7 @@ else:
         "仮Entry",
         "仮Stop",
         "1R",
+        "1R率 %",
         "1.5R目標",
         "2R目標",
         "R状態",
@@ -3188,6 +3221,7 @@ else:
                 "Rebound_Entry_Price",
                 "Rebound_Stop_Price",
                 "Rebound_Risk_1R",
+                "Rebound_Risk_1R_Percent",
                 "Rebound_Target_1_5R",
                 "Rebound_Target_2R",
                 "Rebound_R_Status",
@@ -3205,6 +3239,7 @@ else:
         "仮Entry",
         "仮Stop",
         "1R",
+        "1R率 %",
         "1.5R目標",
         "2R目標",
         "R状態",
@@ -3232,6 +3267,7 @@ stop_compare = (
             "Stop_Entry_Price",
             "Stop_Stop_Price",
             "Stop_Risk_1R",
+            "Stop_Risk_1R_Percent",
             "Stop_R_Valid",
         ]
     ]
@@ -3246,6 +3282,7 @@ rebound_compare = (
             "Rebound_Entry_Price",
             "Rebound_Stop_Price",
             "Rebound_Risk_1R",
+            "Rebound_Risk_1R_Percent",
             "Rebound_R_Valid",
         ]
     ]
@@ -3308,6 +3345,9 @@ else:
                 "Stop_Risk_1R":
                     "下落停止1R",
 
+                "Stop_Risk_1R_Percent":
+                    "下落停止1R率 %",
+
                 "Stop_R_Valid":
                     "下落停止R有効",
 
@@ -3322,6 +3362,9 @@ else:
 
                 "Rebound_Risk_1R":
                     "反発1R",
+
+                "Rebound_Risk_1R_Percent":
+                    "反発1R率 %",
 
                 "Rebound_R_Valid":
                     "反発R有効",
@@ -3457,13 +3500,180 @@ else:
 
 
 # ============================================================
-# ㉚ 現在の研究段階
+# v1.5.1 1R率診断表示
+# ============================================================
+
+def show_risk_percent_diagnostics(
+    title: str,
+    data: pd.DataFrame,
+    percent_column: str,
+    event_id_column: str = "BB_Event_ID",
+):
+
+    st.subheader(title)
+
+    diagnostic_df = (
+        data[
+            data[percent_column].notna()
+        ]
+        .copy()
+    )
+
+    if diagnostic_df.empty:
+
+        st.info(
+            "1R率を診断できるイベントがありません。"
+        )
+
+        return
+
+    values = diagnostic_df[
+        percent_column
+    ].astype(float)
+
+    minimum = values.min()
+    median = values.median()
+    mean = values.mean()
+    maximum = values.max()
+
+    col1, col2, col3, col4 = st.columns(4)
+
+    with col1:
+        st.metric(
+            "最小1R率",
+            f"{minimum:.4f}%",
+        )
+
+    with col2:
+        st.metric(
+            "中央値",
+            f"{median:.2f}%",
+        )
+
+    with col3:
+        st.metric(
+            "平均",
+            f"{mean:.2f}%",
+        )
+
+    with col4:
+        st.metric(
+            "最大1R率",
+            f"{maximum:.2f}%",
+        )
+
+    # この区分は診断表示だけ。
+    # 売買条件・除外条件には使用しない。
+    bucket_labels = [
+        "1%未満",
+        "1%以上～2%未満",
+        "2%以上～3%未満",
+        "3%以上～5%未満",
+        "5%以上",
+    ]
+
+    bucket_counts = [
+        int((values < 1.0).sum()),
+        int(((values >= 1.0) & (values < 2.0)).sum()),
+        int(((values >= 2.0) & (values < 3.0)).sum()),
+        int(((values >= 3.0) & (values < 5.0)).sum()),
+        int((values >= 5.0).sum()),
+    ]
+
+    bucket_df = pd.DataFrame(
+        {
+            "1R率区分": bucket_labels,
+            "件数": bucket_counts,
+        }
+    )
+
+    bucket_df["割合 %"] = (
+        bucket_df["件数"]
+        / len(values)
+        * 100
+    )
+
+    st.dataframe(
+        bucket_df.round(2),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    small_r_df = (
+        diagnostic_df[
+            diagnostic_df[percent_column] < 1.0
+        ][
+            [
+                event_id_column,
+                percent_column,
+            ]
+        ]
+        .copy()
+    )
+
+    if small_r_df.empty:
+
+        st.success(
+            "1R率1％未満のイベントはありません。"
+        )
+
+    else:
+
+        small_r_df = small_r_df.sort_values(
+            percent_column
+        )
+
+        small_r_df.columns = [
+            "イベントID",
+            "1R率 %",
+        ]
+
+        st.write(
+            "診断用：1R率1％未満のイベント"
+        )
+
+        st.dataframe(
+            small_r_df.round(4),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    st.caption(
+        "1％・2％・3％・5％の区分は分布を見やすくするための診断区分です。"
+        "現在の売買条件・除外条件ではありません。"
+    )
+
+
+# ============================================================
+# ㉚ 下落停止 1R率診断
+# ============================================================
+
+show_risk_percent_diagnostics(
+    "㉚ v1.5.1 下落停止・1R率診断",
+    stop_r_valid,
+    "Stop_Risk_1R_Percent",
+)
+
+
+# ============================================================
+# ㉛ 反発開始 1R率診断
+# ============================================================
+
+show_risk_percent_diagnostics(
+    "㉛ v1.5.1 反発開始・1R率診断",
+    rebound_r_valid,
+    "Rebound_Risk_1R_Percent",
+)
+
+
+# ============================================================
+# ㉜ 現在の研究段階
 # ============================================================
 
 st.divider()
 
 st.subheader(
-    "㉚ 現在の研究段階"
+    "㉜ 現在の研究段階"
 )
 
 st.write(
@@ -3511,7 +3721,19 @@ st.write(
 )
 
 st.write(
-    "【v1.5 実装】1R / 1.5R / 2R価格"
+    "【正常動作確認済み】v1.5 1R / 1.5R / 2R価格計算"
+)
+
+st.write(
+    "【v1.5.1 実装】1R率 ＝ 1R ÷ Entry × 100"
+)
+
+st.write(
+    "【v1.5.1 診断】1R率の最小・中央値・平均・最大・分布"
+)
+
+st.write(
+    "【未採用】1R率による除外条件"
 )
 
 st.write(
@@ -3546,8 +3768,8 @@ st.write(
 st.divider()
 
 st.warning(
-    "重要：v1.5で表示する1R・1.5R・2Rは"
-    "『価格設計』です。"
+    "重要：v1.5.1で表示する1R率は『診断値』です。"
+    "1R・1.5R・2Rも引き続き『価格設計』です。"
     "勝率や期待値ではありません。"
 )
 
@@ -3556,6 +3778,12 @@ st.info(
     "仮Entryには次営業日の始値を使用します。"
     "仮Stopはシグナル確認時点までに分かっている"
     "安値だけを使用し、未来の安値は使いません。"
+)
+
+st.info(
+    "v1.5.1では1R率が小さいイベントも削除しません。"
+    "まずGOOG / NVDAそれぞれの分布を確認してから、"
+    "除外条件が必要かを判断します。"
 )
 
 st.caption(
