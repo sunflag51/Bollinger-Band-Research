@@ -88,6 +88,7 @@
 # ・day3で見送る設計が結果に強く依存していないかを確認
 # ・固定窓終了後の反発は新しいEntry条件には使わず、観察窓感度の診断だけを行う
 # v2.2.2: イベントID再照合を廃止し、イベント開始日＋固定3営業日から終了位置を直接決定
+# v2.2.3: v1.6準備ループの valid_df 変数上書きを修正し、v2.2追跡は全日足 df を直接使用
 #
 # 重要
 # v2.2も「コスト前のルールベースR損益・意思決定比較」まで。
@@ -116,7 +117,7 @@ st.set_page_config(
 # 定数
 # ============================================================
 
-APP_VERSION = "2.2.2"
+APP_VERSION = "2.2.3"
 
 BB_PERIOD = 20
 BB_STD = 2.0
@@ -3069,7 +3070,7 @@ def build_v22_post_window_rebound_tracking(
     """v2.1で見送りとなったイベントを、固定イベント終了後だけ追跡する。
 
     反発条件は既存と同じ Close > Prev_High。
-    v2.2.2ではイベントIDの再照合に依存せず、イベント開始日の実データ位置を
+    v2.2.3では全日足data上で、イベント開始日の実データ位置を
     day0として observation_days=3 行先を固定窓終了位置にする。
     """
 
@@ -3115,7 +3116,7 @@ def build_v22_post_window_rebound_tracking(
             errors="coerce",
         )
 
-        # v2.2.2 fix:
+        # v2.2.3: 全日足dataを前提に固定窓位置を直接決定。
         # 固定イベントは day0～day3。BB_Event_ID の再照合ではなく、
         # イベント開始日の実データ位置 + 3営業日を終了位置とする。
         start_position = resolve_position(event_start_date)
@@ -5732,7 +5733,7 @@ show_risk_percent_diagnostics(
 
 first_hit_result_sets = {}
 
-for prefix_name, valid_df in [
+for prefix_name, r_valid_df in [
     ("Stop", stop_r_valid),
     ("Rebound", rebound_r_valid),
 ]:
@@ -5745,7 +5746,7 @@ for prefix_name, valid_df in [
 
             part = calculate_first_hit_results(
                 df,
-                valid_df,
+                r_valid_df,
                 prefix_name,
                 target_r,
                 horizon,
@@ -7180,8 +7181,10 @@ st.warning(
     "固定イベント終了後に別のBB下限イベントが始まる場合があります。v2.2ではその有無も表示し、後の反発を元イベントだけの効果だと決めつけません。"
 )
 
+# v2.2.3: 追跡は全日足 df を使用する。
+# 表示用 valid_df や他セクションの一時変数に依存させない。
 v22_tracking_df = build_v22_post_window_rebound_tracking(
-    valid_df,
+    df,
     v21_signal_df,
     V22_MAX_FOLLOW_DAYS,
 )
