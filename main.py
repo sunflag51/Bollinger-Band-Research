@@ -2,7 +2,7 @@
 # GOOG / NVDA
 # Bollinger Band Lower-Band Research Program
 #
-# Version : 2.4
+# Version : 2.5
 #
 # v1.4まで
 # ・BB下限イベント
@@ -106,8 +106,17 @@
 # ・同じEntry日でもStop起点が異なる場合のR設計差を表示
 # ・新しいEntry条件は追加せず、イベント定義と二重計上だけを検証
 #
+# v2.5
+# ・新しいBB下限イベントが発生したら、旧イベントの追跡を終了して新イベントへリセット
+# ・新イベントありは新イベント側の既存Rebound R設計を使用
+# ・新イベントなしは旧イベントの遅い反発R設計を継続使用
+# ・元イベントと新イベントの同一反発シグナルを1取引として扱い、二重計上を除去
+# ・リセット後の1.5R / 2R、5 / 10 / 20営業日R損益を再計算
+# ・v2.3旧イベント基準とv2.5リセット基準の20日2R差をイベント別に表示
+# ・リセット方式は研究候補であり、正式売買ルールには採用しない
+#
 # 重要
-# v2.4も「コスト前のルールベースR損益・意思決定比較」まで。
+# v2.5も「コスト前のルールベースR損益・意思決定比較」まで。
 # 手数料・スリッページ・ギャップ時の実約定差はまだ含めない。
 # 正式な売買ルールはまだ確定しない。
 # ============================================================
@@ -133,7 +142,7 @@ st.set_page_config(
 # 定数
 # ============================================================
 
-APP_VERSION = "2.4"
+APP_VERSION = "2.5"
 
 BB_PERIOD = 20
 BB_STD = 2.0
@@ -3910,6 +3919,340 @@ def build_v24_linkage_summary(linkage_df: pd.DataFrame) -> pd.DataFrame:
 
 
 def make_v24_copy_text(title: str, data: pd.DataFrame) -> str:
+    if data is None or data.empty:
+        return title + "\n対象イベントなし"
+    return title + "\n" + data.to_csv(index=False, float_format="%.4f").rstrip()
+
+
+# ============================================================
+# v2.5
+# 新BBイベント発生時リセット方式
+# ============================================================
+
+def build_v25_reset_r_design(
+    data: pd.DataFrame,
+    linkage_df: pd.DataFrame,
+    v23_design_df: pd.DataFrame,
+) -> pd.DataFrame:
+    """v2.4の連結結果を使い、重複しない実効イベント単位のR設計を作る。
+
+    ・新規BBイベントなし:
+      元イベントの遅い反発(v2.3)をそのまま使う。
+    ・新規BBイベントあり:
+      旧イベントの延長としては数えず、連結先の新イベントで最初に確認された
+      Reboundシグナルと、その新イベントday0起点のR設計へ置き換える。
+
+    これにより、同じ反発日を「旧イベントの遅い反発」と「新イベントの反発」の
+    2件として数えない。
+    """
+
+    if data is None or data.empty or linkage_df is None or linkage_df.empty:
+        return pd.DataFrame()
+
+    v23_map = {}
+    if v23_design_df is not None and not v23_design_df.empty:
+        for _, r in v23_design_df.iterrows():
+            eid = pd.to_numeric(pd.Series([r.get("BB_Event_ID")]), errors="coerce").iloc[0]
+            if pd.notna(eid):
+                v23_map[int(eid)] = r
+
+    rows = []
+
+    for _, link in linkage_df.iterrows():
+        source_val = pd.to_numeric(pd.Series([link.get("元イベントID")]), errors="coerce").iloc[0]
+        if pd.isna(source_val):
+            continue
+        source_id = int(source_val)
+
+        new_count = pd.to_numeric(
+            pd.Series([link.get("新規BBイベント数", 0)]), errors="coerce"
+        ).iloc[0]
+        has_new = bool(pd.notna(new_count) and float(new_count) > 0)
+
+        effective_id = source_id
+        mode = "新イベントなし・遅い反発継続"
+        signal_date = pd.NaT
+        entry_date = pd.NaT
+        entry_price = np.nan
+        stop_price = np.nan
+        risk = np.nan
+        risk_pct = np.nan
+        target15 = np.nan
+        target20 = np.nan
+        valid = False
+        status = "R設計対象なし"
+        source_start = pd.to_datetime(link.get("元イベント開始日", pd.NaT), errors="coerce")
+        effective_start = source_start
+
+        if has_new:
+            linked_val = pd.to_numeric(
+                pd.Series([link.get("連結先イベントID")]), errors="coerce"
+            ).iloc[0]
+            if pd.notna(linked_val):
+                effective_id = int(linked_val)
+                mode = "新BBイベントへリセット"
+                effective_start = pd.to_datetime(
+                    link.get("連結先イベント開始日", pd.NaT), errors="coerce"
+                )
+
+                event_rows = data[
+                    pd.to_numeric(data["BB_Event_ID"], errors="coerce").eq(effective_id)
+                ].copy()
+                rebound_rows = event_rows[
+                    event_rows.get(
+                        "First_Rebound_Start_In_Event",
+                        pd.Series(False, index=event_rows.index),
+                    ).eq(True)
+                ]
+
+                if not rebound_rows.empty:
+                    rr = rebound_rows.iloc[0]
+                    signal_date = pd.to_datetime(rebound_rows.index[0], errors="coerce")
+                    entry_date = pd.to_datetime(rr.get("Rebound_Entry_Date", pd.NaT), errors="coerce")
+                    entry_price = pd.to_numeric(
+                        pd.Series([rr.get("Rebound_Entry_Price", np.nan)]), errors="coerce"
+                    ).iloc[0]
+                    stop_price = pd.to_numeric(
+                        pd.Series([rr.get("Rebound_Stop_Price", np.nan)]), errors="coerce"
+                    ).iloc[0]
+                    risk = pd.to_numeric(
+                        pd.Series([rr.get("Rebound_Risk_1R", np.nan)]), errors="coerce"
+                    ).iloc[0]
+                    risk_pct = pd.to_numeric(
+                        pd.Series([rr.get("Rebound_Risk_1R_Percent", np.nan)]), errors="coerce"
+                    ).iloc[0]
+                    target15 = pd.to_numeric(
+                        pd.Series([rr.get("Rebound_Target_1_5R", np.nan)]), errors="coerce"
+                    ).iloc[0]
+                    target20 = pd.to_numeric(
+                        pd.Series([rr.get("Rebound_Target_2R", np.nan)]), errors="coerce"
+                    ).iloc[0]
+                    valid = bool(rr.get("Rebound_R_Valid", False))
+                    status = str(rr.get("Rebound_R_Status", ""))
+                else:
+                    status = "新イベント側の固定窓内反発なし"
+            else:
+                mode = "新イベント連結不可"
+                status = "連結先イベントIDなし"
+        else:
+            old = v23_map.get(source_id)
+            if old is not None:
+                signal_date = pd.to_datetime(old.get("V23Late_Signal_Date", pd.NaT), errors="coerce")
+                entry_date = pd.to_datetime(old.get("V23Late_Entry_Date", pd.NaT), errors="coerce")
+                entry_price = pd.to_numeric(
+                    pd.Series([old.get("V23Late_Entry_Price", np.nan)]), errors="coerce"
+                ).iloc[0]
+                stop_price = pd.to_numeric(
+                    pd.Series([old.get("V23Late_Stop_Price", np.nan)]), errors="coerce"
+                ).iloc[0]
+                risk = pd.to_numeric(
+                    pd.Series([old.get("V23Late_Risk_1R", np.nan)]), errors="coerce"
+                ).iloc[0]
+                risk_pct = pd.to_numeric(
+                    pd.Series([old.get("V23Late_Risk_1R_Percent", np.nan)]), errors="coerce"
+                ).iloc[0]
+                target15 = pd.to_numeric(
+                    pd.Series([old.get("V23Late_Target_1_5R", np.nan)]), errors="coerce"
+                ).iloc[0]
+                target20 = pd.to_numeric(
+                    pd.Series([old.get("V23Late_Target_2R", np.nan)]), errors="coerce"
+                ).iloc[0]
+                valid = bool(old.get("V23Late_R_Valid", False))
+                status = str(old.get("V23Late_R_Status", ""))
+            else:
+                status = "v2.3遅い反発R設計なし"
+
+        # 念のため、R値がある場合はTargetを再計算して定義を統一する。
+        if valid and pd.notna(entry_price) and pd.notna(stop_price):
+            risk = float(entry_price) - float(stop_price)
+            if risk > 0:
+                risk_pct = risk / float(entry_price) * 100.0
+                target15 = float(entry_price) + 1.5 * risk
+                target20 = float(entry_price) + 2.0 * risk
+            else:
+                valid = False
+                status = "R計算不可（Entry≦Stop）"
+
+        rows.append({
+            "BB_Event_ID": effective_id,
+            "V25_Source_Event_ID": source_id,
+            "V25_Effective_Event_ID": effective_id,
+            "V25_Mode": mode,
+            "V25_Source_Event_Start_Date": source_start,
+            "V25_Effective_Event_Start_Date": effective_start,
+            "V25Reset_Signal_Date": signal_date,
+            "V25Reset_Entry_Date": entry_date,
+            "V25Reset_Entry_Price": entry_price,
+            "V25Reset_Stop_Price": stop_price,
+            "V25Reset_Risk_1R": risk,
+            "V25Reset_Risk_1R_Percent": risk_pct,
+            "V25Reset_Target_1_5R": target15,
+            "V25Reset_Target_2R": target20,
+            "V25Reset_R_Valid": valid,
+            "V25Reset_R_Status": status,
+            "V25_Old_Late_Rebound_Date": pd.to_datetime(
+                link.get("遅い反発確認日", pd.NaT), errors="coerce"
+            ),
+            "V25_Linked_Event_ID": pd.to_numeric(
+                pd.Series([link.get("連結先イベントID", np.nan)]), errors="coerce"
+            ).iloc[0],
+        })
+
+    result = pd.DataFrame(rows)
+    if result.empty:
+        return result
+
+    # 実効イベントID + シグナル日が同じものは1取引だけ残す。
+    # 元イベントの遅い反発と新イベント反発の二重計上を防ぐ安全装置。
+    result = result.sort_values(
+        ["V25Reset_Signal_Date", "V25_Effective_Event_ID", "V25_Source_Event_ID"]
+    ).copy()
+    result["V25_Duplicate_Key"] = (
+        result["V25_Effective_Event_ID"].astype(str)
+        + "|"
+        + pd.to_datetime(result["V25Reset_Signal_Date"], errors="coerce").astype(str)
+    )
+    result["V25_Duplicate_Count"] = result.groupby("V25_Duplicate_Key")[
+        "V25_Duplicate_Key"
+    ].transform("size")
+    result = result.drop_duplicates(subset=["V25_Duplicate_Key"], keep="first").copy()
+    result.index = pd.to_datetime(result["V25Reset_Signal_Date"], errors="coerce")
+    return result
+
+
+def build_v25_reset_summary(
+    design_df: pd.DataFrame,
+    pnl_df: pd.DataFrame,
+    target_r: float,
+) -> pd.DataFrame:
+    if design_df is None or design_df.empty:
+        return pd.DataFrame()
+
+    reset_count = int(design_df["V25_Mode"].eq("新BBイベントへリセット").sum())
+    carry_count = int(design_df["V25_Mode"].eq("新イベントなし・遅い反発継続").sum())
+    valid_design_count = int(design_df["V25Reset_R_Valid"].eq(True).sum())
+
+    rows = []
+    for horizon in FIRST_HIT_HORIZONS:
+        part = pd.DataFrame()
+        if pnl_df is not None and not pnl_df.empty:
+            part = pnl_df[
+                (pd.to_numeric(pnl_df["Horizon"], errors="coerce") == int(horizon))
+                & np.isclose(
+                    pd.to_numeric(pnl_df["Target_R"], errors="coerce"),
+                    float(target_r),
+                )
+            ].copy()
+
+        valid = part[part.get("R_PnL_Valid", False).eq(True)].copy() if not part.empty else pd.DataFrame()
+        r = (
+            pd.to_numeric(valid["Realized_R"], errors="coerce").dropna()
+            if not valid.empty else pd.Series(dtype=float)
+        )
+
+        rows.append({
+            "保有期間": f"{horizon}営業日",
+            "Target": f"+{target_r:g}R",
+            "元見送りイベント": int(design_df["V25_Source_Event_ID"].nunique()),
+            "重複除去後の実効イベント": int(design_df["V25_Effective_Event_ID"].nunique()),
+            "新イベントへリセット": reset_count,
+            "新イベントなし・遅い反発": carry_count,
+            "R設計可能": valid_design_count,
+            "R損益計算可能": len(r),
+            "平均R": float(r.mean()) if not r.empty else np.nan,
+            "中央値R": float(r.median()) if not r.empty else np.nan,
+            "合計R": float(r.sum()) if not r.empty else np.nan,
+            "Target決済": int((part.get("Exit_Type", pd.Series(dtype=str)) == "Target決済").sum()) if not part.empty else 0,
+            "Stop決済": int((part.get("Exit_Type", pd.Series(dtype=str)) == "Stop決済").sum()) if not part.empty else 0,
+            "期間末決済": int((part.get("Exit_Type", pd.Series(dtype=str)) == "期間末終値決済").sum()) if not part.empty else 0,
+            "比較不可": int(len(design_df) - len(r)),
+        })
+
+    return pd.DataFrame(rows)
+
+
+def build_v25_compare_v23_v25(
+    v23_design_df: pd.DataFrame,
+    v23_pnl_df: pd.DataFrame,
+    v25_design_df: pd.DataFrame,
+    v25_pnl_df: pd.DataFrame,
+    horizon: int = 20,
+    target_r: float = 2.0,
+) -> pd.DataFrame:
+    """元見送りイベント単位でv2.3旧基準とv2.5リセット基準を比較する。"""
+
+    if v25_design_df is None or v25_design_df.empty:
+        return pd.DataFrame()
+
+    old_design = {}
+    if v23_design_df is not None and not v23_design_df.empty:
+        for _, r in v23_design_df.iterrows():
+            eid = pd.to_numeric(pd.Series([r.get("BB_Event_ID")]), errors="coerce").iloc[0]
+            if pd.notna(eid):
+                old_design[int(eid)] = r
+
+    old_pnl = {}
+    if v23_pnl_df is not None and not v23_pnl_df.empty:
+        part = v23_pnl_df[
+            (pd.to_numeric(v23_pnl_df["Horizon"], errors="coerce") == int(horizon))
+            & np.isclose(pd.to_numeric(v23_pnl_df["Target_R"], errors="coerce"), float(target_r))
+        ]
+        for _, r in part.iterrows():
+            eid = pd.to_numeric(pd.Series([r.get("BB_Event_ID")]), errors="coerce").iloc[0]
+            if pd.notna(eid):
+                old_pnl[int(eid)] = r
+
+    new_pnl = {}
+    if v25_pnl_df is not None and not v25_pnl_df.empty:
+        part = v25_pnl_df[
+            (pd.to_numeric(v25_pnl_df["Horizon"], errors="coerce") == int(horizon))
+            & np.isclose(pd.to_numeric(v25_pnl_df["Target_R"], errors="coerce"), float(target_r))
+        ]
+        for _, r in part.iterrows():
+            eid = pd.to_numeric(pd.Series([r.get("BB_Event_ID")]), errors="coerce").iloc[0]
+            if pd.notna(eid):
+                new_pnl[int(eid)] = r
+
+    rows = []
+    for _, nd in v25_design_df.iterrows():
+        source_id = int(nd["V25_Source_Event_ID"])
+        effective_id = int(nd["V25_Effective_Event_ID"])
+        od = old_design.get(source_id)
+        op = old_pnl.get(source_id)
+        npnl = new_pnl.get(effective_id)
+
+        old_stop = od.get("V23Late_Stop_Price", np.nan) if od is not None else np.nan
+        old_r_pct = od.get("V23Late_Risk_1R_Percent", np.nan) if od is not None else np.nan
+        old_realized = op.get("Realized_R", np.nan) if op is not None else np.nan
+        old_exit = op.get("Exit_Type", "") if op is not None else ""
+        new_realized = npnl.get("Realized_R", np.nan) if npnl is not None else np.nan
+        new_exit = npnl.get("Exit_Type", "") if npnl is not None else ""
+
+        diff = np.nan
+        if pd.notna(old_realized) and pd.notna(new_realized):
+            diff = float(new_realized) - float(old_realized)
+
+        rows.append({
+            "元イベントID": source_id,
+            "v2.5実効イベントID": effective_id,
+            "扱い": nd.get("V25_Mode", ""),
+            "シグナル日": nd.get("V25Reset_Signal_Date", pd.NaT),
+            "Entry日": nd.get("V25Reset_Entry_Date", pd.NaT),
+            "v2.3_Stop": old_stop,
+            "v2.5_Stop": nd.get("V25Reset_Stop_Price", np.nan),
+            "v2.3_1R率_%": old_r_pct,
+            "v2.5_1R率_%": nd.get("V25Reset_Risk_1R_Percent", np.nan),
+            "v2.3_決済": old_exit,
+            "v2.3_実現R": old_realized,
+            "v2.5_決済": new_exit,
+            "v2.5_実現R": new_realized,
+            "R差_v2.5-v2.3": diff,
+        })
+
+    return pd.DataFrame(rows).sort_values("元イベントID").reset_index(drop=True)
+
+
+def make_v25_copy_text(title: str, data: pd.DataFrame) -> str:
     if data is None or data.empty:
         return title + "\n対象イベントなし"
     return title + "\n" + data.to_csv(index=False, float_format="%.4f").rstrip()
@@ -8234,8 +8577,172 @@ st.write(
     "【未採用】新規BBイベントありをEntry条件にはしません。件数が少なく、同じ標本から条件を作ると過去データへの合わせ込みになるためです。"
 )
 st.write(
-    "【次の判断】77～79番で、4件が本当に既存の新イベント反発と重複しているかを確認してから次の検証へ進みます。"
+    "【確認済み】77～79番で、新規BBイベントありケースの同一反発シグナル重複を確認しました。v2.5で新イベント基準へリセットして再計算します。"
 )
+
+# ============================================================
+# v2.5 新BBイベント発生時リセット方式
+# ============================================================
+
+st.divider()
+
+st.subheader(
+    "81 v2.5 新BBイベント発生時リセット方式・研究ルール"
+)
+st.write(
+    "【目的】固定窓終了後に新しいBB下限イベントが発生したら、旧イベントの延長追跡を終了し、新イベントを独立した通常イベントとして評価し直します。"
+)
+st.write(
+    "【新イベントあり】旧イベントの遅い反発としては数えず、新イベント側の最初の反発・新イベントday0起点Stopを使用します。"
+)
+st.write(
+    "【新イベントなし】固定窓後の遅い反発を旧イベントの延長として残し、v2.3と同じR設計を使用します。"
+)
+st.write(
+    "【二重計上防止】実効イベントIDと反発シグナル日が同一なら1取引だけ残します。"
+)
+st.warning(
+    "v2.5はイベント定義の研究です。新BBイベント発生をEntry条件として正式採用するものではありません。"
+)
+
+v25_design_df = build_v25_reset_r_design(
+    df,
+    v24_linkage_df,
+    v23_design_df,
+)
+
+st.subheader(
+    "82 v2.5 リセット後・重複除去済み実効イベント一覧"
+)
+if v25_design_df.empty:
+    st.info("v2.5の対象イベントがありません。")
+else:
+    v25_design_display = v25_design_df[
+        [
+            "V25_Source_Event_ID",
+            "V25_Effective_Event_ID",
+            "V25_Mode",
+            "V25_Source_Event_Start_Date",
+            "V25_Effective_Event_Start_Date",
+            "V25Reset_Signal_Date",
+            "V25Reset_Entry_Date",
+            "V25Reset_Entry_Price",
+            "V25Reset_Stop_Price",
+            "V25Reset_Risk_1R_Percent",
+            "V25Reset_R_Valid",
+            "V25Reset_R_Status",
+            "V25_Duplicate_Count",
+        ]
+    ].copy()
+    v25_design_display.columns = [
+        "元イベントID",
+        "実効イベントID",
+        "扱い",
+        "元イベント開始日",
+        "実効イベント開始日",
+        "反発確認日",
+        "Entry日",
+        "Entry価格",
+        "Stop価格",
+        "1R率_%",
+        "R設計可能",
+        "R設計状態",
+        "同一実効シグナル重複数",
+    ]
+    st.dataframe(v25_design_display.round(4), use_container_width=True, hide_index=True)
+    st.write("📋 コピー用・v2.5実効イベント一覧")
+    st.code(v25_design_display.to_csv(index=False, float_format="%.4f"), language=None)
+
+v25_pnl_sets = {}
+for target_r in [1.5, 2.0]:
+    parts = []
+    valid_design = (
+        v25_design_df[v25_design_df["V25Reset_R_Valid"].eq(True)].copy()
+        if not v25_design_df.empty else pd.DataFrame()
+    )
+    for horizon in FIRST_HIT_HORIZONS:
+        first_hit = calculate_first_hit_results(
+            df,
+            valid_design,
+            "V25Reset",
+            target_r,
+            horizon,
+        )
+        if not first_hit.empty:
+            pnl = calculate_r_pnl_results(df, first_hit)
+            if not pnl.empty:
+                parts.append(pnl)
+    v25_pnl_sets[target_r] = (
+        pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
+    )
+
+st.subheader(
+    "83 v2.5 リセット方式・1.5R"
+)
+v25_summary_15 = build_v25_reset_summary(
+    v25_design_df,
+    v25_pnl_sets[1.5],
+    1.5,
+)
+st.dataframe(v25_summary_15.round(4), use_container_width=True, hide_index=True)
+st.write("📋 コピー用・v2.5リセット方式1.5R")
+st.code(
+    make_v25_copy_text(
+        "【83 v2.5 リセット方式・1.5R】",
+        v25_summary_15,
+    ),
+    language=None,
+)
+
+st.subheader(
+    "84 v2.5 リセット方式・2R"
+)
+v25_summary_20 = build_v25_reset_summary(
+    v25_design_df,
+    v25_pnl_sets[2.0],
+    2.0,
+)
+st.dataframe(v25_summary_20.round(4), use_container_width=True, hide_index=True)
+st.write("📋 コピー用・v2.5リセット方式2R")
+st.code(
+    make_v25_copy_text(
+        "【84 v2.5 リセット方式・2R】",
+        v25_summary_20,
+    ),
+    language=None,
+)
+
+st.subheader(
+    "85 v2.5 v2.3旧イベント基準 vs リセット基準・20日保有・2R"
+)
+v25_compare_20_2r = build_v25_compare_v23_v25(
+    v23_design_df,
+    v23_pnl_sets[2.0],
+    v25_design_df,
+    v25_pnl_sets[2.0],
+    horizon=20,
+    target_r=2.0,
+)
+if v25_compare_20_2r.empty:
+    st.info("比較対象がありません。")
+else:
+    st.dataframe(v25_compare_20_2r.round(4), use_container_width=True, hide_index=True)
+    st.write("📋 コピー用・v2.3 vs v2.5 20日2R比較")
+    st.code(v25_compare_20_2r.to_csv(index=False, float_format="%.4f"), language=None)
+
+st.subheader(
+    "86 v2.5 リセット方式の扱い"
+)
+st.write(
+    "【研究上の整理】新イベントありは旧イベントの遅い反発と二重に数えず、新イベント側のR設計へ一本化します。"
+)
+st.write(
+    "【検証中】新イベントなしの遅い反発6件と、新イベントへリセットしたケースを同じ売買ルールとして運用すべきかは未確定です。"
+)
+st.write(
+    "【未採用】v2.5リセット方式を実運用Entryルールとして採用すること。"
+)
+
 
 # ============================================================
 # 現在の研究段階
@@ -8409,6 +8916,22 @@ st.write(
 
 st.write(
     "【未採用】v2.2の追跡結果を使って固定観察窓やEntryルールを変更すること"
+)
+
+st.write(
+    "【v2.4 確認済み】新規BBイベントありケースは新イベント側の反発シグナルと重複するため、独立2事例として数えない"
+)
+
+st.write(
+    "【v2.5 実装】新BBイベント発生時に旧イベント追跡を終了し、新イベント基準のRebound R設計へリセット"
+)
+
+st.write(
+    "【v2.5 実装】重複除去後の1.5R / 2R、5 / 10 / 20営業日R損益を再計算"
+)
+
+st.write(
+    "【未採用】v2.5リセット方式を正式な売買ルールにすること"
 )
 
 st.write(
