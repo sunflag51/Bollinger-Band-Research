@@ -106,7 +106,7 @@
 # ・同じEntry日でもStop起点が異なる場合のR設計差を表示
 # ・新しいEntry条件は追加せず、イベント定義と二重計上だけを検証
 #
-# v2.5
+# v2.5.1
 # ・新しいBB下限イベントが発生したら、旧イベントの追跡を終了して新イベントへリセット
 # ・新イベントありは新イベント側の既存Rebound R設計を使用
 # ・新イベントなしは旧イベントの遅い反発R設計を継続使用
@@ -142,7 +142,7 @@ st.set_page_config(
 # 定数
 # ============================================================
 
-APP_VERSION = "2.5"
+APP_VERSION = "2.5.1"
 
 BB_PERIOD = 20
 BB_STD = 2.0
@@ -4465,6 +4465,10 @@ st.info(
     "新しい売買条件は追加しません。"
 )
 
+# v2.5.1: 実際の結果は後段で計算されるため、ここに空の表示場所だけ作り、
+# 計算完了後にこの位置へ番号選択・コピー欄を描画する。
+quick_copy_top_placeholder = st.empty()
+
 
 # ============================================================
 # ① 銘柄・期間
@@ -8314,27 +8318,28 @@ def show_v23_policy_section(section_title, wait_limit, target_r):
     st.dataframe(summary.round(4), use_container_width=True, hide_index=True)
     st.write("📋 コピー用・v2.3方針C R損益")
     st.code(make_v23_copy_text(f"【{section_title}】", summary), language=None)
+    return summary
 
 
-show_v23_policy_section(
+v23_summary_69 = show_v23_policy_section(
     "69 v2.3 方針C・固定窓後5営業日まで待つ・1.5R",
     5,
     1.5,
 )
 
-show_v23_policy_section(
+v23_summary_70 = show_v23_policy_section(
     "70 v2.3 方針C・固定窓後5営業日まで待つ・2R",
     5,
     2.0,
 )
 
-show_v23_policy_section(
+v23_summary_71 = show_v23_policy_section(
     "71 v2.3 方針C・固定窓後10営業日まで待つ・1.5R",
     10,
     1.5,
 )
 
-show_v23_policy_section(
+v23_summary_72 = show_v23_policy_section(
     "72 v2.3 方針C・固定窓後10営業日まで待つ・2R",
     10,
     2.0,
@@ -8742,6 +8747,117 @@ st.write(
 st.write(
     "【未採用】v2.5リセット方式を実運用Entryルールとして採用すること。"
 )
+
+
+# ============================================================
+# v2.5.1 番号選択・クイックコピー
+# ============================================================
+
+# 長いページをスクロールしなくても、サイドバーから番号を選んで
+# コピー用結果をすぐ表示できるようにする。
+def _quick_copy_text(title, frame):
+    if frame is None or not isinstance(frame, pd.DataFrame) or frame.empty:
+        return f"【{title}】\n表示対象がありません。"
+    return f"【{title}】\n" + frame.to_csv(index=False, float_format="%.4f")
+
+
+quick_copy_results = {
+    "64 v2.2 見送りイベント・固定窓終了後N営業日以内の反発確認": _quick_copy_text(
+        "64 v2.2 見送りイベント・固定窓終了後N営業日以内の反発確認",
+        v22_horizon_summary,
+    ),
+    "65 v2.2 初回反発確認タイミング": _quick_copy_text(
+        "65 v2.2 初回反発確認タイミング",
+        v22_timing_summary,
+    ),
+    "66 v2.2 見送りイベント・固定窓終了後追跡詳細": _quick_copy_text(
+        "66 v2.2 見送りイベント・固定窓終了後追跡詳細",
+        v22_detail_display if "v22_detail_display" in globals() else pd.DataFrame(),
+    ),
+    "68 v2.3 遅い反発Entry・R設計詳細": _quick_copy_text(
+        "68 v2.3 遅い反発Entry・R設計詳細",
+        v23_design_display if "v23_design_display" in globals() else pd.DataFrame(),
+    ),
+    "69 v2.3 方針C・固定窓後5営業日まで待つ・1.5R": _quick_copy_text(
+        "69 v2.3 方針C・固定窓後5営業日まで待つ・1.5R", v23_summary_69
+    ),
+    "70 v2.3 方針C・固定窓後5営業日まで待つ・2R": _quick_copy_text(
+        "70 v2.3 方針C・固定窓後5営業日まで待つ・2R", v23_summary_70
+    ),
+    "71 v2.3 方針C・固定窓後10営業日まで待つ・1.5R": _quick_copy_text(
+        "71 v2.3 方針C・固定窓後10営業日まで待つ・1.5R", v23_summary_71
+    ),
+    "72 v2.3 方針C・固定窓後10営業日まで待つ・2R": _quick_copy_text(
+        "72 v2.3 方針C・固定窓後10営業日まで待つ・2R", v23_summary_72
+    ),
+    "73 v2.3 新規BBイベント有無別・10日待ち・20日保有・2R": _quick_copy_text(
+        "73 v2.3 新規BBイベント有無別・10日待ち・20日保有・2R", v23_new_bb_summary
+    ),
+    "74 v2.3 遅い反発Entry・10日待ち・20日保有・2R詳細": _quick_copy_text(
+        "74 v2.3 遅い反発Entry・10日待ち・20日保有・2R詳細", v23_detail
+    ),
+    "76 v2.4 元見送りイベント・新規BBイベント連結一覧": _quick_copy_text(
+        "76 v2.4 元見送りイベント・新規BBイベント連結一覧",
+        v24_linkage_display if "v24_linkage_display" in globals() else pd.DataFrame(),
+    ),
+    "77 v2.4 新規BBイベントありケース・連結詳細": _quick_copy_text(
+        "77 v2.4 新規BBイベントありケース・連結詳細",
+        v24_linked_detail if "v24_linked_detail" in globals() else pd.DataFrame(),
+    ),
+    "78 v2.4 二重計上診断サマリー": _quick_copy_text(
+        "78 v2.4 二重計上診断サマリー", v24_summary
+    ),
+    "79 v2.4 同一反発シグナル・元イベントStop vs 新イベントStop": _quick_copy_text(
+        "79 v2.4 同一反発シグナル・元イベントStop vs 新イベントStop",
+        v24_r_design_compare if "v24_r_design_compare" in globals() else pd.DataFrame(),
+    ),
+    "82 v2.5 リセット後・重複除去済み実効イベント一覧": _quick_copy_text(
+        "82 v2.5 リセット後・重複除去済み実効イベント一覧",
+        v25_design_display if "v25_design_display" in globals() else pd.DataFrame(),
+    ),
+    "83 v2.5 リセット方式・1.5R": _quick_copy_text(
+        "83 v2.5 リセット方式・1.5R", v25_summary_15
+    ),
+    "84 v2.5 リセット方式・2R": _quick_copy_text(
+        "84 v2.5 リセット方式・2R", v25_summary_20
+    ),
+    "85 v2.5 v2.3旧イベント基準 vs リセット基準・20日保有・2R": _quick_copy_text(
+        "85 v2.5 v2.3旧イベント基準 vs リセット基準・20日保有・2R",
+        v25_compare_20_2r,
+    ),
+}
+
+with quick_copy_top_placeholder.container():
+    st.divider()
+    st.subheader("📋 番号で結果をすぐコピー")
+    st.caption(
+        "長いページを探す必要はありません。番号を選んでボタンを押すと、その結果だけをコピー欄に表示します。"
+    )
+    quick_copy_choice = st.selectbox(
+        "結果番号を選択",
+        options=list(quick_copy_results.keys()),
+        index=list(quick_copy_results.keys()).index("84 v2.5 リセット方式・2R"),
+        key="quick_copy_choice_v251",
+    )
+
+    if st.button(
+        "選択した結果のコピー欄を表示",
+        use_container_width=True,
+        key="quick_copy_button_v251",
+    ):
+        st.session_state["quick_copy_selected_title_v251"] = quick_copy_choice
+        st.session_state["quick_copy_selected_text_v251"] = quick_copy_results[quick_copy_choice]
+
+    if st.session_state.get("quick_copy_selected_text_v251"):
+        st.success(
+            f"表示中：{st.session_state.get('quick_copy_selected_title_v251', '')}"
+        )
+        st.caption("下のコピー欄の右上にあるコピーアイコンを押すと全文をコピーできます。")
+        st.code(
+            st.session_state["quick_copy_selected_text_v251"],
+            language=None,
+        )
+
 
 
 # ============================================================
