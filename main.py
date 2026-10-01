@@ -2,7 +2,7 @@
 # GOOG / NVDA
 # Bollinger Band Lower-Band Research Program
 #
-# Version : 3.0
+# Version : 3.1
 #
 # v1.4まで
 # ・BB下限イベント
@@ -187,7 +187,7 @@ st.set_page_config(
 # 定数
 # ============================================================
 
-APP_VERSION = "3.0"
+APP_VERSION = "3.1"
 
 BB_PERIOD = 20
 BB_STD = 2.0
@@ -5543,6 +5543,160 @@ def build_v30_ticker_difference(summary_20d: pd.DataFrame) -> pd.DataFrame:
         })
     return pd.DataFrame(rows)
 
+
+# ============================================================
+# v3.1
+# GOOG / NVDA 20日2R 損益構造分解
+# ============================================================
+
+def _v31_exit_bucket(exit_type: str) -> str:
+    """v2.7以降の決済種別を、後付け条件なしの固定5区分へ整理する。"""
+    value = str(exit_type or "")
+    mapping = {
+        "Target決済": "Target通常",
+        "TargetギャップOpen決済": "Targetギャップ",
+        "Stop決済": "Stop通常",
+        "StopギャップOpen決済": "Stopギャップ",
+        "期間末終値決済": "期間末",
+    }
+    return mapping.get(value, "その他")
+
+
+def build_v31_20d_structure(bundles: dict) -> pd.DataFrame:
+    """20日・2RのNet R計算可能行を決済構造別に分解する。"""
+    rows = []
+    bucket_order = ["Target通常", "Targetギャップ", "Stop通常", "Stopギャップ", "期間末"]
+    for ticker_symbol in ["GOOG", "NVDA"]:
+        bundle = bundles.get(ticker_symbol)
+        if not bundle:
+            continue
+        for prefix_name, signal_label in [("Stop", "下落停止"), ("Rebound", "反発開始")]:
+            results = bundle["net_sets"].get(prefix_name, pd.DataFrame())
+            if results is None or results.empty:
+                continue
+            part = results[
+                pd.to_numeric(results["Horizon"], errors="coerce").eq(20)
+                & results["Net_R_Valid"].eq(True)
+            ].copy()
+            if part.empty:
+                continue
+            part["v31区分"] = part["Exit_Type"].map(_v31_exit_bucket)
+            total_n = len(part)
+            for bucket in bucket_order:
+                g = part[part["v31区分"].eq(bucket)].copy()
+                if g.empty:
+                    count = 0
+                    gross_total = 0.0
+                    net_total = 0.0
+                    cost_total = 0.0
+                    net_avg = np.nan
+                    net_median = np.nan
+                else:
+                    gross = pd.to_numeric(g["Gross_Realized_R"], errors="coerce").dropna()
+                    net = pd.to_numeric(g["Net_Realized_R"], errors="coerce").dropna()
+                    cost = pd.to_numeric(g["Cost_R"], errors="coerce").dropna()
+                    count = len(net)
+                    gross_total = float(gross.sum())
+                    net_total = float(net.sum())
+                    cost_total = float(cost.sum())
+                    net_avg = float(net.mean()) if not net.empty else np.nan
+                    net_median = float(net.median()) if not net.empty else np.nan
+                rows.append({
+                    "銘柄": ticker_symbol,
+                    "シグナル": signal_label,
+                    "決済構造": bucket,
+                    "件数": count,
+                    "全R計算可能件数": total_n,
+                    "件数比率_%": (count / total_n * 100.0) if total_n else np.nan,
+                    "Gross合計R": gross_total,
+                    "Net合計R": net_total,
+                    "コスト合計R": cost_total,
+                    "Net平均R": net_avg,
+                    "Net中央値R": net_median,
+                })
+    return pd.DataFrame(rows)
+
+
+def build_v31_cross_ticker_structure_difference(structure: pd.DataFrame) -> pd.DataFrame:
+    """同じ決済構造についてNVDA-GOOG差を記述する。採用判定には使わない。"""
+    if structure is None or structure.empty:
+        return pd.DataFrame()
+    rows = []
+    bucket_order = ["Target通常", "Targetギャップ", "Stop通常", "Stopギャップ", "期間末"]
+    for signal_label in ["下落停止", "反発開始"]:
+        for bucket in bucket_order:
+            part = structure[
+                structure["シグナル"].eq(signal_label)
+                & structure["決済構造"].eq(bucket)
+            ]
+            goog = part[part["銘柄"].eq("GOOG")]
+            nvda = part[part["銘柄"].eq("NVDA")]
+            if goog.empty or nvda.empty:
+                continue
+            g = goog.iloc[0]
+            n = nvda.iloc[0]
+            g_avg = pd.to_numeric(pd.Series([g["Net平均R"]]), errors="coerce").iloc[0]
+            n_avg = pd.to_numeric(pd.Series([n["Net平均R"]]), errors="coerce").iloc[0]
+            rows.append({
+                "シグナル": signal_label,
+                "決済構造": bucket,
+                "GOOG件数": int(g["件数"]),
+                "NVDA件数": int(n["件数"]),
+                "GOOG件数比率_%": g["件数比率_%"],
+                "NVDA件数比率_%": n["件数比率_%"],
+                "GOOG_Net合計R": g["Net合計R"],
+                "NVDA_Net合計R": n["Net合計R"],
+                "Net合計R差_NVDA-GOOG": float(n["Net合計R"]) - float(g["Net合計R"]),
+                "GOOG_Net平均R": g_avg,
+                "NVDA_Net平均R": n_avg,
+                "Net平均R差_NVDA-GOOG": (
+                    float(n_avg) - float(g_avg)
+                    if pd.notna(g_avg) and pd.notna(n_avg) else np.nan
+                ),
+            })
+    return pd.DataFrame(rows)
+
+
+def build_v31_reconciliation_audit(
+    structure: pd.DataFrame,
+    v30_20d_summary: pd.DataFrame,
+) -> pd.DataFrame:
+    """v3.1の5区分合計がv3.0の20日2Rと一致するか監査する。"""
+    if structure is None or structure.empty or v30_20d_summary is None or v30_20d_summary.empty:
+        return pd.DataFrame()
+    rows = []
+    for ticker_symbol in ["GOOG", "NVDA"]:
+        for signal_label in ["下落停止", "反発開始"]:
+            s = structure[
+                structure["銘柄"].eq(ticker_symbol)
+                & structure["シグナル"].eq(signal_label)
+            ]
+            base = v30_20d_summary[
+                v30_20d_summary["銘柄"].eq(ticker_symbol)
+                & v30_20d_summary["シグナル"].eq(signal_label)
+            ]
+            if s.empty or base.empty:
+                continue
+            b = base.iloc[0]
+            v31_n = int(pd.to_numeric(s["件数"], errors="coerce").fillna(0).sum())
+            v31_net = float(pd.to_numeric(s["Net合計R"], errors="coerce").fillna(0).sum())
+            v30_n = int(b["Net_R計算可能"])
+            v30_net = float(b["Net合計R"])
+            n_ok = v31_n == v30_n
+            r_ok = abs(v31_net - v30_net) <= 1e-8
+            rows.append({
+                "銘柄": ticker_symbol,
+                "シグナル": signal_label,
+                "v3.0_Net_R計算可能": v30_n,
+                "v3.1_5区分件数合計": v31_n,
+                "件数差": v31_n - v30_n,
+                "v3.0_Net合計R": v30_net,
+                "v3.1_5区分Net合計R": v31_net,
+                "Net合計R差": v31_net - v30_net,
+                "監査": "OK" if n_ok and r_ok else "要確認",
+            })
+    return pd.DataFrame(rows)
+
 # ============================================================
 # タイトル
 # ============================================================
@@ -10317,7 +10471,7 @@ st.write(
     "【未採用】前半 / 後半の結果を見て、良かった期間だけを選んだりEntry条件を後付け変更したりすること。"
 )
 st.write(
-    "【次段階候補】同じルールを変更せず別銘柄NVDAへ適用し、銘柄をまたいだ再現性を確認します。"
+    "【v3.1】GOOG / NVDAの20日2Rを、Target・Stop・期間末・ギャップ別に分解して銘柄差の中身を確認します。"
 )
 
 
@@ -10439,8 +10593,95 @@ st.write(
     "【注意】NVDAも今回確認することで研究済みデータになります。真の未使用OOSは将来データまたは別途凍結した期間で確認する必要があります。"
 )
 
+
 # ============================================================
-# v3.0 番号選択・クイックコピー
+# v3.1 GOOG / NVDA 20日2R 損益構造分解
+# ============================================================
+
+st.divider()
+
+st.subheader(
+    "112 v3.1 GOOG / NVDA 20日2R・損益構造分解ルール"
+)
+st.write(
+    "【条件固定】v3.0までのBBイベント、シグナル、Entry、Stop、2R Target、ギャップ、手数料、スリッページを変更しません。"
+)
+st.write(
+    "【分解のみ】20営業日・2RのNet R計算可能イベントを、Target通常・Targetギャップ・Stop通常・Stopギャップ・期間末の5区分へ整理します。"
+)
+st.write(
+    "【目的】GOOGとNVDAの平均R差が、Target側・Stop側・期間末・ギャップのどこから生じているかを記述します。"
+)
+st.warning(
+    "v3.1は原因候補の記述診断です。結果を見て銘柄専用条件を追加したり、特定区分を後から除外したりしません。"
+)
+
+v31_structure = build_v31_20d_structure(v30_bundles)
+
+st.subheader(
+    "113 v3.1 GOOG / NVDA 20日保有・2R・決済構造別Net R"
+)
+if v31_structure.empty:
+    st.info("20日2Rの損益構造分解対象がありません。")
+else:
+    st.dataframe(v31_structure.round(4), use_container_width=True, hide_index=True)
+    st.write("📋 コピー用・v3.1 決済構造別Net R")
+    st.code(
+        "【113 v3.1 GOOG / NVDA 20日保有・2R・決済構造別Net R】\n"
+        + v31_structure.to_csv(index=False, float_format="%.4f").rstrip(),
+        language=None,
+    )
+
+v31_structure_difference = build_v31_cross_ticker_structure_difference(v31_structure)
+
+st.subheader(
+    "114 v3.1 20日保有・2R・決済構造別NVDA−GOOG差"
+)
+if v31_structure_difference.empty:
+    st.info("決済構造別の銘柄差を計算できません。")
+else:
+    st.dataframe(v31_structure_difference.round(4), use_container_width=True, hide_index=True)
+    st.write("📋 コピー用・v3.1 決済構造別NVDA−GOOG差")
+    st.code(
+        "【114 v3.1 20日保有・2R・決済構造別NVDA−GOOG差】\n"
+        + v31_structure_difference.to_csv(index=False, float_format="%.4f").rstrip(),
+        language=None,
+    )
+
+v31_reconciliation = build_v31_reconciliation_audit(v31_structure, v30_20d_summary)
+
+st.subheader(
+    "115 v3.1 20日保有・2R・構造分解監査"
+)
+if v31_reconciliation.empty:
+    st.info("v3.1構造分解の監査対象がありません。")
+else:
+    st.dataframe(v31_reconciliation.round(4), use_container_width=True, hide_index=True)
+    st.write("📋 コピー用・v3.1 構造分解監査")
+    st.code(
+        "【115 v3.1 20日保有・2R・構造分解監査】\n"
+        + v31_reconciliation.to_csv(index=False, float_format="%.4f").rstrip(),
+        language=None,
+    )
+
+st.subheader(
+    "116 v3.1 損益構造分解の扱い"
+)
+st.write(
+    "【診断】Target / Stop / 期間末とギャップの件数・Net R寄与を銘柄別に確認します。"
+)
+st.write(
+    "【維持】GOOG / NVDAのイベントは混ぜず、v3.0と同じ20日2R母集団を使います。"
+)
+st.write(
+    "【未採用】結果の悪い決済構造だけを除外すること、銘柄ごとに後付けでルールを変えること。"
+)
+st.write(
+    "【次段階候補】構造差が確認できても、それだけで原因とは断定せず、市場環境候補を事前定義してから検証します。"
+)
+
+# ============================================================
+# v3.1 番号選択・クイックコピー
 # ============================================================
 
 # 長いページをスクロールしなくても、サイドバーから番号を選んで
@@ -10560,6 +10801,15 @@ quick_copy_results = {
     "110 v3.0 20日保有・2R・NVDA−GOOG差": _quick_copy_text(
         "110 v3.0 20日保有・2R・NVDA−GOOG差", v30_ticker_difference
     ),
+    "113 v3.1 GOOG / NVDA 20日保有・2R・決済構造別Net R": _quick_copy_text(
+        "113 v3.1 GOOG / NVDA 20日保有・2R・決済構造別Net R", v31_structure
+    ),
+    "114 v3.1 20日保有・2R・決済構造別NVDA−GOOG差": _quick_copy_text(
+        "114 v3.1 20日保有・2R・決済構造別NVDA−GOOG差", v31_structure_difference
+    ),
+    "115 v3.1 20日保有・2R・構造分解監査": _quick_copy_text(
+        "115 v3.1 20日保有・2R・構造分解監査", v31_reconciliation
+    ),
 }
 
 with quick_copy_top_placeholder.container():
@@ -10571,25 +10821,25 @@ with quick_copy_top_placeholder.container():
     quick_copy_choice = st.selectbox(
         "結果番号を選択",
         options=list(quick_copy_results.keys()),
-        index=list(quick_copy_results.keys()).index("107 v3.0 GOOG / NVDA 同一ルール・監査サマリー"),
-        key="quick_copy_choice_v30",
+        index=list(quick_copy_results.keys()).index("115 v3.1 20日保有・2R・構造分解監査"),
+        key="quick_copy_choice_v31",
     )
 
     if st.button(
         "選択した結果のコピー欄を表示",
         use_container_width=True,
-        key="quick_copy_button_v30",
+        key="quick_copy_button_v31",
     ):
-        st.session_state["quick_copy_selected_title_v30"] = quick_copy_choice
-        st.session_state["quick_copy_selected_text_v30"] = quick_copy_results[quick_copy_choice]
+        st.session_state["quick_copy_selected_title_v31"] = quick_copy_choice
+        st.session_state["quick_copy_selected_text_v31"] = quick_copy_results[quick_copy_choice]
 
-    if st.session_state.get("quick_copy_selected_text_v30"):
+    if st.session_state.get("quick_copy_selected_text_v31"):
         st.success(
-            f"表示中：{st.session_state.get('quick_copy_selected_title_v30', '')}"
+            f"表示中：{st.session_state.get('quick_copy_selected_title_v31', '')}"
         )
         st.caption("下のコピー欄の右上にあるコピーアイコンを押すと全文をコピーできます。")
         st.code(
-            st.session_state["quick_copy_selected_text_v30"],
+            st.session_state["quick_copy_selected_text_v31"],
             language=None,
         )
 
@@ -10826,6 +11076,14 @@ st.write(
 )
 
 st.write(
+    "【v3.1 実装】20日2RをTarget通常・Targetギャップ・Stop通常・Stopギャップ・期間末へ固定分解し、銘柄差の中身を診断"
+)
+
+st.write(
+    "【v3.1 注意】構造差は原因の証明ではなく、悪い区分を後付け除外しない"
+)
+
+st.write(
     "【未実装】R期待値・最大ドローダウン等を含む本格バックテスト"
 )
 
@@ -10839,7 +11097,7 @@ st.divider()
 st.warning(
     "重要：Target先着率や平均Rだけで正式な売買ルールは決めません。"
     "同日順序不明・期間内未到達・将来データ不足を分離し、"
-    "v3.0では研究用の手数料・スリッページと固定時系列分割を維持し、GOOG / NVDAを同一ルールで銘柄横断診断します。"
+    "v3.1ではv3.0までの条件を固定したまま、GOOG / NVDAの20日2Rを決済構造別に分解して診断します。"
     "板・出来高・部分約定・税金・為替コストなどはまだ含みません。"
 )
 
