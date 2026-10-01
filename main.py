@@ -2,7 +2,7 @@
 # GOOG / NVDA
 # Bollinger Band Lower-Band Research Program
 #
-# Version : 2.8
+# Version : 3.0
 #
 # v1.4まで
 # ・BB下限イベント
@@ -151,8 +151,17 @@
 # ・過去5年全体を既に研究に使っているため、後半を真の未使用OOSとは呼ばない
 # ・時系列安定性の診断であり、正式な売買条件の採用判定ではない
 #
+# v3.0
+# ・v2.9までの全機能を維持
+# ・GOOGとNVDAを同じ期間・同じBBイベント定義・同じEntry / Stop / Targetで同時計算
+# ・v2.7のギャップ約定、v2.8の手数料・スリッページも両銘柄へ同じ設定で適用
+# ・5 / 10 / 20営業日・2RのNet Rを銘柄別・シグナル別に並列比較
+# ・各銘柄の独立イベント台帳行数、重複、シグナル数、R計算可能数を監査
+# ・GOOGで見た結果を理由にNVDA側の条件を変更しない
+# ・銘柄横断の再現性診断であり、正式な売買条件の採用判定ではない
+#
 # 重要
-# v2.9は日足ベースの研究用ネットR損益＋時系列安定性診断まで。
+# v3.0は日足ベースの研究用ネットR損益＋時系列安定性＋銘柄横断診断まで。
 # 板・出来高・部分約定・税金・為替コストなどはまだ含めない。
 # 正式な売買ルールはまだ確定しない。
 # ============================================================
@@ -178,7 +187,7 @@ st.set_page_config(
 # 定数
 # ============================================================
 
-APP_VERSION = "2.9"
+APP_VERSION = "3.0"
 
 BB_PERIOD = 20
 BB_STD = 2.0
@@ -5306,6 +5315,234 @@ def format_event_id(value) -> str:
     )
 
 
+
+
+# ============================================================
+# v3.0
+# GOOG / NVDA 同一ルール・同一コスト銘柄横断診断
+# ============================================================
+
+def build_v30_ticker_bundle(
+    ticker_symbol: str,
+    prepared_data: pd.DataFrame,
+    commission_rate: float,
+    slippage_rate: float,
+):
+    """v2.6～v2.8の正式研究計算を1銘柄分まとめて再実行する。"""
+    if prepared_data is None or prepared_data.empty:
+        return None
+
+    data = prepared_data.copy()
+    valid = data.dropna(
+        subset=["BB_Middle", "BB_Upper", "BB_Lower", "BandWidth"]
+    ).copy()
+    if valid.empty:
+        return None
+
+    event_starts = valid[valid["New_BB_Lower_Event"].eq(True)].copy()
+    completed_starts = event_starts[
+        event_starts["Event_Observation_Complete"].eq(True)
+    ].copy()
+
+    completed_ids = set(
+        pd.to_numeric(completed_starts["BB_Event_ID"], errors="coerce")
+        .dropna().astype(int).tolist()
+    )
+    completed_mask = (
+        pd.to_numeric(valid["BB_Event_ID"], errors="coerce")
+        .fillna(-1).astype(int).isin(completed_ids)
+    )
+    first_stop = valid[
+        completed_mask & valid["First_Decline_Stop_In_Event"].eq(True)
+    ].copy()
+    first_rebound = valid[
+        completed_mask & valid["First_Rebound_Start_In_Event"].eq(True)
+    ].copy()
+
+    signal_valid = {
+        "Stop": first_stop[first_stop["Stop_R_Valid"].eq(True)].copy(),
+        "Rebound": first_rebound[first_rebound["Rebound_R_Valid"].eq(True)].copy(),
+    }
+
+    first_hit_sets = {}
+    legacy_sets = {}
+    gap_sets = {}
+    net_sets = {}
+
+    for prefix_name in ["Stop", "Rebound"]:
+        result_parts = []
+        for horizon in FIRST_HIT_HORIZONS:
+            part = calculate_first_hit_results(
+                data,
+                signal_valid[prefix_name],
+                prefix_name,
+                2.0,
+                horizon,
+            )
+            if part is not None and not part.empty:
+                result_parts.append(part)
+        combined = (
+            pd.concat(result_parts, ignore_index=True)
+            if result_parts else pd.DataFrame()
+        )
+        first_hit_sets[prefix_name] = combined
+        legacy_sets[prefix_name] = calculate_r_pnl_results(data, combined)
+        gap_sets[prefix_name] = calculate_gap_aware_r_pnl_results(data, combined)
+        net_sets[prefix_name] = calculate_v28_net_cost_results(
+            gap_sets[prefix_name],
+            commission_rate=commission_rate,
+            slippage_rate=slippage_rate,
+        )
+
+    ledger = build_v26_event_ledger(
+        data,
+        completed_starts,
+        legacy_sets["Stop"],
+        legacy_sets["Rebound"],
+    )
+
+    return {
+        "ticker": ticker_symbol,
+        "data": data,
+        "valid": valid,
+        "completed_starts": completed_starts,
+        "first_stop": first_stop,
+        "first_rebound": first_rebound,
+        "signal_valid": signal_valid,
+        "ledger": ledger,
+        "net_sets": net_sets,
+    }
+
+
+def build_v30_cross_ticker_audit(bundles: dict, period_label: str) -> pd.DataFrame:
+    rows = []
+    for ticker_symbol in ["GOOG", "NVDA"]:
+        bundle = bundles.get(ticker_symbol)
+        if not bundle:
+            rows.append({
+                "銘柄": ticker_symbol,
+                "期間設定": period_label,
+                "データ開始日": pd.NaT,
+                "データ終了日": pd.NaT,
+                "観察完了BBイベント": 0,
+                "独立台帳行数": 0,
+                "ユニークイベントID": 0,
+                "重複イベントID行": 0,
+                "下落停止確認": 0,
+                "下落停止R計算可能": 0,
+                "反発開始確認": 0,
+                "反発開始R計算可能": 0,
+                "監査": "データなし",
+            })
+            continue
+
+        valid = bundle["valid"]
+        ledger = bundle["ledger"]
+        completed_count = len(bundle["completed_starts"])
+        ledger_count = len(ledger)
+        unique_count = (
+            int(pd.to_numeric(ledger["イベントID"], errors="coerce").nunique())
+            if not ledger.empty else 0
+        )
+        duplicate_count = max(0, ledger_count - unique_count)
+        audit_ok = (
+            completed_count == ledger_count == unique_count
+            and duplicate_count == 0
+        )
+        rows.append({
+            "銘柄": ticker_symbol,
+            "期間設定": period_label,
+            "データ開始日": valid.index.min(),
+            "データ終了日": valid.index.max(),
+            "観察完了BBイベント": completed_count,
+            "独立台帳行数": ledger_count,
+            "ユニークイベントID": unique_count,
+            "重複イベントID行": duplicate_count,
+            "下落停止確認": len(bundle["first_stop"]),
+            "下落停止R計算可能": len(bundle["signal_valid"]["Stop"]),
+            "反発開始確認": len(bundle["first_rebound"]),
+            "反発開始R計算可能": len(bundle["signal_valid"]["Rebound"]),
+            "監査": "OK" if audit_ok else "要確認",
+        })
+    return pd.DataFrame(rows)
+
+
+def build_v30_cross_ticker_net_summary(bundles: dict) -> pd.DataFrame:
+    rows = []
+    for ticker_symbol in ["GOOG", "NVDA"]:
+        bundle = bundles.get(ticker_symbol)
+        if not bundle:
+            continue
+        completed_count = len(bundle["completed_starts"])
+        for prefix_name, signal_label in [("Stop", "下落停止"), ("Rebound", "反発開始")]:
+            results = bundle["net_sets"].get(prefix_name, pd.DataFrame())
+            if results is None or results.empty:
+                continue
+            for horizon in FIRST_HIT_HORIZONS:
+                part = results[
+                    pd.to_numeric(results["Horizon"], errors="coerce").eq(horizon)
+                ].copy()
+                valid = part[part["Net_R_Valid"].eq(True)].copy()
+                gross_r = pd.to_numeric(valid["Gross_Realized_R"], errors="coerce").dropna()
+                net_r = pd.to_numeric(valid["Net_Realized_R"], errors="coerce").dropna()
+                cost_r = pd.to_numeric(valid["Cost_R"], errors="coerce").dropna()
+                rows.append({
+                    "銘柄": ticker_symbol,
+                    "シグナル": signal_label,
+                    "保有期間": f"{horizon}営業日",
+                    "観察完了BBイベント": completed_count,
+                    "シグナル対象": len(part),
+                    "Net_R計算可能": len(net_r),
+                    "Gross合計R": float(gross_r.sum()) if not gross_r.empty else np.nan,
+                    "Net合計R": float(net_r.sum()) if not net_r.empty else np.nan,
+                    "コスト合計R": float(cost_r.sum()) if not cost_r.empty else np.nan,
+                    "Net平均R": float(net_r.mean()) if not net_r.empty else np.nan,
+                    "Net中央値R": float(net_r.median()) if not net_r.empty else np.nan,
+                    "NetプラスR": int((net_r > 0).sum()),
+                    "NetマイナスR": int((net_r < 0).sum()),
+                    "NetゼロR": int((net_r.abs() <= 1e-12).sum()),
+                })
+    return pd.DataFrame(rows)
+
+
+def build_v30_20d_cross_ticker(summary: pd.DataFrame) -> pd.DataFrame:
+    if summary is None or summary.empty:
+        return pd.DataFrame()
+    part = summary[summary["保有期間"].eq("20営業日")].copy()
+    return part.reset_index(drop=True)
+
+
+def build_v30_ticker_difference(summary_20d: pd.DataFrame) -> pd.DataFrame:
+    """NVDA-GOOGの差を記述するだけ。優劣判定や採用判定には使わない。"""
+    if summary_20d is None or summary_20d.empty:
+        return pd.DataFrame()
+    rows = []
+    for signal_label in ["下落停止", "反発開始"]:
+        signal = summary_20d[summary_20d["シグナル"].eq(signal_label)]
+        goog = signal[signal["銘柄"].eq("GOOG")]
+        nvda = signal[signal["銘柄"].eq("NVDA")]
+        if goog.empty or nvda.empty:
+            continue
+        g = goog.iloc[0]
+        n = nvda.iloc[0]
+        rows.append({
+            "シグナル": signal_label,
+            "GOOG_Net_R計算可能": int(g["Net_R計算可能"]),
+            "NVDA_Net_R計算可能": int(n["Net_R計算可能"]),
+            "GOOG_Net合計R": g["Net合計R"],
+            "NVDA_Net合計R": n["Net合計R"],
+            "GOOG_Net平均R": g["Net平均R"],
+            "NVDA_Net平均R": n["Net平均R"],
+            "平均R差_NVDA-GOOG": (
+                float(n["Net平均R"]) - float(g["Net平均R"])
+                if pd.notna(n["Net平均R"]) and pd.notna(g["Net平均R"])
+                else np.nan
+            ),
+            "GOOG_Net中央値R": g["Net中央値R"],
+            "NVDA_Net中央値R": n["Net中央値R"],
+        })
+    return pd.DataFrame(rows)
+
 # ============================================================
 # タイトル
 # ============================================================
@@ -5316,14 +5553,14 @@ st.title(
 
 st.caption(
     f"Version {APP_VERSION} ｜ "
-    "時系列分割・Net R再現性診断版"
+    "GOOG / NVDA 同一ルール・銘柄横断診断版"
 )
 
 st.info(
-    "v2.9ではv2.8までの研究結果をすべて維持し、"
-    "55件の独立BBイベントを時系列順の前半・後半へ固定分割します。"
-    "同じEntry / Stop / Target / ギャップ / コスト条件のままNet Rを比較し、"
-    "利益が特定時期だけに偏っていないかを診断します。新しい売買条件は追加しません。"
+    "v3.0ではv2.9までの研究結果をすべて維持し、"
+    "GOOGとNVDAを同じ期間・同じEntry / Stop / Target / ギャップ / コスト条件で同時計算します。"
+    "5・10・20営業日、2RのNet Rを銘柄別に分離して比較し、"
+    "GOOGで研究してきた条件が別銘柄でもどのように振る舞うかを診断します。条件は変更しません。"
 )
 
 # v2.5.1: 実際の結果は後段で計算されるため、ここに空の表示場所だけ作り、
@@ -10084,8 +10321,126 @@ st.write(
 )
 
 
+
+
 # ============================================================
-# v2.6 番号選択・クイックコピー
+# v3.0 GOOG / NVDA 同一ルール・同一コスト比較
+# ============================================================
+
+st.divider()
+
+st.subheader(
+    "106 v3.0 GOOG / NVDA 銘柄横断・研究ルール"
+)
+st.write(
+    f"【同一期間】画面上部で選択中の {period_label} をGOOG / NVDAの両方へ使用します。"
+)
+st.write(
+    "【条件固定】BBイベント、下落停止、反発開始、翌営業日Open Entry、イベント起点Stop、2R Targetを両銘柄で変更しません。"
+)
+st.write(
+    f"【同一コスト】両銘柄とも片道手数料 {commission_percent:.2f}%、片道スリッページ {slippage_percent:.2f}% を使用します。"
+)
+st.write(
+    "【同一約定処理】Stop / Targetのギャップはv2.7と同じOpen約定、Net Rはv2.8と同じ計算です。"
+)
+st.warning(
+    "NVDAの結果を見てからNVDAだけ条件を変えることはしません。v3.0は銘柄横断の再現性診断であり、正式な売買条件の採用判定ではありません。"
+)
+
+v30_bundles = {}
+for v30_symbol in ["GOOG", "NVDA"]:
+    with st.spinner(f"v3.0: {v30_symbol} を同一ルールで計算しています..."):
+        v30_prepared = df if v30_symbol == ticker else prepare_data(v30_symbol, period)
+        v30_bundles[v30_symbol] = build_v30_ticker_bundle(
+            v30_symbol,
+            v30_prepared,
+            commission_rate,
+            slippage_rate,
+        )
+
+v30_audit = build_v30_cross_ticker_audit(v30_bundles, period_label)
+
+st.subheader(
+    "107 v3.0 GOOG / NVDA 同一ルール・監査サマリー"
+)
+if v30_audit.empty:
+    st.info("銘柄横断監査の対象がありません。")
+else:
+    st.dataframe(v30_audit, use_container_width=True, hide_index=True)
+    st.write("📋 コピー用・v3.0銘柄横断監査")
+    st.code(
+        "【107 v3.0 GOOG / NVDA 同一ルール・監査サマリー】\n"
+        + v30_audit.to_csv(index=False, date_format="%Y-%m-%d").rstrip(),
+        language=None,
+    )
+
+v30_net_summary = build_v30_cross_ticker_net_summary(v30_bundles)
+
+st.subheader(
+    "108 v3.0 GOOG / NVDA 2R・コスト後Net R比較"
+)
+if v30_net_summary.empty:
+    st.info("GOOG / NVDAのNet R比較対象がありません。")
+else:
+    st.dataframe(v30_net_summary.round(4), use_container_width=True, hide_index=True)
+    st.write("📋 コピー用・v3.0 GOOG / NVDA Net R比較")
+    st.code(
+        "【108 v3.0 GOOG / NVDA 2R・コスト後Net R比較】\n"
+        + v30_net_summary.to_csv(index=False, float_format="%.4f").rstrip(),
+        language=None,
+    )
+
+v30_20d_summary = build_v30_20d_cross_ticker(v30_net_summary)
+
+st.subheader(
+    "109 v3.0 GOOG / NVDA 20日保有・2R比較"
+)
+if v30_20d_summary.empty:
+    st.info("20日保有・2Rの銘柄横断比較対象がありません。")
+else:
+    st.dataframe(v30_20d_summary.round(4), use_container_width=True, hide_index=True)
+    st.write("📋 コピー用・v3.0 20日2R銘柄比較")
+    st.code(
+        "【109 v3.0 GOOG / NVDA 20日保有・2R比較】\n"
+        + v30_20d_summary.to_csv(index=False, float_format="%.4f").rstrip(),
+        language=None,
+    )
+
+v30_ticker_difference = build_v30_ticker_difference(v30_20d_summary)
+
+st.subheader(
+    "110 v3.0 20日保有・2R・NVDA−GOOG差"
+)
+if v30_ticker_difference.empty:
+    st.info("20日保有・2Rの銘柄差を計算できません。")
+else:
+    st.dataframe(v30_ticker_difference.round(4), use_container_width=True, hide_index=True)
+    st.write("📋 コピー用・v3.0 NVDA−GOOG差")
+    st.code(
+        "【110 v3.0 20日保有・2R・NVDA−GOOG差】\n"
+        + v30_ticker_difference.to_csv(index=False, float_format="%.4f").rstrip(),
+        language=None,
+    )
+
+st.subheader(
+    "111 v3.0 銘柄横断結果の扱い"
+)
+st.write(
+    "【診断目的】GOOGで固定してきた同一ルールをNVDAへそのまま適用し、銘柄が変わったときのNet Rの振る舞いを確認します。"
+)
+st.write(
+    "【別集計】GOOGとNVDAのイベントやR損益は混ぜず、銘柄別のまま表示します。"
+)
+st.write(
+    "【未採用】結果の良い銘柄だけを選ぶこと、NVDAの結果を見てNVDA専用条件を後付けすること。"
+)
+st.write(
+    "【注意】NVDAも今回確認することで研究済みデータになります。真の未使用OOSは将来データまたは別途凍結した期間で確認する必要があります。"
+)
+
+# ============================================================
+# v3.0 番号選択・クイックコピー
 # ============================================================
 
 # 長いページをスクロールしなくても、サイドバーから番号を選んで
@@ -10193,6 +10548,18 @@ quick_copy_results = {
     "104 v2.9 20日保有・2R・前半→後半差": _quick_copy_text(
         "104 v2.9 20日保有・2R・前半→後半差", v29_20d_difference
     ),
+    "107 v3.0 GOOG / NVDA 同一ルール・監査サマリー": _quick_copy_text(
+        "107 v3.0 GOOG / NVDA 同一ルール・監査サマリー", v30_audit
+    ),
+    "108 v3.0 GOOG / NVDA 2R・コスト後Net R比較": _quick_copy_text(
+        "108 v3.0 GOOG / NVDA 2R・コスト後Net R比較", v30_net_summary
+    ),
+    "109 v3.0 GOOG / NVDA 20日保有・2R比較": _quick_copy_text(
+        "109 v3.0 GOOG / NVDA 20日保有・2R比較", v30_20d_summary
+    ),
+    "110 v3.0 20日保有・2R・NVDA−GOOG差": _quick_copy_text(
+        "110 v3.0 20日保有・2R・NVDA−GOOG差", v30_ticker_difference
+    ),
 }
 
 with quick_copy_top_placeholder.container():
@@ -10204,25 +10571,25 @@ with quick_copy_top_placeholder.container():
     quick_copy_choice = st.selectbox(
         "結果番号を選択",
         options=list(quick_copy_results.keys()),
-        index=list(quick_copy_results.keys()).index("102 v2.9 固定時系列分割・監査サマリー"),
-        key="quick_copy_choice_v29",
+        index=list(quick_copy_results.keys()).index("107 v3.0 GOOG / NVDA 同一ルール・監査サマリー"),
+        key="quick_copy_choice_v30",
     )
 
     if st.button(
         "選択した結果のコピー欄を表示",
         use_container_width=True,
-        key="quick_copy_button_v29",
+        key="quick_copy_button_v30",
     ):
-        st.session_state["quick_copy_selected_title_v29"] = quick_copy_choice
-        st.session_state["quick_copy_selected_text_v29"] = quick_copy_results[quick_copy_choice]
+        st.session_state["quick_copy_selected_title_v30"] = quick_copy_choice
+        st.session_state["quick_copy_selected_text_v30"] = quick_copy_results[quick_copy_choice]
 
-    if st.session_state.get("quick_copy_selected_text_v29"):
+    if st.session_state.get("quick_copy_selected_text_v30"):
         st.success(
-            f"表示中：{st.session_state.get('quick_copy_selected_title_v29', '')}"
+            f"表示中：{st.session_state.get('quick_copy_selected_title_v30', '')}"
         )
         st.caption("下のコピー欄の右上にあるコピーアイコンを押すと全文をコピーできます。")
         st.code(
-            st.session_state["quick_copy_selected_text_v29"],
+            st.session_state["quick_copy_selected_text_v30"],
             language=None,
         )
 
@@ -10451,6 +10818,14 @@ st.write(
 )
 
 st.write(
+    "【v3.0 実装】GOOG / NVDAを同一期間・同一ルール・同一コストで別々に同時計算し、銘柄横断の再現性を診断"
+)
+
+st.write(
+    "【v3.0 注意】NVDAの結果を見てから銘柄専用条件を後付けせず、両銘柄の結果を混ぜない"
+)
+
+st.write(
     "【未実装】R期待値・最大ドローダウン等を含む本格バックテスト"
 )
 
@@ -10464,7 +10839,7 @@ st.divider()
 st.warning(
     "重要：Target先着率や平均Rだけで正式な売買ルールは決めません。"
     "同日順序不明・期間内未到達・将来データ不足を分離し、"
-    "v2.9では研究用の手数料・スリッページに加え、固定時系列分割で安定性を診断します。"
+    "v3.0では研究用の手数料・スリッページと固定時系列分割を維持し、GOOG / NVDAを同一ルールで銘柄横断診断します。"
     "板・出来高・部分約定・税金・為替コストなどはまだ含みません。"
 )
 
