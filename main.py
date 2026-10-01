@@ -81,8 +81,15 @@
 # ・BB状態、Squeeze、BandWidth方向などのカテゴリ/真偽特徴を比較
 # ・未来情報を新しいEntry条件として使用せず、事前情報の記述統計だけを行う
 #
+# v2.2
+# ・v2.1で「反発未確認・見送り」となった12イベントだけを追跡
+# ・固定イベント day0～day3 の終了後に、Close > Prev_High がいつ初めて成立したかを診断
+# ・固定窓終了後1/2/3/5/10/20営業日以内の反発確認件数を表示
+# ・day3で見送る設計が結果に強く依存していないかを確認
+# ・固定窓終了後の反発は新しいEntry条件には使わず、観察窓感度の診断だけを行う
+#
 # 重要
-# v2.1も「コスト前のルールベースR損益・意思決定比較」まで。
+# v2.2も「コスト前のルールベースR損益・意思決定比較」まで。
 # 手数料・スリッページ・ギャップ時の実約定差はまだ含めない。
 # 正式な売買ルールはまだ確定しない。
 # ============================================================
@@ -108,7 +115,7 @@ st.set_page_config(
 # 定数
 # ============================================================
 
-APP_VERSION = "2.1"
+APP_VERSION = "2.2"
 
 BB_PERIOD = 20
 BB_STD = 2.0
@@ -123,6 +130,11 @@ LOWER_EVENT_OBSERVATION_DAYS = 3
 # v1.6
 # Entry日を1営業日目として比較する研究用保有期間
 FIRST_HIT_HORIZONS = [5, 10, 20]
+
+# v2.2 固定イベント終了後の反発確認追跡
+# 1営業日後 = 元イベントの day4
+V22_POST_WINDOW_HORIZONS = [1, 2, 3, 5, 10, 20]
+V22_MAX_FOLLOW_DAYS = 20
 
 
 # ============================================================
@@ -3044,6 +3056,274 @@ def make_v21_copy_text(title: str, data: pd.DataFrame) -> str:
 
 
 # ============================================================
+# v2.2
+# 固定イベント終了後の反発確認追跡
+# ============================================================
+
+def build_v22_post_window_rebound_tracking(
+    data: pd.DataFrame,
+    signal_df: pd.DataFrame,
+    max_follow_days: int = 20,
+) -> pd.DataFrame:
+    """v2.1で見送りとなったイベントを、固定イベント終了後だけ追跡する。
+
+    反発条件は既存と同じ Close > Prev_High。
+    固定イベント day0～day3 の外側を診断するだけで、売買ルールは変更しない。
+    """
+
+    if data is None or data.empty or signal_df is None or signal_df.empty:
+        return pd.DataFrame()
+
+    skip = signal_df[
+        signal_df["V21_Outcome_Group"] == "反発未確認・見送り"
+    ].copy()
+
+    if skip.empty:
+        return pd.DataFrame()
+
+    max_follow_days = max(1, int(max_follow_days))
+    row_count = len(data)
+    rows = []
+
+    for _, signal_row in skip.iterrows():
+        event_id_value = signal_row.get("BB_Event_ID", np.nan)
+        if pd.isna(event_id_value):
+            continue
+
+        event_id = int(event_id_value)
+        stop_date = pd.to_datetime(
+            signal_row.get("V21_Stop_Signal_Date", pd.NaT),
+            errors="coerce",
+        )
+        event_start_date = pd.to_datetime(
+            signal_row.get("BB_Event_Start_Date", pd.NaT),
+            errors="coerce",
+        )
+        event_end_date = pd.to_datetime(
+            signal_row.get("Event_End_Date", pd.NaT),
+            errors="coerce",
+        )
+
+        if pd.isna(event_end_date):
+            event_rows = data[
+                pd.to_numeric(data["BB_Event_ID"], errors="coerce") == event_id
+            ]
+            if not event_rows.empty and "Event_End_Date" in event_rows.columns:
+                end_values = pd.to_datetime(
+                    event_rows["Event_End_Date"], errors="coerce"
+                ).dropna()
+                if not end_values.empty:
+                    event_end_date = end_values.iloc[0]
+
+        if pd.isna(event_end_date) or event_end_date not in data.index:
+            rows.append(
+                {
+                    "BB_Event_ID": event_id,
+                    "V22_Event_Start_Date": event_start_date,
+                    "V22_Stop_Signal_Date": stop_date,
+                    "V22_Event_End_Date": event_end_date,
+                    "V22_First_Rebound_Date": pd.NaT,
+                    "V22_Days_After_Event_End": np.nan,
+                    "V22_Days_From_Event_Start": np.nan,
+                    "V22_Days_From_Stop": np.nan,
+                    "V22_Available_Follow_Days": 0,
+                    "V22_20D_Status": "イベント終了日取得不可",
+                    "V22_New_BB_Event_Before_Rebound": np.nan,
+                    "V22_New_BB_Event_Count_To_Check_End": np.nan,
+                }
+            )
+            continue
+
+        end_position = int(data.index.get_loc(event_end_date))
+        available_follow_days = max(0, row_count - end_position - 1)
+        search_days = min(max_follow_days, available_follow_days)
+        search_end_position = end_position + search_days
+
+        rebound_position = None
+        for position in range(end_position + 1, search_end_position + 1):
+            if bool(data.iloc[position].get("Close_Above_Prev_High", False)):
+                rebound_position = int(position)
+                break
+
+        first_rebound_date = pd.NaT
+        days_after_end = np.nan
+        days_from_event_start = np.nan
+        days_from_stop = np.nan
+
+        if rebound_position is not None:
+            first_rebound_date = data.index[rebound_position]
+            days_after_end = int(rebound_position - end_position)
+
+            if pd.notna(event_start_date) and event_start_date in data.index:
+                start_position = int(data.index.get_loc(event_start_date))
+                days_from_event_start = int(rebound_position - start_position)
+
+            if pd.notna(stop_date) and stop_date in data.index:
+                stop_position = int(data.index.get_loc(stop_date))
+                days_from_stop = int(rebound_position - stop_position)
+
+            status = "固定窓終了後20営業日以内に反発確認"
+            count_end_position = rebound_position
+        else:
+            if available_follow_days >= max_follow_days:
+                status = "固定窓終了後20営業日以内に反発なし"
+            else:
+                status = "追跡データ不足・反発未確認"
+            count_end_position = search_end_position
+
+        if count_end_position >= end_position + 1:
+            follow_slice = data.iloc[end_position + 1 : count_end_position + 1]
+            new_event_count = int(
+                follow_slice.get(
+                    "New_BB_Lower_Event",
+                    pd.Series(False, index=follow_slice.index),
+                ).eq(True).sum()
+            )
+        else:
+            new_event_count = 0
+
+        rows.append(
+            {
+                "BB_Event_ID": event_id,
+                "V22_Event_Start_Date": event_start_date,
+                "V22_Stop_Signal_Date": stop_date,
+                "V22_Event_End_Date": event_end_date,
+                "V22_First_Rebound_Date": first_rebound_date,
+                "V22_Days_After_Event_End": days_after_end,
+                "V22_Days_From_Event_Start": days_from_event_start,
+                "V22_Days_From_Stop": days_from_stop,
+                "V22_Available_Follow_Days": int(
+                    min(max_follow_days, available_follow_days)
+                ),
+                "V22_20D_Status": status,
+                "V22_New_BB_Event_Before_Rebound": bool(new_event_count > 0),
+                "V22_New_BB_Event_Count_To_Check_End": new_event_count,
+            }
+        )
+
+    return pd.DataFrame(rows).sort_values("BB_Event_ID").reset_index(drop=True)
+
+
+def build_v22_horizon_summary(
+    tracking_df: pd.DataFrame,
+    horizons=None,
+) -> pd.DataFrame:
+    """固定イベント終了後N営業日以内の反発確認を集計する。"""
+
+    if tracking_df is None or tracking_df.empty:
+        return pd.DataFrame()
+
+    if horizons is None:
+        horizons = V22_POST_WINDOW_HORIZONS
+
+    rows = []
+    total = len(tracking_df)
+
+    for horizon in horizons:
+        horizon = int(horizon)
+        confirmed_mask = (
+            pd.to_numeric(
+                tracking_df["V22_Days_After_Event_End"], errors="coerce"
+            ).le(horizon)
+        )
+        confirmed = int(confirmed_mask.sum())
+
+        full_observation_mask = pd.to_numeric(
+            tracking_df["V22_Available_Follow_Days"], errors="coerce"
+        ).ge(horizon)
+
+        # 早期に反発を確認済みなら、その後のデータが不足していても
+        # 「N日以内に反発した」こと自体は確定している。
+        determinable_mask = confirmed_mask | full_observation_mask
+        determinable = int(determinable_mask.sum())
+        no_rebound = int((determinable_mask & ~confirmed_mask).sum())
+        insufficient = int(total - determinable)
+
+        rows.append(
+            {
+                "固定窓終了後追跡": f"{horizon}営業日以内",
+                "見送りイベント": total,
+                "判定可能": determinable,
+                "期間内反発確認": confirmed,
+                "期間内反発なし": no_rebound,
+                "将来データ不足": insufficient,
+                "判定可能中の反発確認率_%": (
+                    confirmed / determinable * 100.0 if determinable else np.nan
+                ),
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
+def build_v22_timing_summary(tracking_df: pd.DataFrame) -> pd.DataFrame:
+    """20営業日以内に確認した反発の初回タイミングを正確な日数別に表示する。"""
+
+    if tracking_df is None or tracking_df.empty:
+        return pd.DataFrame()
+
+    confirmed = tracking_df.dropna(
+        subset=["V22_Days_After_Event_End"]
+    ).copy()
+
+    rows = []
+    for day in range(1, V22_MAX_FOLLOW_DAYS + 1):
+        count = int(
+            pd.to_numeric(
+                confirmed["V22_Days_After_Event_End"], errors="coerce"
+            ).eq(day).sum()
+        )
+        if count == 0:
+            continue
+
+        event_ids = ",".join(
+            str(int(x))
+            for x in pd.to_numeric(
+                confirmed.loc[
+                    pd.to_numeric(
+                        confirmed["V22_Days_After_Event_End"], errors="coerce"
+                    ).eq(day),
+                    "BB_Event_ID",
+                ],
+                errors="coerce",
+            ).dropna()
+        )
+        rows.append(
+            {
+                "固定窓終了後営業日": day,
+                "元イベント基準day": day + LOWER_EVENT_OBSERVATION_DAYS,
+                "初回反発確認件数": count,
+                "イベントID": event_ids,
+            }
+        )
+
+    no_confirm = tracking_df[
+        tracking_df["V22_Days_After_Event_End"].isna()
+    ].copy()
+    if not no_confirm.empty:
+        ids = ",".join(
+            str(int(x))
+            for x in pd.to_numeric(no_confirm["BB_Event_ID"], errors="coerce").dropna()
+        )
+        rows.append(
+            {
+                "固定窓終了後営業日": np.nan,
+                "元イベント基準day": np.nan,
+                "初回反発確認件数": len(no_confirm),
+                "イベントID": ids,
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
+def make_v22_copy_text(title: str, data: pd.DataFrame) -> str:
+    if data is None or data.empty:
+        return title + "\n対象イベントなし"
+    return title + "\n" + data.to_csv(index=False, float_format="%.4f").rstrip()
+
+
+# ============================================================
 # 全データ準備
 # ============================================================
 
@@ -3240,13 +3520,13 @@ st.title(
 
 st.caption(
     f"Version {APP_VERSION} ｜ "
-    "v1.9意思決定差の原因分解版"
+    "固定観察窓・反発確認タイミング診断版"
 )
 
 st.info(
-    "v2.1ではv2.0までの研究結果を維持したまま、"
-    "方針Aと方針BのR差が、どのイベントから生じたのかを分解します。"
-    "方針Bが見送ったイベント、待ち営業日、A/B結果差、比較不可理由を別々に確認します。"
+    "v2.2ではv2.1までの研究結果をすべて維持したまま、"
+    "v2.1で反発未確認・見送りとなったイベントを固定イベント終了後20営業日まで追跡します。"
+    "day0～day3という現在の固定観察窓に結果が依存していないかを確認する診断で、"
     "新しい売買条件は追加しません。"
 )
 
@@ -6855,6 +7135,134 @@ else:
 
 
 # ============================================================
+# v2.2 固定イベント終了後の反発確認追跡
+# ============================================================
+
+st.divider()
+
+st.subheader(
+    "63 v2.2 見送り12件・固定イベント終了後の追跡ルール"
+)
+
+st.write(
+    "【目的】v2.1で『反発未確認・見送り』となったイベントが、day0～day3の固定観察窓を過ぎた直後に反発していなかったかを確認します。"
+)
+
+st.write(
+    "【反発条件】既存と同じ Close > Prev_High を使用します。固定イベント終了日の翌営業日を『終了後1営業日＝元イベントday4』として、最大20営業日先まで最初の成立日を追跡します。"
+)
+
+st.write(
+    "【重要】これは固定観察窓3日の感度診断です。day4以降の情報を、過去のday3時点のEntry判断へ逆流させません。売買ルールも変更しません。"
+)
+
+st.warning(
+    "固定イベント終了後に別のBB下限イベントが始まる場合があります。v2.2ではその有無も表示し、後の反発を元イベントだけの効果だと決めつけません。"
+)
+
+v22_tracking_df = build_v22_post_window_rebound_tracking(
+    valid_df,
+    v21_signal_df,
+    V22_MAX_FOLLOW_DAYS,
+)
+
+st.subheader(
+    "64 v2.2 見送り12件・固定窓終了後N営業日以内の反発確認"
+)
+
+v22_horizon_summary = build_v22_horizon_summary(
+    v22_tracking_df,
+    V22_POST_WINDOW_HORIZONS,
+)
+
+st.dataframe(
+    v22_horizon_summary.round(4),
+    use_container_width=True,
+    hide_index=True,
+)
+
+st.write("📋 コピー用・固定窓終了後N営業日以内の反発確認")
+st.code(
+    make_v22_copy_text(
+        "【v2.2 見送り12件・固定窓終了後反発確認】",
+        v22_horizon_summary,
+    ),
+    language=None,
+)
+
+st.subheader(
+    "65 v2.2 初回反発確認タイミング"
+)
+
+v22_timing_summary = build_v22_timing_summary(v22_tracking_df)
+st.dataframe(
+    v22_timing_summary.round(4),
+    use_container_width=True,
+    hide_index=True,
+)
+
+st.write("📋 コピー用・初回反発確認タイミング")
+st.code(
+    make_v22_copy_text(
+        "【v2.2 見送り12件・初回反発確認タイミング】",
+        v22_timing_summary,
+    ),
+    language=None,
+)
+
+st.subheader(
+    "66 v2.2 見送り12件・固定窓終了後追跡詳細"
+)
+
+if v22_tracking_df.empty:
+    st.info("v2.2の追跡対象イベントはありません。")
+else:
+    v22_detail_display = v22_tracking_df[
+        [
+            "BB_Event_ID",
+            "V22_Event_Start_Date",
+            "V22_Stop_Signal_Date",
+            "V22_Event_End_Date",
+            "V22_First_Rebound_Date",
+            "V22_Days_After_Event_End",
+            "V22_Days_From_Event_Start",
+            "V22_Days_From_Stop",
+            "V22_Available_Follow_Days",
+            "V22_20D_Status",
+            "V22_New_BB_Event_Before_Rebound",
+            "V22_New_BB_Event_Count_To_Check_End",
+        ]
+    ].copy()
+
+    v22_detail_display.columns = [
+        "イベントID",
+        "イベント開始日",
+        "下落停止シグナル日",
+        "固定イベント終了日",
+        "固定窓後の初回反発確認日",
+        "固定窓終了後営業日",
+        "元イベント基準day",
+        "下落停止からの営業日",
+        "追跡可能営業日",
+        "20営業日追跡状態",
+        "反発確認までに新規BBイベントあり",
+        "確認終了までの新規BBイベント数",
+    ]
+
+    st.dataframe(
+        v22_detail_display.round(4),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    st.write("📋 コピー用・v2.2見送り12件追跡詳細")
+    st.code(
+        v22_detail_display.to_csv(index=False, float_format="%.4f"),
+        language=None,
+    )
+
+
+# ============================================================
 # 現在の研究段階
 # ============================================================
 
@@ -7017,6 +7425,18 @@ st.write(
 )
 
 st.write(
+    "【v2.2 実装】見送りイベントを固定窓終了後20営業日まで追跡し、最初の反発確認日を診断"
+)
+
+st.write(
+    "【v2.2 実装】固定窓終了後1 / 2 / 3 / 5 / 10 / 20営業日以内の反発確認件数を比較"
+)
+
+st.write(
+    "【未採用】v2.2の追跡結果を使って固定観察窓やEntryルールを変更すること"
+)
+
+st.write(
     "【未実装】コスト・スリッページを含む約定損益"
 )
 
@@ -7083,6 +7503,12 @@ st.info(
     "v2.1は下落停止シグナル日の終値確定時点までに観測できた情報だけを使い、"
     "同日反発を除いた『後日反発 vs 反発未確認・見送り』を比較します。"
     "ここで見つかった差は次の検証候補であり、同じ標本内で新しい売買ルールとして採用しません。"
+)
+
+st.info(
+    "v2.2はv2.1で見送りとなったイベントだけを固定イベント終了後に追跡し、"
+    "day3という観察窓の長さに結果が依存していないかを診断します。"
+    "day4以降の反発情報を過去のEntry判断には使用しません。"
 )
 
 st.caption(
