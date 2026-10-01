@@ -2,7 +2,7 @@
 # GOOG / NVDA
 # Bollinger Band Lower-Band Research Program
 #
-# Version : 1.5.2
+# Version : 1.6
 #
 # v1.4まで
 # ・BB下限イベント
@@ -27,13 +27,20 @@
 #
 # v1.5.2
 # ・㉚ / ㉛ の1R率診断にコピー用テキストを追加
-# ・Streamlit標準のコピーアイコンから診断結果を一括コピー可能
-# ・研究計算・イベント判定・R設計はv1.5.1から変更しない
+#
+# v1.6
+# ・R計算可能イベントについてEntry後の先着判定を追加
+# ・-1R Stop vs +1.5R Target を判定
+# ・-1R Stop vs +2R Target を判定
+# ・Entry日を1営業日目として 5 / 10 / 20営業日を比較
+# ・同一日にStopとTargetへ到達した場合は「順序不明」として分離
+# ・期間末で必要日数が足りない未決着イベントは「将来データ不足」として分離
+# ・1R率による除外は行わない
 #
 # 重要
-# v1.5.2でも「R幅の診断」まで。
-# -1R / +1.5R / +2R の到達判定、勝率、期待値、
-# 売買判断はまだ行わない。
+# v1.6は「価格水準の先着判定」まで。
+# コスト・スリッページを含む最終的な売買成績や
+# 正式な売買ルールはまだ確定しない。
 # ============================================================
 
 import streamlit as st
@@ -57,7 +64,7 @@ st.set_page_config(
 # 定数
 # ============================================================
 
-APP_VERSION = "1.5.2"
+APP_VERSION = "1.6"
 
 BB_PERIOD = 20
 BB_STD = 2.0
@@ -68,6 +75,10 @@ LOW_BANDWIDTH_ZONE = 0.20
 # 最初のBB下限タッチを0日目
 # 0・1・2・3営業日目を固定観察
 LOWER_EVENT_OBSERVATION_DAYS = 3
+
+# v1.6
+# Entry日を1営業日目として比較する研究用保有期間
+FIRST_HIT_HORIZONS = [5, 10, 20]
 
 
 # ============================================================
@@ -1360,6 +1371,254 @@ def calculate_r_design(
 
 
 # ============================================================
+# v1.6
+# R先着判定
+#
+# Entry日を1営業日目として、指定営業日数の範囲で
+# Stop(-1R) と Target(+1.5R / +2R) のどちらへ
+# 先に到達したかを日足OHLCで判定する。
+#
+# 同一日のOpenがどちらかの水準を既に超えている場合は、
+# 寄り付きで到達した側を先着とする。
+# OpenがStopとTargetの間にあり、その日のHigh/Lowが
+# 両方の水準へ届いた場合、日足だけでは順序が分からないため
+# 「同日両方到達・順序不明」として分離する。
+# ============================================================
+
+def calculate_first_hit_results(
+    data: pd.DataFrame,
+    signal_rows: pd.DataFrame,
+    prefix: str,
+    target_r: float,
+    horizon: int,
+) -> pd.DataFrame:
+
+    result_rows = []
+
+    if signal_rows is None or signal_rows.empty:
+        return pd.DataFrame()
+
+    entry_date_col = f"{prefix}_Entry_Date"
+    entry_price_col = f"{prefix}_Entry_Price"
+    stop_price_col = f"{prefix}_Stop_Price"
+    risk_col = f"{prefix}_Risk_1R"
+    risk_percent_col = f"{prefix}_Risk_1R_Percent"
+    valid_col = f"{prefix}_R_Valid"
+
+    for signal_date, row in signal_rows.iterrows():
+
+        if not bool(row.get(valid_col, False)):
+            continue
+
+        entry_date = row.get(entry_date_col, pd.NaT)
+        entry_price = row.get(entry_price_col, np.nan)
+        stop_price = row.get(stop_price_col, np.nan)
+        risk_1r = row.get(risk_col, np.nan)
+        risk_percent = row.get(risk_percent_col, np.nan)
+
+        if (
+            pd.isna(entry_date)
+            or pd.isna(entry_price)
+            or pd.isna(stop_price)
+            or pd.isna(risk_1r)
+        ):
+            continue
+
+        target_price = (
+            float(entry_price)
+            + float(target_r) * float(risk_1r)
+        )
+
+        try:
+            entry_position = data.index.get_loc(entry_date)
+        except KeyError:
+            continue
+
+        if not isinstance(entry_position, (int, np.integer)):
+            # 日足Indexは一意である前提。万一重複した場合は
+            # 誤判定を避けるためこのイベントを飛ばす。
+            continue
+
+        last_position = min(
+            int(entry_position) + int(horizon) - 1,
+            len(data) - 1,
+        )
+
+        available_days = (
+            last_position
+            - int(entry_position)
+            + 1
+        )
+
+        outcome = None
+        outcome_date = pd.NaT
+        outcome_day = np.nan
+        hit_price = np.nan
+
+        for position in range(
+            int(entry_position),
+            last_position + 1,
+        ):
+
+            day_row = data.iloc[position]
+
+            day_open = float(day_row["Open"])
+            day_high = float(day_row["High"])
+            day_low = float(day_row["Low"])
+
+            current_date = data.index[position]
+            day_number = (
+                position
+                - int(entry_position)
+                + 1
+            )
+
+            # 前営業日からのギャップはOpenが最初に観測される価格。
+            if day_open <= float(stop_price):
+                outcome = "Stop先着"
+                outcome_date = current_date
+                outcome_day = day_number
+                hit_price = day_open
+                break
+
+            if day_open >= float(target_price):
+                outcome = "Target先着"
+                outcome_date = current_date
+                outcome_day = day_number
+                hit_price = day_open
+                break
+
+            stop_hit = (
+                day_low <= float(stop_price)
+            )
+
+            target_hit = (
+                day_high >= float(target_price)
+            )
+
+            if stop_hit and target_hit:
+                outcome = "同日両方到達・順序不明"
+                outcome_date = current_date
+                outcome_day = day_number
+                break
+
+            if stop_hit:
+                outcome = "Stop先着"
+                outcome_date = current_date
+                outcome_day = day_number
+                hit_price = float(stop_price)
+                break
+
+            if target_hit:
+                outcome = "Target先着"
+                outcome_date = current_date
+                outcome_day = day_number
+                hit_price = float(target_price)
+                break
+
+        if outcome is None:
+            if available_days >= int(horizon):
+                outcome = "期間内未到達"
+            else:
+                outcome = "将来データ不足"
+
+        result_rows.append(
+            {
+                "BB_Event_ID": int(row["BB_Event_ID"]),
+                "Signal_Date": signal_date,
+                "Entry_Date": entry_date,
+                "Entry_Price": float(entry_price),
+                "Stop_Price": float(stop_price),
+                "Risk_1R": float(risk_1r),
+                "Risk_1R_Percent": float(risk_percent)
+                    if not pd.isna(risk_percent) else np.nan,
+                "Target_R": float(target_r),
+                "Target_Price": float(target_price),
+                "Horizon": int(horizon),
+                "Available_Days": int(available_days),
+                "Outcome": outcome,
+                "Outcome_Date": outcome_date,
+                "Outcome_Day": outcome_day,
+                "Observed_Hit_Price": hit_price,
+            }
+        )
+
+    return pd.DataFrame(result_rows)
+
+
+def build_first_hit_summary(
+    results: pd.DataFrame,
+) -> pd.DataFrame:
+
+    outcome_order = [
+        "Target先着",
+        "Stop先着",
+        "同日両方到達・順序不明",
+        "期間内未到達",
+        "将来データ不足",
+    ]
+
+    rows = []
+
+    for horizon in FIRST_HIT_HORIZONS:
+
+        horizon_df = results[
+            results["Horizon"] == horizon
+        ].copy()
+
+        total = len(horizon_df)
+
+        row = {
+            "保有期間": f"{horizon}営業日",
+            "対象": total,
+        }
+
+        for outcome in outcome_order:
+            count = int(
+                (horizon_df["Outcome"] == outcome).sum()
+            )
+            row[outcome] = count
+            row[f"{outcome} %"] = (
+                count / total * 100
+                if total > 0
+                else np.nan
+            )
+
+        rows.append(row)
+
+    return pd.DataFrame(rows)
+
+
+def make_first_hit_copy_text(
+    title: str,
+    summary_df: pd.DataFrame,
+) -> str:
+
+    lines = [title]
+
+    if summary_df.empty:
+        lines.append("対象イベントなし")
+        return "\n".join(lines)
+
+    lines.append(
+        "保有期間,対象,Target先着,Stop先着,同日両方到達・順序不明,期間内未到達,将来データ不足"
+    )
+
+    for _, row in summary_df.iterrows():
+        lines.append(
+            f"{row['保有期間']},"
+            f"{int(row['対象'])},"
+            f"{int(row['Target先着'])},"
+            f"{int(row['Stop先着'])},"
+            f"{int(row['同日両方到達・順序不明'])},"
+            f"{int(row['期間内未到達'])},"
+            f"{int(row['将来データ不足'])}"
+        )
+
+    return "\n".join(lines)
+
+
+# ============================================================
 # 全データ準備
 # ============================================================
 
@@ -1545,13 +1804,14 @@ st.title(
 
 st.caption(
     f"Version {APP_VERSION} ｜ "
-    "下落停止 vs 反発開始 ＋ 1R率診断版"
+    "下落停止 vs 反発開始 ＋ R先着判定版"
 )
 
 st.info(
-    "v1.5.2ではv1.5.1の研究計算をそのまま維持し、"
-    "㉚・㉛の1R率診断にコピー用表示を追加します。"
-    "極端に小さい1Rがどの程度あるかを確認する段階で、"
+    "v1.6ではv1.5.2までの研究計算を維持したまま、"
+    "R計算可能イベントについてEntry後の先着判定を追加します。"
+    "-1R Stopと+1.5R / +2R Targetを、"
+    "5・10・20営業日で別々に比較します。"
     "1R率による除外条件はまだ設定しません。"
 )
 
@@ -3033,8 +3293,8 @@ st.write(
 )
 
 st.warning(
-    "v1.5では、-1R・+1.5R・+2Rの"
-    "どれに先に到達したかはまだ判定しません。"
+    "v1.6では、R計算可能イベントについて"
+    "-1Rと+1.5R / +2Rの先着判定を追加します。"
 )
 
 
@@ -3732,13 +3992,322 @@ show_risk_percent_diagnostics(
 
 
 # ============================================================
-# ㉜ 現在の研究段階
+# v1.6 R先着判定の準備
+# ============================================================
+
+first_hit_result_sets = {}
+
+for prefix_name, valid_df in [
+    ("Stop", stop_r_valid),
+    ("Rebound", rebound_r_valid),
+]:
+
+    for target_r in [1.5, 2.0]:
+
+        result_parts = []
+
+        for horizon in FIRST_HIT_HORIZONS:
+
+            part = calculate_first_hit_results(
+                df,
+                valid_df,
+                prefix_name,
+                target_r,
+                horizon,
+            )
+
+            if not part.empty:
+                result_parts.append(part)
+
+        if result_parts:
+            combined = pd.concat(
+                result_parts,
+                ignore_index=True,
+            )
+        else:
+            combined = pd.DataFrame()
+
+        first_hit_result_sets[
+            (prefix_name, target_r)
+        ] = combined
+
+
+# ============================================================
+# ㉜ v1.6 先着判定ルール
 # ============================================================
 
 st.divider()
 
 st.subheader(
-    "㉜ 現在の研究段階"
+    "㉜ v1.6 R先着判定ルール"
+)
+
+st.write(
+    "【対象】R計算可能イベントのみ。1R率による除外は行いません。"
+)
+
+st.write(
+    "【開始】シグナル確認後の次営業日始値でEntryし、Entry日を1営業日目とします。"
+)
+
+st.write(
+    "【比較A】-1R Stop と +1.5R Target のどちらへ先に到達したかを判定します。"
+)
+
+st.write(
+    "【比較B】-1R Stop と +2R Target のどちらへ先に到達したかを判定します。"
+)
+
+st.write(
+    "【保有期間】5・10・20営業日を同時に表示し、まだ1つに固定しません。"
+)
+
+st.write(
+    "【同日両方】OpenがStopとTargetの間にあり、同じ日足でHighがTarget以上かつLowがStop以下なら、順序不明として分離します。"
+)
+
+st.write(
+    "【ギャップ】保有中の営業日OpenがStop以下ならStop先着、Target以上ならTarget先着として扱います。"
+)
+
+st.write(
+    "【期間末】決着前にデータが終わり、必要営業日数を観察できない場合は『将来データ不足』として分離します。"
+)
+
+st.warning(
+    "v1.6のTarget先着・Stop先着は価格水準の到達研究です。"
+    "手数料・スリッページ・実際の約定価格を含む最終損益ではありません。"
+)
+
+
+def show_first_hit_section(
+    section_title: str,
+    results: pd.DataFrame,
+):
+
+    st.subheader(section_title)
+
+    if results.empty:
+        st.info("対象イベントがありません。")
+        return
+
+    summary_df = build_first_hit_summary(
+        results
+    )
+
+    display_columns = [
+        "保有期間",
+        "対象",
+        "Target先着",
+        "Stop先着",
+        "同日両方到達・順序不明",
+        "期間内未到達",
+        "将来データ不足",
+    ]
+
+    st.dataframe(
+        summary_df[display_columns],
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    percent_display = summary_df[
+        [
+            "保有期間",
+            "Target先着 %",
+            "Stop先着 %",
+            "同日両方到達・順序不明 %",
+            "期間内未到達 %",
+            "将来データ不足 %",
+        ]
+    ].copy()
+
+    percent_display.columns = [
+        "保有期間",
+        "Target先着 %",
+        "Stop先着 %",
+        "同日両方 %",
+        "期間内未到達 %",
+        "将来データ不足 %",
+    ]
+
+    st.write("全対象イベントに対する割合")
+
+    st.dataframe(
+        percent_display.round(2),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    copy_text = make_first_hit_copy_text(
+        section_title,
+        summary_df,
+    )
+
+    st.write("📋 コピー用先着判定結果")
+
+    st.caption(
+        "下の枠の右上にあるコピーアイコンから、件数をまとめてコピーできます。"
+    )
+
+    st.code(
+        copy_text,
+        language=None,
+    )
+
+
+# ============================================================
+# ㉝ 下落停止 1.5R
+# ============================================================
+
+show_first_hit_section(
+    "㉝ v1.6 下落停止・1.5R先着判定",
+    first_hit_result_sets[("Stop", 1.5)],
+)
+
+
+# ============================================================
+# ㉞ 下落停止 2R
+# ============================================================
+
+show_first_hit_section(
+    "㉞ v1.6 下落停止・2R先着判定",
+    first_hit_result_sets[("Stop", 2.0)],
+)
+
+
+# ============================================================
+# ㉟ 反発開始 1.5R
+# ============================================================
+
+show_first_hit_section(
+    "㉟ v1.6 反発開始・1.5R先着判定",
+    first_hit_result_sets[("Rebound", 1.5)],
+)
+
+
+# ============================================================
+# ㊱ 反発開始 2R
+# ============================================================
+
+show_first_hit_section(
+    "㊱ v1.6 反発開始・2R先着判定",
+    first_hit_result_sets[("Rebound", 2.0)],
+)
+
+
+# ============================================================
+# ㊲ 20営業日・イベント詳細
+# ============================================================
+
+st.subheader(
+    "㊲ v1.6 20営業日・イベント別先着詳細"
+)
+
+strategy_label = st.radio(
+    "詳細表示するシグナル",
+    options=[
+        "下落停止",
+        "反発開始",
+    ],
+    horizontal=True,
+    key="v16_detail_strategy",
+)
+
+target_label = st.radio(
+    "詳細表示するTarget",
+    options=[
+        "+1.5R",
+        "+2R",
+    ],
+    horizontal=True,
+    key="v16_detail_target",
+)
+
+detail_prefix = (
+    "Stop"
+    if strategy_label == "下落停止"
+    else "Rebound"
+)
+
+detail_target_r = (
+    1.5
+    if target_label == "+1.5R"
+    else 2.0
+)
+
+detail_results = first_hit_result_sets[
+    (detail_prefix, detail_target_r)
+]
+
+if detail_results.empty:
+
+    st.info("詳細表示できるイベントがありません。")
+
+else:
+
+    detail_20 = detail_results[
+        detail_results["Horizon"] == 20
+    ].copy()
+
+    detail_20 = detail_20[
+        [
+            "BB_Event_ID",
+            "Signal_Date",
+            "Entry_Date",
+            "Entry_Price",
+            "Stop_Price",
+            "Risk_1R",
+            "Risk_1R_Percent",
+            "Target_Price",
+            "Outcome",
+            "Outcome_Date",
+            "Outcome_Day",
+            "Available_Days",
+        ]
+    ]
+
+    detail_20.columns = [
+        "イベントID",
+        "シグナル日",
+        "Entry日",
+        "Entry",
+        "Stop",
+        "1R",
+        "1R率 %",
+        "Target",
+        "結果",
+        "決着日",
+        "Entryから何営業日目",
+        "観察可能日数",
+    ]
+
+    st.dataframe(
+        detail_20.round(4),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    detail_copy = detail_20.to_csv(
+        index=False
+    )
+
+    st.write("📋 コピー用20営業日詳細")
+
+    st.code(
+        detail_copy,
+        language=None,
+    )
+
+
+# ============================================================
+# ㊳ 現在の研究段階
+# ============================================================
+
+st.divider()
+
+st.subheader(
+    "㊳ 現在の研究段階"
 )
 
 st.write(
@@ -3747,18 +4316,6 @@ st.write(
 
 st.write(
     "【実装済み】20日・2標準偏差BB"
-)
-
-st.write(
-    "【実装済み】BandWidth・125営業日正規化"
-)
-
-st.write(
-    "【研究分類】低BandWidthゾーン"
-)
-
-st.write(
-    "【実装済み】BB下限タッチ・下抜け・BB内復帰"
 )
 
 st.write(
@@ -3774,15 +4331,15 @@ st.write(
 )
 
 st.write(
-    "【v1.4 検証中】終値が前日高値を上回る＝反発開始候補"
+    "【検証中】終値が前日高値を上回る＝反発開始候補"
 )
 
 st.write(
-    "【v1.5 実装】シグナル確認後の次営業日始値＝仮Entry"
+    "【正式採用 for research execution】シグナル確認後の次営業日始値＝Entry"
 )
 
 st.write(
-    "【v1.5 検証中】イベント開始～確認日の最安値＝仮Stop"
+    "【検証中】イベント開始～確認日の最安値＝Stop"
 )
 
 st.write(
@@ -3790,15 +4347,7 @@ st.write(
 )
 
 st.write(
-    "【v1.5.1 実装】1R率 ＝ 1R ÷ Entry × 100"
-)
-
-st.write(
-    "【v1.5.1 診断】1R率の最小・中央値・平均・最大・分布"
-)
-
-st.write(
-    "【v1.5.2 実装】㉚・㉛の診断結果を一括コピー"
+    "【正常動作確認済み】v1.5.2 1R率診断・コピー"
 )
 
 st.write(
@@ -3806,27 +4355,31 @@ st.write(
 )
 
 st.write(
-    "【未検証】このR設計に利益上の優位性があるか"
+    "【v1.6 実装】5・10・20営業日のR先着判定"
 )
 
 st.write(
-    "【未実装】-1R / +1.5R / +2R の先着判定"
+    "【v1.6 実装】同日Stop・Target両方到達を順序不明として分離"
 )
 
 st.write(
-    "【未実装】同一日のStop・Target両方到達時の処理"
+    "【v1.6 実装】期間末の将来データ不足を分離"
 )
 
 st.write(
-    "【未実装】最大保有期間"
+    "【未検証】下落停止と反発開始のどちらにR上の優位性があるか"
 )
 
 st.write(
-    "【未実装】コスト・スリッページ"
+    "【未採用】最大保有期間を5・10・20営業日のどれかに固定すること"
 )
 
 st.write(
-    "【未実装】イベント単位Rバックテスト"
+    "【未実装】コスト・スリッページを含む約定損益"
+)
+
+st.write(
+    "【未実装】R期待値・最大ドローダウン等を含む本格バックテスト"
 )
 
 
@@ -3837,22 +4390,21 @@ st.write(
 st.divider()
 
 st.warning(
-    "重要：v1.5.2で表示する1R率は『診断値』です。"
-    "1R・1.5R・2Rも引き続き『価格設計』です。"
-    "勝率や期待値ではありません。"
+    "重要：v1.6のTarget先着率は、そのまま最終的な勝率ではありません。"
+    "同日順序不明・期間内未到達・将来データ不足を分離し、"
+    "コストや実際の約定条件もまだ含めていません。"
 )
 
 st.info(
-    "シグナルは当日の終値確定後に判定するため、"
-    "仮Entryには次営業日の始値を使用します。"
-    "仮Stopはシグナル確認時点までに分かっている"
-    "安値だけを使用し、未来の安値は使いません。"
+    "シグナルは当日の終値確定後に判定し、Entryには次営業日の始値を使用します。"
+    "Stopはシグナル確認時点までの情報だけで決定します。"
+    "Entry後のHigh / Low / Openは、研究上の結果判定にのみ使用します。"
 )
 
 st.info(
-    "v1.5.2でも1R率が小さいイベントは削除しません。"
-    "まずGOOG / NVDAそれぞれの分布を確認してから、"
-    "除外条件が必要かを判断します。"
+    "v1.6でも1R率が小さいイベントは削除しません。"
+    "まず全R計算可能イベントで先着結果を確認し、"
+    "極小1Rが結果へ与える影響はその後に分けて検証します。"
 )
 
 st.caption(
