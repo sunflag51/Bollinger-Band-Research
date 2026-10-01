@@ -2,7 +2,7 @@
 # GOOG / NVDA
 # Bollinger Band Lower-Band Research Program
 #
-# Version : 1.8
+# Version : 1.9
 #
 # v1.4まで
 # ・BB下限イベント
@@ -55,8 +55,18 @@
 # ・ペア内のStop側1R率が最小の1イベントを特定し、影響を参考診断
 # ・最小1Rイベント除外は正式フィルターではない
 #
+# v1.9
+# ・意思決定の起点を「下落停止シグナル確認時点」に固定
+# ・方針A = 下落停止確認後、次営業日始値でEntry
+# ・方針B = 下落停止確認後から固定イベント終了まで反発開始を待つ
+# ・方針Bは反発開始を確認できた場合だけ次営業日始値でEntry
+# ・反発開始を確認できなければ「見送り = 0R機会」として残す
+# ・反発開始が下落停止より前に出ただけのケースは、方針Bの確認には使わない
+# ・方針Bの待ち日数、Entry件数、見送り件数、機会平均Rを表示
+# ・将来「両方出たイベント」だけを後から選ぶペア比較の選別問題を避ける
+#
 # 重要
-# v1.8も「コスト前のルールベースR損益・ペア比較」まで。
+# v1.9も「コスト前のルールベースR損益・意思決定比較」まで。
 # 手数料・スリッページ・ギャップ時の実約定差はまだ含めない。
 # 正式な売買ルールはまだ確定しない。
 # ============================================================
@@ -82,7 +92,7 @@ st.set_page_config(
 # 定数
 # ============================================================
 
-APP_VERSION = "1.8"
+APP_VERSION = "1.9"
 
 BB_PERIOD = 20
 BB_STD = 2.0
@@ -2137,6 +2147,366 @@ def get_min_stop_risk_event_id(
 
 
 # ============================================================
+# v1.9
+# 下落停止時点を起点にした「反発待ち」方針
+#
+# 方針A:
+#   First_Decline_Stop_In_Event の翌営業日始値でEntry。
+#   既存Stop方式をそのまま使う。
+#
+# 方針B:
+#   下落停止シグナル日から固定イベント終了日まで、
+#   Close > Prev_High（反発開始候補）を待つ。
+#   同じ日に両条件が成立していれば待ち0営業日。
+#   下落停止より前に反発開始条件が出ていても、それだけでは採用しない。
+#   期間内に確認できなければ見送り（0R機会）。
+# ============================================================
+
+def calculate_wait_rebound_after_stop(
+    data: pd.DataFrame,
+) -> pd.DataFrame:
+
+    df = data.copy()
+
+    df["Wait_Rebound_After_Stop"] = False
+    df["Wait_Rebound_Days_From_Stop"] = np.nan
+    df["Wait_Rebound_Stop_Signal_Date"] = pd.NaT
+
+    stop_positions = np.where(
+        df["First_Decline_Stop_In_Event"].to_numpy(dtype=bool)
+    )[0]
+
+    for stop_position in stop_positions:
+
+        event_id = df.iloc[stop_position]["BB_Event_ID"]
+        if pd.isna(event_id):
+            continue
+
+        event_id_int = int(event_id)
+
+        event_positions = np.where(
+            (df["BB_Event_ID"].fillna(-1).astype(int).to_numpy() == event_id_int)
+        )[0]
+
+        # 下落停止を確認した日以降だけを探索する。
+        # これにより、下落停止より前に出た反発条件を未来の意思決定に流用しない。
+        eligible_positions = [
+            int(pos)
+            for pos in event_positions
+            if int(pos) >= int(stop_position)
+            and bool(df.iloc[int(pos)]["Fixed_Window_Rebound_Start_Candidate"])
+        ]
+
+        if not eligible_positions:
+            continue
+
+        rebound_position = eligible_positions[0]
+        rebound_date = df.index[rebound_position]
+        stop_date = df.index[stop_position]
+
+        df.at[rebound_date, "Wait_Rebound_After_Stop"] = True
+        df.at[
+            rebound_date,
+            "Wait_Rebound_Days_From_Stop",
+        ] = int(rebound_position - stop_position)
+        df.at[
+            rebound_date,
+            "Wait_Rebound_Stop_Signal_Date",
+        ] = stop_date
+
+    return df
+
+
+def build_v19_decision_results(
+    opportunity_rows: pd.DataFrame,
+    policy_a_results: pd.DataFrame,
+    policy_b_signal_rows: pd.DataFrame,
+    policy_b_results: pd.DataFrame,
+    horizon: int,
+    target_r: float,
+) -> pd.DataFrame:
+
+    if opportunity_rows is None or opportunity_rows.empty:
+        return pd.DataFrame()
+
+    base = opportunity_rows.copy()
+    base = base.dropna(subset=["BB_Event_ID"])
+    base["BB_Event_ID"] = base["BB_Event_ID"].astype(int)
+
+    base = base[
+        [
+            "BB_Event_ID",
+            "Stop_Signal_Date",
+            "Stop_Entry_Date",
+            "Stop_Entry_Price",
+            "Stop_Stop_Price",
+            "Stop_Risk_1R",
+            "Stop_Risk_1R_Percent",
+            "Stop_R_Valid",
+            "Stop_R_Status",
+        ]
+    ].copy()
+
+    # 方針A（下落停止ですぐEntry）のR結果
+    if policy_a_results is not None and not policy_a_results.empty:
+        a = policy_a_results[
+            (policy_a_results["Horizon"] == int(horizon))
+            & np.isclose(
+                pd.to_numeric(policy_a_results["Target_R"], errors="coerce"),
+                float(target_r),
+            )
+        ][
+            [
+                "BB_Event_ID",
+                "Exit_Type",
+                "Realized_R",
+                "R_PnL_Valid",
+                "R_PnL_Status",
+            ]
+        ].copy()
+
+        a["BB_Event_ID"] = a["BB_Event_ID"].astype(int)
+        a = a.rename(
+            columns={
+                "Exit_Type": "Policy_A_Exit_Type",
+                "Realized_R": "Policy_A_R",
+                "R_PnL_Valid": "Policy_A_R_Valid",
+                "R_PnL_Status": "Policy_A_R_Status",
+            }
+        )
+        base = base.merge(a, on="BB_Event_ID", how="left", validate="one_to_one")
+    else:
+        base["Policy_A_Exit_Type"] = ""
+        base["Policy_A_R"] = np.nan
+        base["Policy_A_R_Valid"] = False
+        base["Policy_A_R_Status"] = "結果なし"
+
+    # 方針Bのシグナル有無。見送りも母集団から消さない。
+    b_signal = pd.DataFrame()
+    if policy_b_signal_rows is not None and not policy_b_signal_rows.empty:
+        b_signal = policy_b_signal_rows.dropna(subset=["BB_Event_ID"]).copy()
+        b_signal["BB_Event_ID"] = b_signal["BB_Event_ID"].astype(int)
+        b_signal = b_signal[
+            [
+                "BB_Event_ID",
+                "WaitRebound_Signal_Date",
+                "WaitRebound_Entry_Date",
+                "WaitRebound_Entry_Price",
+                "WaitRebound_Stop_Price",
+                "WaitRebound_Risk_1R",
+                "WaitRebound_Risk_1R_Percent",
+                "WaitRebound_R_Valid",
+                "WaitRebound_R_Status",
+                "Wait_Rebound_Days_From_Stop",
+            ]
+        ].copy()
+
+    if not b_signal.empty:
+        base = base.merge(b_signal, on="BB_Event_ID", how="left", validate="one_to_one")
+    else:
+        for col in [
+            "WaitRebound_Signal_Date",
+            "WaitRebound_Entry_Date",
+            "WaitRebound_Entry_Price",
+            "WaitRebound_Stop_Price",
+            "WaitRebound_Risk_1R",
+            "WaitRebound_Risk_1R_Percent",
+            "Wait_Rebound_Days_From_Stop",
+        ]:
+            base[col] = np.nan
+        base["WaitRebound_R_Valid"] = False
+        base["WaitRebound_R_Status"] = "反発未確認"
+
+    base["Policy_B_Has_Rebound"] = base["WaitRebound_Signal_Date"].notna()
+    base["Policy_B_Action"] = np.where(
+        base["Policy_B_Has_Rebound"],
+        "反発確認→Entry",
+        "見送り",
+    )
+
+    # 方針BでEntryしたケースのR結果
+    if policy_b_results is not None and not policy_b_results.empty:
+        b = policy_b_results[
+            (policy_b_results["Horizon"] == int(horizon))
+            & np.isclose(
+                pd.to_numeric(policy_b_results["Target_R"], errors="coerce"),
+                float(target_r),
+            )
+        ][
+            [
+                "BB_Event_ID",
+                "Exit_Type",
+                "Realized_R",
+                "R_PnL_Valid",
+                "R_PnL_Status",
+            ]
+        ].copy()
+        b["BB_Event_ID"] = b["BB_Event_ID"].astype(int)
+        b = b.rename(
+            columns={
+                "Exit_Type": "Policy_B_Exit_Type",
+                "Realized_R": "Policy_B_Trade_R",
+                "R_PnL_Valid": "Policy_B_Trade_R_Valid",
+                "R_PnL_Status": "Policy_B_Trade_R_Status",
+            }
+        )
+        base = base.merge(b, on="BB_Event_ID", how="left", validate="one_to_one")
+    else:
+        base["Policy_B_Exit_Type"] = ""
+        base["Policy_B_Trade_R"] = np.nan
+        base["Policy_B_Trade_R_Valid"] = False
+        base["Policy_B_Trade_R_Status"] = "結果なし"
+
+    # 見送りは「取引損益」ではなく、意思決定機会として0Rとする。
+    # EntryしたのにR結果が不明なケースは0Rにせず比較不可のまま残す。
+    base["Policy_B_Opportunity_R"] = np.nan
+    skip_mask = ~base["Policy_B_Has_Rebound"]
+    base.loc[skip_mask, "Policy_B_Opportunity_R"] = 0.0
+
+    b_trade_valid = (
+        base["Policy_B_Trade_R_Valid"].eq(True)
+        if "Policy_B_Trade_R_Valid" in base.columns
+        else pd.Series(False, index=base.index)
+    )
+    base.loc[
+        base["Policy_B_Has_Rebound"] & b_trade_valid,
+        "Policy_B_Opportunity_R",
+    ] = pd.to_numeric(
+        base.loc[
+            base["Policy_B_Has_Rebound"] & b_trade_valid,
+            "Policy_B_Trade_R",
+        ],
+        errors="coerce",
+    )
+
+    a_valid = base["Policy_A_R_Valid"].eq(True)
+    b_decision_valid = skip_mask | (
+        base["Policy_B_Has_Rebound"] & b_trade_valid
+    )
+
+    base["Decision_Comparison_Valid"] = a_valid & b_decision_valid
+    base["Decision_R_Difference_B_Minus_A"] = np.nan
+
+    valid_mask = base["Decision_Comparison_Valid"]
+    base.loc[
+        valid_mask,
+        "Decision_R_Difference_B_Minus_A",
+    ] = (
+        pd.to_numeric(base.loc[valid_mask, "Policy_B_Opportunity_R"], errors="coerce")
+        - pd.to_numeric(base.loc[valid_mask, "Policy_A_R"], errors="coerce")
+    )
+
+    diff = pd.to_numeric(base["Decision_R_Difference_B_Minus_A"], errors="coerce")
+    base["Decision_Result"] = "比較不可"
+    base.loc[valid_mask & (diff > 1e-12), "Decision_Result"] = "方針Bが高い"
+    base.loc[valid_mask & (diff < -1e-12), "Decision_Result"] = "方針Aが高い"
+    base.loc[
+        valid_mask & np.isclose(diff, 0.0, atol=1e-12, rtol=0.0),
+        "Decision_Result",
+    ] = "同じ"
+
+    base["Horizon"] = int(horizon)
+    base["Target_R"] = float(target_r)
+
+    return base.sort_values("BB_Event_ID").reset_index(drop=True)
+
+
+def build_v19_decision_summary(
+    results: pd.DataFrame,
+) -> pd.DataFrame:
+
+    if results is None or results.empty:
+        return pd.DataFrame()
+
+    rows = []
+
+    for horizon in FIRST_HIT_HORIZONS:
+        part = results[results["Horizon"] == int(horizon)].copy()
+        if part.empty:
+            continue
+
+        valid = part[part["Decision_Comparison_Valid"]].copy()
+        entered = part[part["Policy_B_Has_Rebound"]].copy()
+        entered_valid = entered[
+            entered["Policy_B_Trade_R_Valid"].eq(True)
+        ].copy()
+
+        a_r = pd.to_numeric(valid["Policy_A_R"], errors="coerce").dropna()
+        b_opp_r = pd.to_numeric(valid["Policy_B_Opportunity_R"], errors="coerce").dropna()
+        b_trade_r = pd.to_numeric(entered_valid["Policy_B_Trade_R"], errors="coerce").dropna()
+        diff = pd.to_numeric(
+            valid["Decision_R_Difference_B_Minus_A"], errors="coerce"
+        ).dropna()
+        waits = pd.to_numeric(
+            entered["Wait_Rebound_Days_From_Stop"], errors="coerce"
+        ).dropna()
+
+        rows.append(
+            {
+                "保有期間": f"{horizon}営業日",
+                "意思決定機会": len(part),
+                "比較可能": len(valid),
+                "方針A平均R": float(a_r.mean()) if not a_r.empty else np.nan,
+                "方針B機会平均R": float(b_opp_r.mean()) if not b_opp_r.empty else np.nan,
+                "平均R差_B-A": float(diff.mean()) if not diff.empty else np.nan,
+                "中央値R差_B-A": float(diff.median()) if not diff.empty else np.nan,
+                "方針B_Entry": int(part["Policy_B_Has_Rebound"].sum()),
+                "方針B_見送り": int((~part["Policy_B_Has_Rebound"]).sum()),
+                "方針B_Entry取引平均R": float(b_trade_r.mean()) if not b_trade_r.empty else np.nan,
+                "平均待ち営業日": float(waits.mean()) if not waits.empty else np.nan,
+                "方針Bが高い": int((valid["Decision_Result"] == "方針Bが高い").sum()),
+                "方針Aが高い": int((valid["Decision_Result"] == "方針Aが高い").sum()),
+                "同じ": int((valid["Decision_Result"] == "同じ").sum()),
+                "比較不可": int((~part["Decision_Comparison_Valid"]).sum()),
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
+def make_v19_decision_copy_text(
+    title: str,
+    summary_df: pd.DataFrame,
+) -> str:
+
+    lines = [title]
+
+    if summary_df is None or summary_df.empty:
+        lines.append("対象イベントなし")
+        return "\n".join(lines)
+
+    lines.append(
+        "保有期間,意思決定機会,比較可能,方針A平均R,方針B機会平均R,平均R差_B-A,中央値R差_B-A,方針B_Entry,方針B_見送り,方針B_Entry取引平均R,平均待ち営業日,方針Bが高い,方針Aが高い,同じ,比較不可"
+    )
+
+    def fmt(value):
+        if pd.isna(value):
+            return ""
+        return f"{float(value):.4f}"
+
+    for _, row in summary_df.iterrows():
+        lines.append(
+            f"{row['保有期間']},"
+            f"{int(row['意思決定機会'])},"
+            f"{int(row['比較可能'])},"
+            f"{fmt(row['方針A平均R'])},"
+            f"{fmt(row['方針B機会平均R'])},"
+            f"{fmt(row['平均R差_B-A'])},"
+            f"{fmt(row['中央値R差_B-A'])},"
+            f"{int(row['方針B_Entry'])},"
+            f"{int(row['方針B_見送り'])},"
+            f"{fmt(row['方針B_Entry取引平均R'])},"
+            f"{fmt(row['平均待ち営業日'])},"
+            f"{int(row['方針Bが高い'])},"
+            f"{int(row['方針Aが高い'])},"
+            f"{int(row['同じ'])},"
+            f"{int(row['比較不可'])}"
+        )
+
+    return "\n".join(lines)
+
+
+# ============================================================
 # 全データ準備
 # ============================================================
 
@@ -2275,6 +2645,17 @@ def prepare_data(
         "Rebound",
     )
 
+    # v1.9: 下落停止を確認した時点から反発開始を待つ方針B
+    df = calculate_wait_rebound_after_stop(
+        df
+    )
+
+    df = calculate_r_design(
+        df,
+        "Wait_Rebound_After_Stop",
+        "WaitRebound",
+    )
+
     return df
 
 
@@ -2322,15 +2703,14 @@ st.title(
 
 st.caption(
     f"Version {APP_VERSION} ｜ "
-    "下落停止 vs 反発開始 ＋ 同一イベント・ペア比較版"
+    "下落停止時点からの意思決定比較版"
 )
 
 st.info(
-    "v1.6ではv1.5.2までの研究計算を維持したまま、"
-    "R計算可能イベントについてEntry後の先着判定を追加します。"
-    "-1R Stopと+1.5R / +2R Targetを、"
-    "5・10・20営業日で別々に比較します。"
-    "1R率による除外条件はまだ設定しません。"
+    "v1.9ではv1.8までの研究結果を維持したまま、"
+    "意思決定の起点を下落停止シグナル確認時点に固定します。"
+    "方針Aは下落停止後すぐEntry、方針Bは同じ固定イベント内で反発開始を待ち、"
+    "確認できなければ見送り0R機会として残します。"
 )
 
 
@@ -5363,13 +5743,248 @@ else:
 
 
 # ============================================================
-# ㊽ 現在の研究段階
+# v1.9 意思決定比較の準備
+# ============================================================
+
+# 方針Bの反発確認シグナル行（完了イベントだけ）
+completed_wait_rebound_df = (
+    valid_df[
+        completed_mask
+        & valid_df["Wait_Rebound_After_Stop"]
+    ]
+    .copy()
+)
+
+# 方針BでR設計可能なEntryだけを、既存の先着/R損益関数へ渡す。
+wait_rebound_r_valid = (
+    completed_wait_rebound_df[
+        completed_wait_rebound_df["WaitRebound_R_Valid"]
+    ]
+    .copy()
+)
+
+v19_policy_b_r_pnl_sets = {}
+
+for target_r in [1.5, 2.0]:
+    parts = []
+
+    for horizon in FIRST_HIT_HORIZONS:
+        first_hit = calculate_first_hit_results(
+            df,
+            wait_rebound_r_valid,
+            "WaitRebound",
+            target_r,
+            horizon,
+        )
+
+        if not first_hit.empty:
+            pnl = calculate_r_pnl_results(
+                df,
+                first_hit,
+            )
+            if not pnl.empty:
+                parts.append(pnl)
+
+    v19_policy_b_r_pnl_sets[target_r] = (
+        pd.concat(parts, ignore_index=True)
+        if parts
+        else pd.DataFrame()
+    )
+
+v19_decision_result_sets = {}
+
+for target_r in [1.5, 2.0]:
+    all_parts = []
+
+    for horizon in FIRST_HIT_HORIZONS:
+        part = build_v19_decision_results(
+            completed_first_stop_df,
+            r_pnl_result_sets[("Stop", target_r)],
+            completed_wait_rebound_df,
+            v19_policy_b_r_pnl_sets[target_r],
+            horizon,
+            target_r,
+        )
+        if not part.empty:
+            all_parts.append(part)
+
+    v19_decision_result_sets[target_r] = (
+        pd.concat(all_parts, ignore_index=True)
+        if all_parts
+        else pd.DataFrame()
+    )
+
+
+# ============================================================
+# ㊽ v1.9 意思決定比較ルール
 # ============================================================
 
 st.divider()
 
 st.subheader(
-    "㊽ 現在の研究段階"
+    "㊽ v1.9 下落停止時点からの意思決定比較ルール"
+)
+
+st.write(
+    "【共通の起点】観察完了したBB下限イベントで、下落停止シグナルが確認された時点を1つの意思決定機会とします。"
+)
+
+st.write(
+    "【方針A】下落停止確認後の次営業日始値でEntryします。v1.5以降の下落停止R設計と同じです。"
+)
+
+st.write(
+    "【方針B】下落停止を確認した日から固定イベント終了まで反発開始（終値 > 前日高値）を待ちます。確認できれば次営業日始値でEntryします。"
+)
+
+st.write(
+    "【重要】下落停止より前に反発開始条件が出ていただけのケースは方針Bの確認には使いません。同日成立は待ち0営業日として使います。"
+)
+
+st.write(
+    "【見送り】固定イベント終了まで反発開始を確認できなければ、イベントを削除せず『見送り = 0R機会』として残します。"
+)
+
+st.write(
+    "【方針B機会平均R】Entryした取引のR損益に、見送り0Rを含めて意思決定機会全体で平均します。『方針B Entry取引平均R』とは別物です。"
+)
+
+st.write(
+    "【比較】R差 = 方針B機会R − 方針A R。5・10・20営業日、1.5R・2Rを同じ母集団で比較します。"
+)
+
+st.warning(
+    "方針Bの見送り0Rは『資金が0%増減した』という意味ではなく、"
+    "このBB下限イベントでは取引しなかったという機会ベースの比較値です。"
+    "手数料・スリッページ・待機資金の別用途はまだ含めません。"
+)
+
+
+def show_v19_decision_section(
+    section_title: str,
+    results: pd.DataFrame,
+):
+
+    st.subheader(section_title)
+
+    if results is None or results.empty:
+        st.info("意思決定比較の対象イベントがありません。")
+        return
+
+    summary = build_v19_decision_summary(results)
+
+    st.dataframe(
+        summary.round(4),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    st.write("📋 コピー用意思決定比較")
+
+    st.code(
+        make_v19_decision_copy_text(
+            section_title,
+            summary,
+        ),
+        language=None,
+    )
+
+
+# ============================================================
+# ㊾ v1.9 1.5R
+# ============================================================
+
+show_v19_decision_section(
+    "㊾ v1.9 下落停止でEntry vs 反発開始まで待つ・1.5R",
+    v19_decision_result_sets[1.5],
+)
+
+
+# ============================================================
+# ㊿ v1.9 2R
+# ============================================================
+
+show_v19_decision_section(
+    "㊿ v1.9 下落停止でEntry vs 反発開始まで待つ・2R",
+    v19_decision_result_sets[2.0],
+)
+
+
+# ============================================================
+# v1.9 20営業日・意思決定詳細
+# ============================================================
+
+st.subheader(
+    "v1.9 20営業日・意思決定イベント詳細"
+)
+
+v19_detail_target_label = st.radio(
+    "v1.9詳細を表示するTarget",
+    options=["+1.5R", "+2R"],
+    horizontal=True,
+    key="v19_decision_detail_target",
+)
+
+v19_detail_target_r = (
+    1.5 if v19_detail_target_label == "+1.5R" else 2.0
+)
+
+v19_detail = v19_decision_result_sets[v19_detail_target_r].copy()
+
+if v19_detail.empty:
+    st.info("v1.9詳細を表示できるイベントがありません。")
+else:
+    v19_detail = v19_detail[v19_detail["Horizon"] == 20].copy()
+
+    detail_cols = [
+        "BB_Event_ID",
+        "Stop_Signal_Date",
+        "Policy_A_R",
+        "Policy_A_Exit_Type",
+        "Policy_B_Action",
+        "WaitRebound_Signal_Date",
+        "Wait_Rebound_Days_From_Stop",
+        "Policy_B_Trade_R",
+        "Policy_B_Opportunity_R",
+        "Policy_B_Exit_Type",
+        "Decision_R_Difference_B_Minus_A",
+        "Decision_Result",
+    ]
+
+    detail_display = v19_detail[detail_cols].copy()
+    detail_display.columns = [
+        "イベントID",
+        "下落停止シグナル日",
+        "方針A_R",
+        "方針A決済",
+        "方針B行動",
+        "反発確認日",
+        "待ち営業日",
+        "方針B_Entry取引R",
+        "方針B_機会R",
+        "方針B決済",
+        "R差_B-A",
+        "比較結果",
+    ]
+
+    st.dataframe(
+        detail_display.round(4),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    st.write("📋 コピー用v1.9 20営業日詳細")
+    st.code(detail_display.to_csv(index=False), language=None)
+
+
+# ============================================================
+# 現在の研究段階
+# ============================================================
+
+st.divider()
+
+st.subheader(
+    "現在の研究段階"
 )
 
 st.write(
@@ -5469,6 +6084,26 @@ st.write(
 )
 
 st.write(
+    "【v1.9 実装】下落停止シグナル時点を共通の意思決定起点に固定"
+)
+
+st.write(
+    "【v1.9 実装】方針A＝下落停止後Entry、方針B＝反発開始を待ち、未確認なら見送り0R機会"
+)
+
+st.write(
+    "【v1.9 実装】下落停止より前だけに出た反発条件を方針Bへ流用しない"
+)
+
+st.write(
+    "【v1.9 実装】方針Bの待ち営業日・Entry件数・見送り件数・機会平均Rを表示"
+)
+
+st.write(
+    "【未採用】方針A / 方針Bのどちらかを正式な売買方式に固定すること"
+)
+
+st.write(
     "【未実装】コスト・スリッページを含む約定損益"
 )
 
@@ -5514,6 +6149,16 @@ st.info(
 st.info(
     "v1.8のペア比較は、同じBB下限イベントについて下落停止と反発開始を同じTarget・同じ保有期間で比較します。"
     "R差は『反発開始R − 下落停止R』です。最小1Rイベント除外表示は感度確認だけで、正式な除外条件ではありません。"
+)
+
+st.info(
+    "v1.9の意思決定比較は、将来『両方のシグナルが出たイベント』だけを後から選びません。"
+    "下落停止が出た時点を母集団の起点にし、反発を待って出なかったイベントも見送りとして残します。"
+)
+
+st.info(
+    "方針Bの機会平均Rには見送り0Rを含みます。Entry取引だけの平均Rも別列で表示し、"
+    "『取引の質』と『見送りを含む意思決定全体』を混同しないようにしています。"
 )
 
 st.caption(
