@@ -2,7 +2,7 @@
 # GOOG / NVDA
 # Bollinger Band Lower-Band Research Program
 #
-# Version : 2.1
+# Version : 2.3
 #
 # v1.4まで
 # ・BB下限イベント
@@ -75,14 +75,14 @@
 #
 # v2.1
 # ・下落停止シグナル確定時点で既に観測できた情報だけを比較
-# ・方針Bの33 Entryを「同日反発」と「後日反発」に分離
+# ・方針BのEntryを「同日反発」と「後日反発」に分離
 # ・同日反発を除外し、後日反発 vs 反発未確認・見送りを比較
 # ・BB位置、BandWidth、価格反応などの数値特徴を比較
 # ・BB状態、Squeeze、BandWidth方向などのカテゴリ/真偽特徴を比較
 # ・未来情報を新しいEntry条件として使用せず、事前情報の記述統計だけを行う
 #
 # v2.2
-# ・v2.1で「反発未確認・見送り」となった12イベントだけを追跡
+# ・v2.1で「反発未確認・見送り」となったイベントだけを追跡
 # ・固定イベント day0～day3 の終了後に、Close > Prev_High がいつ初めて成立したかを診断
 # ・固定窓終了後1/2/3/5/10/20営業日以内の反発確認件数を表示
 # ・day3で見送る設計が結果に強く依存していないかを確認
@@ -90,8 +90,16 @@
 # v2.2.2: イベントID再照合を廃止し、イベント開始日＋固定3営業日から終了位置を直接決定
 # v2.2.3: v1.6準備ループの valid_df 変数上書きを修正し、v2.2追跡は全日足 df を直接使用
 #
+# v2.3
+# ・v2.2で固定窓終了後に反発確認した見送りイベントを研究対象化
+# ・方針C = day3後も最大5日 / 10日待ち、初回反発確認後の翌営業日OpenでEntry
+# ・方針CのStop = 元イベントday0から遅い反発確認日までの最安値
+# ・1.5R / 2R、保有5 / 10 / 20営業日のR損益を既存ロジックで評価
+# ・反発までに新規BBイベントが発生したケースを別集計
+# ・方針Cは研究候補であり、正式売買ルールには採用しない
+#
 # 重要
-# v2.2も「コスト前のルールベースR損益・意思決定比較」まで。
+# v2.3も「コスト前のルールベースR損益・意思決定比較」まで。
 # 手数料・スリッページ・ギャップ時の実約定差はまだ含めない。
 # 正式な売買ルールはまだ確定しない。
 # ============================================================
@@ -117,7 +125,7 @@ st.set_page_config(
 # 定数
 # ============================================================
 
-APP_VERSION = "2.2.3"
+APP_VERSION = "2.3"
 
 BB_PERIOD = 20
 BB_STD = 2.0
@@ -137,6 +145,9 @@ FIRST_HIT_HORIZONS = [5, 10, 20]
 # 1営業日後 = 元イベントの day4
 V22_POST_WINDOW_HORIZONS = [1, 2, 3, 5, 10, 20]
 V22_MAX_FOLLOW_DAYS = 20
+
+# v2.3 遅い反発を待つ研究用上限
+V23_WAIT_LIMITS = [5, 10]
 
 
 # ============================================================
@@ -3339,6 +3350,276 @@ def build_v22_timing_summary(tracking_df: pd.DataFrame) -> pd.DataFrame:
 
 
 def make_v22_copy_text(title: str, data: pd.DataFrame) -> str:
+    if data is None or data.empty:
+        return title + "\n対象イベントなし"
+    return title + "\n" + data.to_csv(index=False, float_format="%.4f").rstrip()
+
+
+# ============================================================
+# v2.3
+# 固定窓終了後の遅い反発を待ってEntryする方針C
+# ============================================================
+
+def build_v23_late_rebound_r_design(
+    data: pd.DataFrame,
+    tracking_df: pd.DataFrame,
+) -> pd.DataFrame:
+    """v2.2追跡で確認した固定窓後の初回反発からR設計を作る。
+
+    Entry: 反発確認日の翌営業日Open
+    Stop : 元BBイベントday0から反発確認日までのLow最小値
+    未来の価格はStop計算に使わない。
+    """
+
+    if data is None or data.empty or tracking_df is None or tracking_df.empty:
+        return pd.DataFrame()
+
+    index_ts = pd.to_datetime(pd.Index(data.index), errors="coerce")
+
+    def resolve_position(date_value):
+        ts = pd.to_datetime(date_value, errors="coerce")
+        if pd.isna(ts):
+            return None
+        target = ts.date()
+        for pos, idx_ts in enumerate(index_ts):
+            if pd.notna(idx_ts) and idx_ts.date() == target:
+                return int(pos)
+        return None
+
+    rows = []
+
+    for _, tr in tracking_df.iterrows():
+        event_id_value = tr.get("BB_Event_ID", np.nan)
+        if pd.isna(event_id_value):
+            continue
+
+        event_id = int(event_id_value)
+        start_date = pd.to_datetime(tr.get("V22_Event_Start_Date", pd.NaT), errors="coerce")
+        event_end_date = pd.to_datetime(tr.get("V22_Event_End_Date", pd.NaT), errors="coerce")
+        signal_date = pd.to_datetime(tr.get("V22_First_Rebound_Date", pd.NaT), errors="coerce")
+        days_after_end = pd.to_numeric(
+            pd.Series([tr.get("V22_Days_After_Event_End", np.nan)]), errors="coerce"
+        ).iloc[0]
+        new_bb = tr.get("V22_New_BB_Event_Before_Rebound", np.nan)
+        new_bb_count = tr.get("V22_New_BB_Event_Count_To_Check_End", np.nan)
+
+        base = {
+            "BB_Event_ID": event_id,
+            "V23_Event_Start_Date": start_date,
+            "V23_Event_End_Date": event_end_date,
+            "V23Late_Signal_Date": signal_date,
+            "V23_Days_After_Event_End": days_after_end,
+            "V23_New_BB_Event_Before_Rebound": new_bb,
+            "V23_New_BB_Event_Count": new_bb_count,
+            "V23Late_Entry_Date": pd.NaT,
+            "V23Late_Entry_Price": np.nan,
+            "V23Late_Stop_Price": np.nan,
+            "V23Late_Risk_1R": np.nan,
+            "V23Late_Risk_1R_Percent": np.nan,
+            "V23Late_Target_1_5R": np.nan,
+            "V23Late_Target_2R": np.nan,
+            "V23Late_R_Valid": False,
+            "V23Late_R_Status": "反発未確認",
+        }
+
+        if pd.isna(signal_date):
+            rows.append(base)
+            continue
+
+        start_pos = resolve_position(start_date)
+        signal_pos = resolve_position(signal_date)
+
+        if start_pos is None or signal_pos is None or signal_pos < start_pos:
+            base["V23Late_R_Status"] = "日付位置取得不可"
+            rows.append(base)
+            continue
+
+        stop_price = pd.to_numeric(
+            data.iloc[start_pos : signal_pos + 1]["Low"], errors="coerce"
+        ).min()
+        base["V23Late_Stop_Price"] = stop_price
+
+        entry_pos = signal_pos + 1
+        if entry_pos >= len(data):
+            base["V23Late_R_Status"] = "翌営業日データなし"
+            rows.append(base)
+            continue
+
+        entry_date = data.index[entry_pos]
+        entry_price = pd.to_numeric(
+            pd.Series([data.iloc[entry_pos]["Open"]]), errors="coerce"
+        ).iloc[0]
+        base["V23Late_Entry_Date"] = entry_date
+        base["V23Late_Entry_Price"] = entry_price
+
+        if pd.isna(stop_price) or pd.isna(entry_price):
+            base["V23Late_R_Status"] = "価格データ不足"
+            rows.append(base)
+            continue
+
+        risk = float(entry_price) - float(stop_price)
+        if risk <= 0:
+            base["V23Late_R_Status"] = "R計算不可（Entry≦Stop）"
+            rows.append(base)
+            continue
+
+        risk_pct = risk / float(entry_price) * 100.0
+        base["V23Late_Risk_1R"] = risk
+        base["V23Late_Risk_1R_Percent"] = risk_pct
+        base["V23Late_Target_1_5R"] = float(entry_price) + 1.5 * risk
+        base["V23Late_Target_2R"] = float(entry_price) + 2.0 * risk
+        base["V23Late_R_Valid"] = True
+        base["V23Late_R_Status"] = "R計算可能"
+        rows.append(base)
+
+    result = pd.DataFrame(rows)
+    if result.empty:
+        return result
+
+    # calculate_first_hit_results はindexをSignal_Dateとして記録するため、
+    # 反発確認日をindexにする。同一日複数イベントでも計算自体は可能だが、
+    # 元データ照合はEntry_Dateで行うため未来情報は混ざらない。
+    result = result.sort_values(["V23Late_Signal_Date", "BB_Event_ID"]).copy()
+    result.index = pd.to_datetime(result["V23Late_Signal_Date"], errors="coerce")
+    return result
+
+
+def build_v23_policy_summary(
+    tracking_df: pd.DataFrame,
+    design_df: pd.DataFrame,
+    pnl_df: pd.DataFrame,
+    wait_limit: int,
+    target_r: float,
+) -> pd.DataFrame:
+    """方針Cの機会平均R。待機上限まで反発なしは0R見送り。"""
+
+    if tracking_df is None or tracking_df.empty:
+        return pd.DataFrame()
+
+    wait_limit = int(wait_limit)
+    days = pd.to_numeric(tracking_df["V22_Days_After_Event_End"], errors="coerce")
+    eligible_ids = set(
+        pd.to_numeric(
+            tracking_df.loc[days.le(wait_limit), "BB_Event_ID"], errors="coerce"
+        ).dropna().astype(int).tolist()
+    )
+    all_ids = set(
+        pd.to_numeric(tracking_df["BB_Event_ID"], errors="coerce")
+        .dropna().astype(int).tolist()
+    )
+    skipped_ids = all_ids - eligible_ids
+
+    design_valid_ids = set()
+    if design_df is not None and not design_df.empty:
+        d = design_df.copy()
+        d_ids = pd.to_numeric(d["BB_Event_ID"], errors="coerce")
+        d_valid = d["V23Late_R_Valid"].eq(True) & d_ids.isin(eligible_ids)
+        design_valid_ids = set(d_ids[d_valid].dropna().astype(int).tolist())
+
+    rows = []
+    for horizon in FIRST_HIT_HORIZONS:
+        part = pd.DataFrame()
+        if pnl_df is not None and not pnl_df.empty:
+            part = pnl_df[
+                (pnl_df["Horizon"] == int(horizon))
+                & np.isclose(pd.to_numeric(pnl_df["Target_R"], errors="coerce"), float(target_r))
+                & pd.to_numeric(pnl_df["BB_Event_ID"], errors="coerce").isin(eligible_ids)
+            ].copy()
+
+        valid = part[part.get("R_PnL_Valid", False).eq(True)].copy() if not part.empty else pd.DataFrame()
+        realized = (
+            pd.to_numeric(valid["Realized_R"], errors="coerce").dropna()
+            if not valid.empty else pd.Series(dtype=float)
+        )
+
+        # 見送りは0R。Entry対象なのにR結果が計算不能なら機会平均から除外し、比較不可に残す。
+        opportunity_values = [0.0] * len(skipped_ids) + realized.tolist()
+        opportunity = pd.Series(opportunity_values, dtype=float)
+        unavailable = len(all_ids) - len(skipped_ids) - len(realized)
+
+        rows.append({
+            "待機上限": f"固定窓後{wait_limit}営業日",
+            "保有期間": f"{horizon}営業日",
+            "Target": f"+{target_r:g}R",
+            "元見送りイベント": len(all_ids),
+            "反発確認→Entry対象": len(eligible_ids),
+            "見送り継続": len(skipped_ids),
+            "R設計可能": len(design_valid_ids),
+            "R損益計算可能": len(realized),
+            "機会平均R": float(opportunity.mean()) if not opportunity.empty else np.nan,
+            "Entry取引平均R": float(realized.mean()) if not realized.empty else np.nan,
+            "Entry取引中央値R": float(realized.median()) if not realized.empty else np.nan,
+            "Entry取引合計R": float(realized.sum()) if not realized.empty else np.nan,
+            "Target決済": int((part.get("Exit_Type", pd.Series(dtype=str)) == "Target決済").sum()) if not part.empty else 0,
+            "Stop決済": int((part.get("Exit_Type", pd.Series(dtype=str)) == "Stop決済").sum()) if not part.empty else 0,
+            "期間末決済": int((part.get("Exit_Type", pd.Series(dtype=str)) == "期間末終値決済").sum()) if not part.empty else 0,
+            "比較不可": int(max(0, unavailable)),
+        })
+
+    return pd.DataFrame(rows)
+
+
+def build_v23_new_bb_split_summary(
+    design_df: pd.DataFrame,
+    pnl_df: pd.DataFrame,
+    wait_limit: int,
+    target_r: float,
+    horizon: int = 20,
+) -> pd.DataFrame:
+    """遅い反発までに新規BBイベントを挟んだかでR結果を分ける。"""
+
+    if design_df is None or design_df.empty:
+        return pd.DataFrame()
+
+    d = design_df.copy()
+    days = pd.to_numeric(d["V23_Days_After_Event_End"], errors="coerce")
+    d = d[days.le(int(wait_limit))].copy()
+    if d.empty:
+        return pd.DataFrame()
+
+    p = pd.DataFrame()
+    if pnl_df is not None and not pnl_df.empty:
+        p = pnl_df[
+            (pnl_df["Horizon"] == int(horizon))
+            & np.isclose(pd.to_numeric(pnl_df["Target_R"], errors="coerce"), float(target_r))
+        ][["BB_Event_ID", "Exit_Type", "Realized_R", "R_PnL_Valid"]].copy()
+        p["BB_Event_ID"] = pd.to_numeric(p["BB_Event_ID"], errors="coerce").astype("Int64")
+
+    d["BB_Event_ID"] = pd.to_numeric(d["BB_Event_ID"], errors="coerce").astype("Int64")
+    if not p.empty:
+        d = d.merge(p, on="BB_Event_ID", how="left", validate="one_to_one")
+    else:
+        d["Exit_Type"] = ""
+        d["Realized_R"] = np.nan
+        d["R_PnL_Valid"] = False
+
+    d["新規BBイベント"] = np.where(
+        d["V23_New_BB_Event_Before_Rebound"].eq(True), "あり", "なし"
+    )
+
+    rows = []
+    for label in ["なし", "あり"]:
+        g = d[d["新規BBイベント"] == label].copy()
+        if g.empty:
+            continue
+        valid = g[g["R_PnL_Valid"].eq(True)].copy()
+        r = pd.to_numeric(valid["Realized_R"], errors="coerce").dropna()
+        rows.append({
+            "反発までに新規BBイベント": label,
+            "Entry対象": len(g),
+            "R損益計算可能": len(r),
+            "平均R": float(r.mean()) if not r.empty else np.nan,
+            "中央値R": float(r.median()) if not r.empty else np.nan,
+            "合計R": float(r.sum()) if not r.empty else np.nan,
+            "Target決済": int((g["Exit_Type"] == "Target決済").sum()),
+            "Stop決済": int((g["Exit_Type"] == "Stop決済").sum()),
+            "期間末決済": int((g["Exit_Type"] == "期間末終値決済").sum()),
+            "比較不可": int((~g["R_PnL_Valid"].eq(True)).sum()),
+        })
+    return pd.DataFrame(rows)
+
+
+def make_v23_copy_text(title: str, data: pd.DataFrame) -> str:
     if data is None or data.empty:
         return title + "\n対象イベントなし"
     return title + "\n" + data.to_csv(index=False, float_format="%.4f").rstrip()
@@ -7162,7 +7443,7 @@ else:
 st.divider()
 
 st.subheader(
-    "63 v2.2 見送り12件・固定イベント終了後の追跡ルール"
+    "63 v2.2 見送りイベント・固定イベント終了後の追跡ルール"
 )
 
 st.write(
@@ -7190,7 +7471,7 @@ v22_tracking_df = build_v22_post_window_rebound_tracking(
 )
 
 st.subheader(
-    "64 v2.2 見送り12件・固定窓終了後N営業日以内の反発確認"
+    "64 v2.2 見送りイベント・固定窓終了後N営業日以内の反発確認"
 )
 
 v22_horizon_summary = build_v22_horizon_summary(
@@ -7207,7 +7488,7 @@ st.dataframe(
 st.write("📋 コピー用・固定窓終了後N営業日以内の反発確認")
 st.code(
     make_v22_copy_text(
-        "【v2.2 見送り12件・固定窓終了後反発確認】",
+        "【v2.2 見送りイベント・固定窓終了後反発確認】",
         v22_horizon_summary,
     ),
     language=None,
@@ -7227,14 +7508,14 @@ st.dataframe(
 st.write("📋 コピー用・初回反発確認タイミング")
 st.code(
     make_v22_copy_text(
-        "【v2.2 見送り12件・初回反発確認タイミング】",
+        "【v2.2 見送りイベント・初回反発確認タイミング】",
         v22_timing_summary,
     ),
     language=None,
 )
 
 st.subheader(
-    "66 v2.2 見送り12件・固定窓終了後追跡詳細"
+    "66 v2.2 見送りイベント・固定窓終了後追跡詳細"
 )
 
 if v22_tracking_df.empty:
@@ -7278,11 +7559,233 @@ else:
         hide_index=True,
     )
 
-    st.write("📋 コピー用・v2.2見送り12件追跡詳細")
+    st.write("📋 コピー用・v2.2見送りイベント追跡詳細")
     st.code(
         v22_detail_display.to_csv(index=False, float_format="%.4f"),
         language=None,
     )
+
+
+# ============================================================
+# v2.3 固定窓後の遅い反発Entry研究
+# ============================================================
+
+st.divider()
+
+st.subheader(
+    "67 v2.3 固定窓後の遅い反発を待つ方針C・研究ルール"
+)
+
+st.write(
+    "【対象】v2.1で固定day0～day3内に反発確認できず見送ったイベントだけを使います。"
+)
+st.write(
+    "【方針C】固定窓終了後も最大5営業日または10営業日まで待ち、最初に Close > Prev_High を確認した翌営業日OpenでEntryします。"
+)
+st.write(
+    "【Stop】元BBイベントday0から、遅い反発確認日までに付けたLowの最小値です。反発確認より後の安値は使いません。"
+)
+st.write(
+    "【評価】+1.5R / +2R、Entry日を1営業日目として5・10・20営業日を既存の先着判定と期間末R損益で評価します。"
+)
+st.warning(
+    "方針Cは研究候補です。固定窓を正式に延長したわけではありません。また反発までに新しいBB下限イベントが始まったケースは別集計します。"
+)
+
+v23_design_df = build_v23_late_rebound_r_design(
+    df,
+    v22_tracking_df,
+)
+
+st.subheader(
+    "68 v2.3 遅い反発Entry・R設計詳細"
+)
+
+if v23_design_df.empty:
+    st.info("v2.3の遅い反発Entry対象はありません。")
+else:
+    v23_design_display = v23_design_df[
+        [
+            "BB_Event_ID",
+            "V23_Event_Start_Date",
+            "V23_Event_End_Date",
+            "V23Late_Signal_Date",
+            "V23_Days_After_Event_End",
+            "V23Late_Entry_Date",
+            "V23Late_Entry_Price",
+            "V23Late_Stop_Price",
+            "V23Late_Risk_1R",
+            "V23Late_Risk_1R_Percent",
+            "V23Late_Target_1_5R",
+            "V23Late_Target_2R",
+            "V23Late_R_Status",
+            "V23_New_BB_Event_Before_Rebound",
+            "V23_New_BB_Event_Count",
+        ]
+    ].copy()
+    v23_design_display.columns = [
+        "イベントID",
+        "元イベント開始日",
+        "固定窓終了日",
+        "遅い反発確認日",
+        "固定窓終了後営業日",
+        "Entry日",
+        "Entry価格",
+        "Stop価格",
+        "1R",
+        "1R率_%",
+        "1.5R_Target",
+        "2R_Target",
+        "R設計状態",
+        "反発までに新規BBイベントあり",
+        "新規BBイベント数",
+    ]
+    st.dataframe(v23_design_display.round(4), use_container_width=True, hide_index=True)
+    st.write("📋 コピー用・v2.3遅い反発Entry R設計詳細")
+    st.code(v23_design_display.to_csv(index=False, float_format="%.4f"), language=None)
+
+# 遅い反発EntryのR損益を一度だけ計算し、5日待ち/10日待ちの両方で利用する。
+v23_pnl_sets = {}
+for target_r in [1.5, 2.0]:
+    parts = []
+    valid_design = (
+        v23_design_df[v23_design_df["V23Late_R_Valid"].eq(True)].copy()
+        if not v23_design_df.empty else pd.DataFrame()
+    )
+    for horizon in FIRST_HIT_HORIZONS:
+        first_hit = calculate_first_hit_results(
+            df,
+            valid_design,
+            "V23Late",
+            target_r,
+            horizon,
+        )
+        if not first_hit.empty:
+            pnl = calculate_r_pnl_results(df, first_hit)
+            if not pnl.empty:
+                parts.append(pnl)
+    v23_pnl_sets[target_r] = (
+        pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
+    )
+
+
+def show_v23_policy_section(section_title, wait_limit, target_r):
+    st.subheader(section_title)
+    summary = build_v23_policy_summary(
+        v22_tracking_df,
+        v23_design_df,
+        v23_pnl_sets[target_r],
+        wait_limit,
+        target_r,
+    )
+    st.dataframe(summary.round(4), use_container_width=True, hide_index=True)
+    st.write("📋 コピー用・v2.3方針C R損益")
+    st.code(make_v23_copy_text(f"【{section_title}】", summary), language=None)
+
+
+show_v23_policy_section(
+    "69 v2.3 方針C・固定窓後5営業日まで待つ・1.5R",
+    5,
+    1.5,
+)
+
+show_v23_policy_section(
+    "70 v2.3 方針C・固定窓後5営業日まで待つ・2R",
+    5,
+    2.0,
+)
+
+show_v23_policy_section(
+    "71 v2.3 方針C・固定窓後10営業日まで待つ・1.5R",
+    10,
+    1.5,
+)
+
+show_v23_policy_section(
+    "72 v2.3 方針C・固定窓後10営業日まで待つ・2R",
+    10,
+    2.0,
+)
+
+st.subheader(
+    "73 v2.3 新規BBイベント有無別・10日待ち・20日保有・2R"
+)
+
+v23_new_bb_summary = build_v23_new_bb_split_summary(
+    v23_design_df,
+    v23_pnl_sets[2.0],
+    10,
+    2.0,
+    20,
+)
+st.dataframe(v23_new_bb_summary.round(4), use_container_width=True, hide_index=True)
+st.write("📋 コピー用・v2.3新規BBイベント有無別")
+st.code(
+    make_v23_copy_text(
+        "【v2.3 新規BBイベント有無別・10日待ち・20日保有・2R】",
+        v23_new_bb_summary,
+    ),
+    language=None,
+)
+
+st.subheader(
+    "74 v2.3 遅い反発Entry・10日待ち・20日保有・2R詳細"
+)
+
+v23_detail = pd.DataFrame()
+if not v23_design_df.empty:
+    d = v23_design_df[
+        pd.to_numeric(v23_design_df["V23_Days_After_Event_End"], errors="coerce").le(10)
+    ].copy()
+    p = v23_pnl_sets[2.0]
+    if not p.empty:
+        p20 = p[p["Horizon"].eq(20)][
+            ["BB_Event_ID", "Exit_Type", "Exit_Date", "Realized_R", "R_PnL_Valid", "R_PnL_Status"]
+        ].copy()
+        p20["BB_Event_ID"] = pd.to_numeric(p20["BB_Event_ID"], errors="coerce").astype("Int64")
+        d["BB_Event_ID"] = pd.to_numeric(d["BB_Event_ID"], errors="coerce").astype("Int64")
+        d = d.merge(p20, on="BB_Event_ID", how="left", validate="one_to_one")
+    v23_detail = d[
+        [
+            "BB_Event_ID",
+            "V23_Event_Start_Date",
+            "V23_Event_End_Date",
+            "V23Late_Signal_Date",
+            "V23_Days_After_Event_End",
+            "V23Late_Entry_Date",
+            "V23Late_Entry_Price",
+            "V23Late_Stop_Price",
+            "V23Late_Risk_1R_Percent",
+            "V23_New_BB_Event_Before_Rebound",
+            "Exit_Type",
+            "Exit_Date",
+            "Realized_R",
+            "R_PnL_Status",
+        ]
+    ].copy()
+    v23_detail.columns = [
+        "イベントID",
+        "元イベント開始日",
+        "固定窓終了日",
+        "遅い反発確認日",
+        "固定窓終了後営業日",
+        "Entry日",
+        "Entry価格",
+        "Stop価格",
+        "1R率_%",
+        "反発までに新規BBイベントあり",
+        "決済",
+        "決済日",
+        "実現R",
+        "R損益状態",
+    ]
+
+if v23_detail.empty:
+    st.info("表示対象がありません。")
+else:
+    st.dataframe(v23_detail.round(4), use_container_width=True, hide_index=True)
+    st.write("📋 コピー用・v2.3遅い反発Entry詳細")
+    st.code(v23_detail.to_csv(index=False, float_format="%.4f"), language=None)
 
 
 # ============================================================
