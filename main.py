@@ -2,7 +2,7 @@
 # GOOG / NVDA
 # Bollinger Band Lower-Band Research Program
 #
-# Version : 1.5.1
+# Version : 1.5.2
 #
 # v1.4まで
 # ・BB下限イベント
@@ -25,8 +25,13 @@
 # ・1R率の分布を研究用区分で表示
 # ・1R率による除外はまだ行わない
 #
+# v1.5.2
+# ・㉚ / ㉛ の1R率診断にコピー用テキストを追加
+# ・Streamlit標準のコピーアイコンから診断結果を一括コピー可能
+# ・研究計算・イベント判定・R設計はv1.5.1から変更しない
+#
 # 重要
-# v1.5.1では「R幅の診断」まで。
+# v1.5.2でも「R幅の診断」まで。
 # -1R / +1.5R / +2R の到達判定、勝率、期待値、
 # 売買判断はまだ行わない。
 # ============================================================
@@ -52,7 +57,7 @@ st.set_page_config(
 # 定数
 # ============================================================
 
-APP_VERSION = "1.5.1"
+APP_VERSION = "1.5.2"
 
 BB_PERIOD = 20
 BB_STD = 2.0
@@ -1544,8 +1549,8 @@ st.caption(
 )
 
 st.info(
-    "v1.5.1ではv1.5のR設計を維持したまま、"
-    "1RがEntry価格の何％に相当するかを診断します。"
+    "v1.5.2ではv1.5.1の研究計算をそのまま維持し、"
+    "㉚・㉛の1R率診断にコピー用表示を追加します。"
     "極端に小さい1Rがどの程度あるかを確認する段階で、"
     "1R率による除外条件はまだ設定しません。"
 )
@@ -3643,13 +3648,73 @@ def show_risk_percent_diagnostics(
         "現在の売買条件・除外条件ではありません。"
     )
 
+    # --------------------------------------------------------
+    # v1.5.2 コピー用テキスト
+    # st.code の右上に表示されるStreamlit標準コピーアイコンで、
+    # iPhoneから診断結果をまとめてコピーできるようにする。
+    # --------------------------------------------------------
+
+    copy_lines = [
+        title,
+        f"診断イベント数: {len(values)}回",
+        f"最小1R率: {minimum:.4f}%",
+        f"中央値: {median:.4f}%",
+        f"平均: {mean:.4f}%",
+        f"最大1R率: {maximum:.4f}%",
+        "",
+        "1R率区分,件数,割合%",
+    ]
+
+    for _, bucket_row in bucket_df.iterrows():
+        copy_lines.append(
+            f"{bucket_row['1R率区分']},"
+            f"{int(bucket_row['件数'])},"
+            f"{float(bucket_row['割合 %']):.2f}"
+        )
+
+    copy_lines.append("")
+
+    if small_r_df.empty:
+        copy_lines.append(
+            "1R率1%未満のイベント: なし"
+        )
+    else:
+        copy_lines.append(
+            "1R率1%未満のイベント"
+        )
+        copy_lines.append(
+            "イベントID,1R率%"
+        )
+
+        for _, small_row in small_r_df.iterrows():
+            copy_lines.append(
+                f"{format_event_id(small_row['イベントID'])},"
+                f"{float(small_row['1R率 %']):.6f}"
+            )
+
+    copy_text = "\n".join(copy_lines)
+
+    st.write(
+        "📋 コピー用診断結果"
+    )
+
+    st.caption(
+        "下の枠の右上にあるコピーアイコンを押すと、"
+        "この診断結果をまとめてコピーできます。"
+    )
+
+    st.code(
+        copy_text,
+        language=None,
+    )
+
 
 # ============================================================
 # ㉚ 下落停止 1R率診断
 # ============================================================
 
 show_risk_percent_diagnostics(
-    "㉚ v1.5.1 下落停止・1R率診断",
+    "㉚ v1.5.2 下落停止・1R率診断",
     stop_r_valid,
     "Stop_Risk_1R_Percent",
 )
@@ -3660,7 +3725,7 @@ show_risk_percent_diagnostics(
 # ============================================================
 
 show_risk_percent_diagnostics(
-    "㉛ v1.5.1 反発開始・1R率診断",
+    "㉛ v1.5.2 反発開始・1R率診断",
     rebound_r_valid,
     "Rebound_Risk_1R_Percent",
 )
@@ -3733,6 +3798,10 @@ st.write(
 )
 
 st.write(
+    "【v1.5.2 実装】㉚・㉛の診断結果を一括コピー"
+)
+
+st.write(
     "【未採用】1R率による除外条件"
 )
 
@@ -3768,7 +3837,7 @@ st.write(
 st.divider()
 
 st.warning(
-    "重要：v1.5.1で表示する1R率は『診断値』です。"
+    "重要：v1.5.2で表示する1R率は『診断値』です。"
     "1R・1.5R・2Rも引き続き『価格設計』です。"
     "勝率や期待値ではありません。"
 )
@@ -3781,7 +3850,7 @@ st.info(
 )
 
 st.info(
-    "v1.5.1では1R率が小さいイベントも削除しません。"
+    "v1.5.2でも1R率が小さいイベントは削除しません。"
     "まずGOOG / NVDAそれぞれの分布を確認してから、"
     "除外条件が必要かを判断します。"
 )
