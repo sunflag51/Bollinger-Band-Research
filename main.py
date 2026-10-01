@@ -2,7 +2,7 @@
 # GOOG / NVDA
 # Bollinger Band Lower-Band Research Program
 #
-# Version : 1.7
+# Version : 1.8
 #
 # v1.4まで
 # ・BB下限イベント
@@ -47,8 +47,16 @@
 # ・全件と「1R率1%以上」の参考診断を並べる
 # ・1R率1%以上は正式フィルターではない
 #
+# v1.8
+# ・下落停止と反発開始の「同じBB下限イベント」だけを1対1で比較
+# ・同じTarget・同じ保有期間で、両方式のR損益差を計算
+# ・差 = 反発開始R - 下落停止R
+# ・反発開始が高い / 下落停止が高い / 同じ / 比較不可を集計
+# ・ペア内のStop側1R率が最小の1イベントを特定し、影響を参考診断
+# ・最小1Rイベント除外は正式フィルターではない
+#
 # 重要
-# v1.7は「コスト前のルールベースR損益」まで。
+# v1.8も「コスト前のルールベースR損益・ペア比較」まで。
 # 手数料・スリッページ・ギャップ時の実約定差はまだ含めない。
 # 正式な売買ルールはまだ確定しない。
 # ============================================================
@@ -74,7 +82,7 @@ st.set_page_config(
 # 定数
 # ============================================================
 
-APP_VERSION = "1.7"
+APP_VERSION = "1.8"
 
 BB_PERIOD = 20
 BB_STD = 2.0
@@ -1879,6 +1887,256 @@ def make_r_pnl_copy_text(
     return "\n".join(lines)
 
 # ============================================================
+# v1.8
+# 同一BB下限イベント・ペア比較
+#
+# 下落停止と反発開始の両方でR設計できた同じイベントを、
+# 同じTarget・同じ保有期間で1対1比較する。
+#
+# 差 = 反発開始R - 下落停止R
+# 正なら反発開始側、負なら下落停止側のR損益が高い。
+# 同日順序不明や将来データ不足など、どちらか一方でも
+# R損益計算不可ならペア差は計算せず「比較不可」とする。
+# ============================================================
+
+def build_paired_r_results(
+    stop_results: pd.DataFrame,
+    rebound_results: pd.DataFrame,
+) -> pd.DataFrame:
+
+    if (
+        stop_results is None
+        or rebound_results is None
+        or stop_results.empty
+        or rebound_results.empty
+    ):
+        return pd.DataFrame()
+
+    stop_cols = [
+        "BB_Event_ID",
+        "Horizon",
+        "Target_R",
+        "Signal_Date",
+        "Entry_Date",
+        "Entry_Price",
+        "Stop_Price",
+        "Risk_1R",
+        "Risk_1R_Percent",
+        "Exit_Type",
+        "Exit_Date",
+        "Exit_Price",
+        "Realized_R",
+        "R_PnL_Valid",
+        "R_PnL_Status",
+    ]
+
+    rebound_cols = stop_cols.copy()
+
+    stop_part = stop_results[stop_cols].copy()
+    rebound_part = rebound_results[rebound_cols].copy()
+
+    paired = stop_part.merge(
+        rebound_part,
+        on=["BB_Event_ID", "Horizon", "Target_R"],
+        how="inner",
+        suffixes=("_Stop", "_Rebound"),
+        validate="one_to_one",
+    )
+
+    if paired.empty:
+        return paired
+
+    stop_valid = paired["R_PnL_Valid_Stop"].fillna(False).astype(bool)
+    rebound_valid = paired["R_PnL_Valid_Rebound"].fillna(False).astype(bool)
+
+    paired["Pair_R_Valid"] = stop_valid & rebound_valid
+    paired["R_Difference_Rebound_Minus_Stop"] = np.nan
+    paired["Pair_Result"] = "比較不可"
+
+    valid_mask = paired["Pair_R_Valid"]
+
+    paired.loc[
+        valid_mask,
+        "R_Difference_Rebound_Minus_Stop",
+    ] = (
+        pd.to_numeric(
+            paired.loc[valid_mask, "Realized_R_Rebound"],
+            errors="coerce",
+        )
+        - pd.to_numeric(
+            paired.loc[valid_mask, "Realized_R_Stop"],
+            errors="coerce",
+        )
+    )
+
+    diff = pd.to_numeric(
+        paired["R_Difference_Rebound_Minus_Stop"],
+        errors="coerce",
+    )
+
+    paired.loc[
+        valid_mask & (diff > 1e-12),
+        "Pair_Result",
+    ] = "反発開始が高い"
+
+    paired.loc[
+        valid_mask & (diff < -1e-12),
+        "Pair_Result",
+    ] = "下落停止が高い"
+
+    paired.loc[
+        valid_mask & np.isclose(diff, 0.0, atol=1e-12, rtol=0.0),
+        "Pair_Result",
+    ] = "同じ"
+
+    return paired.sort_values(
+        ["Horizon", "BB_Event_ID"]
+    ).reset_index(drop=True)
+
+
+def build_paired_r_summary(
+    paired_results: pd.DataFrame,
+) -> pd.DataFrame:
+
+    rows = []
+
+    if paired_results is None or paired_results.empty:
+        return pd.DataFrame()
+
+    for horizon in FIRST_HIT_HORIZONS:
+
+        part = paired_results[
+            paired_results["Horizon"] == horizon
+        ].copy()
+
+        valid = part[
+            part["Pair_R_Valid"]
+        ].copy()
+
+        stop_r = pd.to_numeric(
+            valid["Realized_R_Stop"],
+            errors="coerce",
+        )
+
+        rebound_r = pd.to_numeric(
+            valid["Realized_R_Rebound"],
+            errors="coerce",
+        )
+
+        diff = pd.to_numeric(
+            valid["R_Difference_Rebound_Minus_Stop"],
+            errors="coerce",
+        ).dropna()
+
+        rows.append(
+            {
+                "保有期間": f"{horizon}営業日",
+                "同一イベント": len(part),
+                "ペア比較可能": len(diff),
+                "下落停止平均R": (
+                    float(stop_r.mean())
+                    if len(diff) > 0 else np.nan
+                ),
+                "反発開始平均R": (
+                    float(rebound_r.mean())
+                    if len(diff) > 0 else np.nan
+                ),
+                "平均R差_反発-下落": (
+                    float(diff.mean())
+                    if not diff.empty else np.nan
+                ),
+                "中央値R差_反発-下落": (
+                    float(diff.median())
+                    if not diff.empty else np.nan
+                ),
+                "反発開始が高い": int(
+                    (valid["Pair_Result"] == "反発開始が高い").sum()
+                ),
+                "下落停止が高い": int(
+                    (valid["Pair_Result"] == "下落停止が高い").sum()
+                ),
+                "同じ": int(
+                    (valid["Pair_Result"] == "同じ").sum()
+                ),
+                "比較不可": int(
+                    (~part["Pair_R_Valid"]).sum()
+                ),
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
+def make_paired_r_copy_text(
+    title: str,
+    summary_df: pd.DataFrame,
+) -> str:
+
+    lines = [title]
+
+    if summary_df is None or summary_df.empty:
+        lines.append("対象ペアイベントなし")
+        return "\n".join(lines)
+
+    lines.append(
+        "保有期間,同一イベント,ペア比較可能,下落停止平均R,反発開始平均R,平均R差_反発-下落,中央値R差_反発-下落,反発開始が高い,下落停止が高い,同じ,比較不可"
+    )
+
+    def fmt(value):
+        if pd.isna(value):
+            return ""
+        return f"{float(value):.4f}"
+
+    for _, row in summary_df.iterrows():
+        lines.append(
+            f"{row['保有期間']},"
+            f"{int(row['同一イベント'])},"
+            f"{int(row['ペア比較可能'])},"
+            f"{fmt(row['下落停止平均R'])},"
+            f"{fmt(row['反発開始平均R'])},"
+            f"{fmt(row['平均R差_反発-下落'])},"
+            f"{fmt(row['中央値R差_反発-下落'])},"
+            f"{int(row['反発開始が高い'])},"
+            f"{int(row['下落停止が高い'])},"
+            f"{int(row['同じ'])},"
+            f"{int(row['比較不可'])}"
+        )
+
+    return "\n".join(lines)
+
+
+def get_min_stop_risk_event_id(
+    paired_results: pd.DataFrame,
+):
+
+    if paired_results is None or paired_results.empty:
+        return None
+
+    base = (
+        paired_results
+        .sort_values(["Horizon", "BB_Event_ID"])
+        .drop_duplicates(subset=["BB_Event_ID"])
+        .copy()
+    )
+
+    base["Risk_1R_Percent_Stop"] = pd.to_numeric(
+        base["Risk_1R_Percent_Stop"],
+        errors="coerce",
+    )
+
+    base = base.dropna(
+        subset=["Risk_1R_Percent_Stop"]
+    )
+
+    if base.empty:
+        return None
+
+    idx = base["Risk_1R_Percent_Stop"].idxmin()
+
+    return int(base.loc[idx, "BB_Event_ID"])
+
+
+# ============================================================
 # 全データ準備
 # ============================================================
 
@@ -2064,7 +2322,7 @@ st.title(
 
 st.caption(
     f"Version {APP_VERSION} ｜ "
-    "下落停止 vs 反発開始 ＋ R損益検証版"
+    "下落停止 vs 反発開始 ＋ 同一イベント・ペア比較版"
 )
 
 st.info(
@@ -4837,13 +5095,281 @@ else:
 
 
 # ============================================================
-# ㊹ 現在の研究段階
+# v1.8 同一イベント・ペア比較の準備
+# ============================================================
+
+paired_r_result_sets = {}
+
+for target_r in [1.5, 2.0]:
+    paired_r_result_sets[target_r] = build_paired_r_results(
+        r_pnl_result_sets[("Stop", target_r)],
+        r_pnl_result_sets[("Rebound", target_r)],
+    )
+
+
+# ============================================================
+# ㊹ v1.8 ペア比較ルール
 # ============================================================
 
 st.divider()
 
 st.subheader(
-    "㊹ 現在の研究段階"
+    "㊹ v1.8 同一イベント・ペア比較ルール"
+)
+
+st.write(
+    "【対象】下落停止と反発開始の両方でR設計できた同じBB下限イベントだけを比較します。"
+)
+
+st.write(
+    "【比較条件】同じTarget（1.5Rまたは2R）・同じ保有期間（5・10・20営業日）で比較します。"
+)
+
+st.write(
+    "【R差】反発開始R − 下落停止R。プラスならそのイベントでは反発開始側、マイナスなら下落停止側のR損益が高かったことを表します。"
+)
+
+st.write(
+    "【比較不可】どちらか一方でも同日順序不明・データ不足などでR損益を計算できない場合は、ペア差を計算しません。"
+)
+
+st.warning(
+    "この比較もGOOG / NVDAの選択期間内の過去データによる研究値です。"
+    "平均R差がプラス・マイナスでも、その方式を正式採用する判定にはしません。"
+)
+
+
+def show_paired_r_section(
+    section_title: str,
+    paired_results: pd.DataFrame,
+):
+
+    st.subheader(section_title)
+
+    if paired_results is None or paired_results.empty:
+        st.info("同一イベントのペア比較対象がありません。")
+        return
+
+    summary_all = build_paired_r_summary(
+        paired_results
+    )
+
+    st.write("全ペアイベント")
+
+    st.dataframe(
+        summary_all.round(4),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    st.write("📋 コピー用ペア比較集計")
+
+    st.code(
+        make_paired_r_copy_text(
+            section_title,
+            summary_all,
+        ),
+        language=None,
+    )
+
+    min_event_id = get_min_stop_risk_event_id(
+        paired_results
+    )
+
+    if min_event_id is not None:
+        min_rows = paired_results[
+            paired_results["BB_Event_ID"] == min_event_id
+        ].copy()
+
+        min_stop_risk = pd.to_numeric(
+            min_rows["Risk_1R_Percent_Stop"],
+            errors="coerce",
+        ).dropna()
+
+        min_rebound_risk = pd.to_numeric(
+            min_rows["Risk_1R_Percent_Rebound"],
+            errors="coerce",
+        ).dropna()
+
+        stop_risk_text = (
+            f"{float(min_stop_risk.iloc[0]):.6f}%"
+            if not min_stop_risk.empty
+            else "N/A"
+        )
+
+        rebound_risk_text = (
+            f"{float(min_rebound_risk.iloc[0]):.6f}%"
+            if not min_rebound_risk.empty
+            else "N/A"
+        )
+
+        st.write(
+            f"参考診断：ペア内で下落停止1R率が最小のイベントID {min_event_id} "
+            f"（下落停止 {stop_risk_text} / 反発開始 {rebound_risk_text}）"
+        )
+
+        min_detail_cols = [
+            "BB_Event_ID",
+            "Horizon",
+            "Signal_Date_Stop",
+            "Entry_Date_Stop",
+            "Risk_1R_Percent_Stop",
+            "Realized_R_Stop",
+            "Signal_Date_Rebound",
+            "Entry_Date_Rebound",
+            "Risk_1R_Percent_Rebound",
+            "Realized_R_Rebound",
+            "R_Difference_Rebound_Minus_Stop",
+            "Pair_Result",
+        ]
+
+        st.dataframe(
+            min_rows[min_detail_cols].round(6),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        without_min = paired_results[
+            paired_results["BB_Event_ID"] != min_event_id
+        ].copy()
+
+        summary_without_min = build_paired_r_summary(
+            without_min
+        )
+
+        st.write(
+            "参考診断：上の最小1Rイベント1件だけを除いた場合（正式フィルターではありません）"
+        )
+
+        st.dataframe(
+            summary_without_min.round(4),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        st.write("📋 コピー用・最小1Rイベント1件除外参考診断")
+
+        st.code(
+            make_paired_r_copy_text(
+                f"{section_title}・最小1Rイベント1件除外参考診断",
+                summary_without_min,
+            ),
+            language=None,
+        )
+
+
+# ============================================================
+# ㊺ 下落停止 vs 反発開始・1.5R ペア比較
+# ============================================================
+
+show_paired_r_section(
+    "㊺ v1.8 同一イベント・下落停止 vs 反発開始・1.5R",
+    paired_r_result_sets[1.5],
+)
+
+
+# ============================================================
+# ㊻ 下落停止 vs 反発開始・2R ペア比較
+# ============================================================
+
+show_paired_r_section(
+    "㊻ v1.8 同一イベント・下落停止 vs 反発開始・2R",
+    paired_r_result_sets[2.0],
+)
+
+
+# ============================================================
+# ㊼ v1.8 20営業日・ペア詳細
+# ============================================================
+
+st.subheader(
+    "㊼ v1.8 20営業日・同一イベントR差詳細"
+)
+
+v18_target_label = st.radio(
+    "ペア詳細を表示するTarget",
+    options=["+1.5R", "+2R"],
+    horizontal=True,
+    key="v18_pair_detail_target",
+)
+
+v18_target_r = (
+    1.5
+    if v18_target_label == "+1.5R"
+    else 2.0
+)
+
+v18_detail = paired_r_result_sets[
+    v18_target_r
+].copy()
+
+if v18_detail.empty:
+    st.info("ペア詳細を表示できるイベントがありません。")
+else:
+    v18_detail = v18_detail[
+        v18_detail["Horizon"] == 20
+    ].copy()
+
+    v18_detail = v18_detail[
+        [
+            "BB_Event_ID",
+            "Signal_Date_Stop",
+            "Entry_Date_Stop",
+            "Entry_Price_Stop",
+            "Risk_1R_Percent_Stop",
+            "Exit_Type_Stop",
+            "Realized_R_Stop",
+            "Signal_Date_Rebound",
+            "Entry_Date_Rebound",
+            "Entry_Price_Rebound",
+            "Risk_1R_Percent_Rebound",
+            "Exit_Type_Rebound",
+            "Realized_R_Rebound",
+            "R_Difference_Rebound_Minus_Stop",
+            "Pair_Result",
+        ]
+    ]
+
+    v18_detail.columns = [
+        "イベントID",
+        "下落停止シグナル日",
+        "下落停止Entry日",
+        "下落停止Entry",
+        "下落停止1R率 %",
+        "下落停止決済",
+        "下落停止R",
+        "反発開始シグナル日",
+        "反発開始Entry日",
+        "反発開始Entry",
+        "反発開始1R率 %",
+        "反発開始決済",
+        "反発開始R",
+        "R差_反発-下落",
+        "ペア結果",
+    ]
+
+    st.dataframe(
+        v18_detail.round(4),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    st.write("📋 コピー用20営業日ペア詳細")
+
+    st.code(
+        v18_detail.to_csv(index=False),
+        language=None,
+    )
+
+
+# ============================================================
+# ㊽ 現在の研究段階
+# ============================================================
+
+st.divider()
+
+st.subheader(
+    "㊽ 現在の研究段階"
 )
 
 st.write(
@@ -4927,6 +5453,22 @@ st.write(
 )
 
 st.write(
+    "【v1.8 実装】同じBB下限イベントで下落停止と反発開始を1対1比較"
+)
+
+st.write(
+    "【v1.8 実装】反発開始R − 下落停止Rを5・10・20営業日で比較"
+)
+
+st.write(
+    "【v1.8 実装】ペア内の下落停止1R率最小イベント1件の影響を参考診断"
+)
+
+st.write(
+    "【未採用】最小1Rイベントを正式に除外すること"
+)
+
+st.write(
     "【未実装】コスト・スリッページを含む約定損益"
 )
 
@@ -4942,7 +5484,7 @@ st.write(
 st.divider()
 
 st.warning(
-    "重要：v1.6のTarget先着率は、そのまま最終的な勝率ではありません。"
+    "重要：Target先着率や平均Rだけで正式な売買ルールは決めません。"
     "同日順序不明・期間内未到達・将来データ不足を分離し、"
     "コストや実際の約定条件もまだ含めていません。"
 )
@@ -4954,7 +5496,7 @@ st.info(
 )
 
 st.info(
-    "v1.6でも1R率が小さいイベントは削除しません。"
+    "v1.8でも1R率が小さいイベントは本体集計から削除しません。"
     "まず全R計算可能イベントで先着結果を確認し、"
     "極小1Rが結果へ与える影響はその後に分けて検証します。"
 )
@@ -4967,6 +5509,11 @@ st.info(
 st.info(
     "1R率1%以上の結果は、極小1Rの影響を見るための参考診断です。"
     "過去結果を見て1%を正式採用したものではありません。"
+)
+
+st.info(
+    "v1.8のペア比較は、同じBB下限イベントについて下落停止と反発開始を同じTarget・同じ保有期間で比較します。"
+    "R差は『反発開始R − 下落停止R』です。最小1Rイベント除外表示は感度確認だけで、正式な除外条件ではありません。"
 )
 
 st.caption(
