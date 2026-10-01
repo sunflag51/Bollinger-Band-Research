@@ -2,7 +2,7 @@
 # GOOG / NVDA
 # Bollinger Band Lower-Band Research Program
 #
-# Version : 2.7
+# Version : 2.8
 #
 # v1.4まで
 # ・BB下限イベント
@@ -131,11 +131,19 @@
 # ・日中にStop/Targetへ到達した場合は従来どおり設定水準で約定したものとして扱う
 # ・期間末決済は従来どおり期間末Closeを使用
 # ・旧ルールベースRとギャップ反映Rを並べ、差が出たイベントを個別表示
-# ・手数料・スリッページはまだ反映しない
+#
+# v2.8
+# ・v2.7までの全機能を維持
+# ・EntryとExitの両方へ研究用スリッページ率を反映
+# ・EntryとExitの両方へ研究用売買手数料率を反映
+# ・ギャップ反映後のGross Rと、コスト控除後Net Rを同じ1R基準で比較
+# ・手数料率 / スリッページ率は画面から変更可能
+# ・20営業日・2Rについてイベント別のコストRとNet Rを表示
+# ・コスト設定は研究仮定であり、特定証券会社の実コストを意味しない
 #
 # 重要
-# v2.7も「コスト前のR損益・イベント研究」まで。
-# ギャップ時は日足Openで約定できたと仮定するが、実市場のスリッページはまだ含めない。
+# v2.8は日足ベースの研究用ネットR損益まで。
+# 板・出来高・部分約定・税金・為替コストなどはまだ含めない。
 # 正式な売買ルールはまだ確定しない。
 # ============================================================
 
@@ -160,7 +168,7 @@ st.set_page_config(
 # 定数
 # ============================================================
 
-APP_VERSION = "2.7"
+APP_VERSION = "2.8"
 
 BB_PERIOD = 20
 BB_STD = 2.0
@@ -2244,6 +2252,198 @@ def build_v27_gap_changed_detail(
         "到達日", "ギャップ種別", "Stop", "Target", "観測Open/到達価格",
         "旧決済価格", "ギャップ反映決済価格", "旧実現R", "ギャップ反映実現R", "R差"
     ]].sort_values(["シグナル", "イベントID"]).reset_index(drop=True)
+
+
+# ============================================================
+# v2.8
+# 手数料・スリッページ反映後のNet R損益
+#
+# Gross Rはv2.7のギャップ反映Rをそのまま使用する。
+# Net Rでは、買いEntryをスリッページ分だけ高く、
+# 売りExitをスリッページ分だけ安くしたうえで、
+# Entry / Exit双方の約定金額に手数料を課す。
+#
+# Net Rの分母は、従来から使っている計画時点のRisk_1R。
+# これにより「元の1Rに対してコストが何Rを消費したか」を比較できる。
+# ============================================================
+
+def calculate_v28_net_cost_results(
+    gap_results: pd.DataFrame,
+    commission_rate: float,
+    slippage_rate: float,
+) -> pd.DataFrame:
+    if gap_results is None or gap_results.empty:
+        return pd.DataFrame()
+
+    results = gap_results.copy()
+    commission_rate = max(0.0, float(commission_rate))
+    slippage_rate = max(0.0, float(slippage_rate))
+
+    new_columns = {
+        "Gross_Realized_R": np.nan,
+        "Entry_Execution_Price": np.nan,
+        "Exit_Execution_Price": np.nan,
+        "Entry_Commission": np.nan,
+        "Exit_Commission": np.nan,
+        "Total_Commission": np.nan,
+        "Slippage_Cost": np.nan,
+        "Total_Cost_Amount": np.nan,
+        "Cost_R": np.nan,
+        "Net_PnL_Amount_Per_Share": np.nan,
+        "Net_Realized_R": np.nan,
+        "Net_R_Valid": False,
+        "Net_R_Status": "計算不可",
+    }
+    for column, default in new_columns.items():
+        results[column] = default
+
+    for idx, row in results.iterrows():
+        gross_valid = bool(row.get("R_PnL_Valid", False))
+        raw_entry = pd.to_numeric(pd.Series([row.get("Entry_Price", np.nan)]), errors="coerce").iloc[0]
+        raw_exit = pd.to_numeric(pd.Series([row.get("Exit_Price", np.nan)]), errors="coerce").iloc[0]
+        risk_1r = pd.to_numeric(pd.Series([row.get("Risk_1R", np.nan)]), errors="coerce").iloc[0]
+        gross_r = pd.to_numeric(pd.Series([row.get("Realized_R", np.nan)]), errors="coerce").iloc[0]
+
+        if (
+            not gross_valid
+            or pd.isna(raw_entry)
+            or pd.isna(raw_exit)
+            or pd.isna(risk_1r)
+            or float(risk_1r) <= 0
+            or pd.isna(gross_r)
+        ):
+            results.at[idx, "Net_R_Status"] = row.get("R_PnL_Status", "計算不可")
+            continue
+
+        raw_entry = float(raw_entry)
+        raw_exit = float(raw_exit)
+        risk_1r = float(risk_1r)
+        gross_r = float(gross_r)
+
+        entry_execution = raw_entry * (1.0 + slippage_rate)
+        exit_execution = raw_exit * (1.0 - slippage_rate)
+
+        entry_commission = entry_execution * commission_rate
+        exit_commission = exit_execution * commission_rate
+        total_commission = entry_commission + exit_commission
+
+        entry_slippage_cost = entry_execution - raw_entry
+        exit_slippage_cost = raw_exit - exit_execution
+        slippage_cost = entry_slippage_cost + exit_slippage_cost
+
+        gross_pnl_amount = raw_exit - raw_entry
+        net_pnl_amount = (
+            exit_execution
+            - entry_execution
+            - entry_commission
+            - exit_commission
+        )
+        total_cost_amount = gross_pnl_amount - net_pnl_amount
+        cost_r = total_cost_amount / risk_1r
+        net_r = net_pnl_amount / risk_1r
+
+        results.at[idx, "Gross_Realized_R"] = gross_r
+        results.at[idx, "Entry_Execution_Price"] = entry_execution
+        results.at[idx, "Exit_Execution_Price"] = exit_execution
+        results.at[idx, "Entry_Commission"] = entry_commission
+        results.at[idx, "Exit_Commission"] = exit_commission
+        results.at[idx, "Total_Commission"] = total_commission
+        results.at[idx, "Slippage_Cost"] = slippage_cost
+        results.at[idx, "Total_Cost_Amount"] = total_cost_amount
+        results.at[idx, "Cost_R"] = cost_r
+        results.at[idx, "Net_PnL_Amount_Per_Share"] = net_pnl_amount
+        results.at[idx, "Net_Realized_R"] = net_r
+        results.at[idx, "Net_R_Valid"] = True
+        results.at[idx, "Net_R_Status"] = "コスト反映Net R計算可能"
+
+    return results
+
+
+def build_v28_cost_comparison_summary(
+    net_results: pd.DataFrame,
+    signal_label: str,
+    commission_rate: float,
+    slippage_rate: float,
+) -> pd.DataFrame:
+    if net_results is None or net_results.empty:
+        return pd.DataFrame()
+
+    rows = []
+    for horizon in FIRST_HIT_HORIZONS:
+        part = net_results[
+            pd.to_numeric(net_results["Horizon"], errors="coerce").eq(horizon)
+        ].copy()
+        valid = part[part["Net_R_Valid"].eq(True)].copy()
+
+        gross_r = pd.to_numeric(valid["Gross_Realized_R"], errors="coerce").dropna()
+        net_r = pd.to_numeric(valid["Net_Realized_R"], errors="coerce").dropna()
+        cost_r = pd.to_numeric(valid["Cost_R"], errors="coerce").dropna()
+
+        gross_total = float(gross_r.sum()) if not gross_r.empty else np.nan
+        net_total = float(net_r.sum()) if not net_r.empty else np.nan
+        gross_mean = float(gross_r.mean()) if not gross_r.empty else np.nan
+        net_mean = float(net_r.mean()) if not net_r.empty else np.nan
+        gross_median = float(gross_r.median()) if not gross_r.empty else np.nan
+        net_median = float(net_r.median()) if not net_r.empty else np.nan
+
+        rows.append({
+            "シグナル": signal_label,
+            "保有期間": f"{horizon}営業日",
+            "手数料_片道_%": commission_rate * 100.0,
+            "スリッページ_片道_%": slippage_rate * 100.0,
+            "R損益計算可能": len(net_r),
+            "Gross合計R": gross_total,
+            "Net合計R": net_total,
+            "コスト合計R": float(cost_r.sum()) if not cost_r.empty else np.nan,
+            "合計R差": net_total - gross_total if pd.notna(net_total) and pd.notna(gross_total) else np.nan,
+            "Gross平均R": gross_mean,
+            "Net平均R": net_mean,
+            "平均R差": net_mean - gross_mean if pd.notna(net_mean) and pd.notna(gross_mean) else np.nan,
+            "Gross中央値R": gross_median,
+            "Net中央値R": net_median,
+            "GrossプラスR": int((gross_r > 0).sum()),
+            "NetプラスR": int((net_r > 0).sum()),
+            "NetマイナスR": int((net_r < 0).sum()),
+            "NetゼロR": int((net_r.abs() <= 1e-12).sum()),
+        })
+
+    return pd.DataFrame(rows)
+
+
+def build_v28_cost_detail(
+    net_results: pd.DataFrame,
+    signal_label: str,
+    horizon: int = 20,
+) -> pd.DataFrame:
+    if net_results is None or net_results.empty:
+        return pd.DataFrame()
+
+    part = net_results[
+        pd.to_numeric(net_results["Horizon"], errors="coerce").eq(horizon)
+        & net_results["Net_R_Valid"].eq(True)
+    ].copy()
+    if part.empty:
+        return pd.DataFrame()
+
+    detail = pd.DataFrame({
+        "シグナル": signal_label,
+        "イベントID": part["BB_Event_ID"].values,
+        "Entry日": part["Entry_Date"].values,
+        "Exit日": part["Exit_Date"].values,
+        "決済種別": part["Exit_Type"].values,
+        "Entry元価格": pd.to_numeric(part["Entry_Price"], errors="coerce").values,
+        "Entryコスト反映価格": pd.to_numeric(part["Entry_Execution_Price"], errors="coerce").values,
+        "Exit元価格": pd.to_numeric(part["Exit_Price"], errors="coerce").values,
+        "Exitコスト反映価格": pd.to_numeric(part["Exit_Execution_Price"], errors="coerce").values,
+        "1R率_%": pd.to_numeric(part["Risk_1R_Percent"], errors="coerce").values,
+        "手数料合計_1株": pd.to_numeric(part["Total_Commission"], errors="coerce").values,
+        "スリッページ合計_1株": pd.to_numeric(part["Slippage_Cost"], errors="coerce").values,
+        "コストR": pd.to_numeric(part["Cost_R"], errors="coerce").values,
+        "Gross実現R": pd.to_numeric(part["Gross_Realized_R"], errors="coerce").values,
+        "Net実現R": pd.to_numeric(part["Net_Realized_R"], errors="coerce").values,
+    })
+    detail["R差"] = detail["Net実現R"] - detail["Gross実現R"]
+    return detail.sort_values(["シグナル", "イベントID"]).reset_index(drop=True)
 
 
 # ============================================================
@@ -4952,14 +5152,14 @@ st.title(
 
 st.caption(
     f"Version {APP_VERSION} ｜ "
-    "独立BBイベント台帳・二重計上整理版"
+    "ギャップ＋取引コスト反映・ネットR研究版"
 )
 
 st.info(
-    "v2.7ではv2.6までの研究結果をすべて維持したまま、"
-    "観察完了したBB下限イベントを『1イベント=1行』の独立イベント台帳へ統一します。"
-    "固定窓後の遅い反発を元イベントへ追加せず、新しいBBイベントは別IDとして扱い、"
-    "二重計上のない研究母集団を確認します。新しい売買条件は追加しません。"
+    "v2.8ではv2.7までの研究結果をすべて維持し、"
+    "ギャップ反映後の約定価格へ、Entry / Exit両方の手数料とスリッページを加えます。"
+    "Gross R（コスト前）とNet R（コスト後）を同じ1R基準で比較します。"
+    "新しい売買条件は追加しません。"
 )
 
 # v2.5.1: 実際の結果は後段で計算されるため、ここに空の表示場所だけ作り、
@@ -5005,6 +5205,49 @@ period_map = {
 period = period_map[
     period_label
 ]
+
+
+# ============================================================
+# v2.8 研究用取引コスト設定
+# ============================================================
+
+st.subheader(
+    "①-2 v2.8 研究用取引コスト設定"
+)
+
+cost_col1, cost_col2 = st.columns(2)
+
+with cost_col1:
+    commission_percent = st.number_input(
+        "売買手数料率（片道・%）",
+        min_value=0.0,
+        max_value=5.0,
+        value=0.10,
+        step=0.01,
+        format="%.2f",
+        key="v28_commission_percent",
+        help="EntryとExitそれぞれの約定金額に対してかかる研究用の仮定です。",
+    )
+
+with cost_col2:
+    slippage_percent = st.number_input(
+        "スリッページ率（片道・%）",
+        min_value=0.0,
+        max_value=5.0,
+        value=0.10,
+        step=0.01,
+        format="%.2f",
+        key="v28_slippage_percent",
+        help="買いは不利に高く、売りは不利に安く約定する研究用の仮定です。",
+    )
+
+commission_rate = float(commission_percent) / 100.0
+slippage_rate = float(slippage_percent) / 100.0
+
+st.caption(
+    "初期値は手数料0.10%・スリッページ0.10%を片道ごとに置く研究用仮定です。"
+    "特定の証券会社の実コストを表すものではなく、画面から変更できます。"
+)
 
 
 # ============================================================
@@ -9458,10 +9701,125 @@ st.write(
     "【維持】同日Stop/Target両方到達で順序不明のケースは、引き続きR損益から除外します。"
 )
 st.write(
-    "【未実装】手数料・スリッページを含むネットR損益。"
+    "【v2.7時点では未実装 → v2.8で実装】手数料・スリッページを含むネットR損益。"
 )
 st.write(
     "【未採用】ギャップ結果を見てEntry条件・Stop条件・Target条件を変更すること。"
+)
+
+
+# ============================================================
+# v2.8 手数料・スリッページ反映 Net R
+# ============================================================
+
+st.divider()
+
+st.subheader(
+    "97 v2.8 取引コスト反映・研究ルール"
+)
+st.write(
+    f"【現在の研究設定】売買手数料は片道 {commission_percent:.2f}%、スリッページは片道 {slippage_percent:.2f}% です。"
+)
+st.write(
+    "【Entry】買いのスリッページは不利な方向へ加算し、Entry価格を高くして計算します。"
+)
+st.write(
+    "【Exit】売りのスリッページは不利な方向へ減算し、ギャップ反映後のExit価格を低くして計算します。"
+)
+st.write(
+    "【手数料】EntryとExitそれぞれのコスト反映約定金額に、設定した片道手数料率を適用します。"
+)
+st.write(
+    "【R基準】Net Rの分母は従来の計画時1Rを維持します。したがって、取引コストが元の1Rを何R消費したかを直接比較できます。"
+)
+st.warning(
+    "このコスト設定は研究用仮定です。板・出来高・部分約定・税金・為替コストなどは含みません。"
+)
+
+v28_net_pnl_sets = {}
+for key, gap_results in v27_gap_pnl_sets.items():
+    v28_net_pnl_sets[key] = calculate_v28_net_cost_results(
+        gap_results,
+        commission_rate=commission_rate,
+        slippage_rate=slippage_rate,
+    )
+
+v28_cost_compare_parts = []
+for prefix_name, label in [("Stop", "下落停止"), ("Rebound", "反発開始")]:
+    part = build_v28_cost_comparison_summary(
+        v28_net_pnl_sets[(prefix_name, 2.0)],
+        label,
+        commission_rate,
+        slippage_rate,
+    )
+    if not part.empty:
+        v28_cost_compare_parts.append(part)
+
+v28_cost_compare_summary = (
+    pd.concat(v28_cost_compare_parts, ignore_index=True)
+    if v28_cost_compare_parts else pd.DataFrame()
+)
+
+st.subheader(
+    "98 v2.8 2R・ギャップ反映Gross vs コスト後Net比較"
+)
+if v28_cost_compare_summary.empty:
+    st.info("コスト比較対象がありません。")
+else:
+    st.dataframe(v28_cost_compare_summary.round(4), use_container_width=True, hide_index=True)
+    st.write("📋 コピー用・v2.8 Gross vs Net比較")
+    st.code(
+        "【98 v2.8 2R・ギャップ反映Gross vs コスト後Net比較】\n"
+        + v28_cost_compare_summary.to_csv(index=False, float_format="%.4f").rstrip(),
+        language=None,
+    )
+
+v28_cost_detail_parts = []
+for prefix_name, label in [("Stop", "下落停止"), ("Rebound", "反発開始")]:
+    part = build_v28_cost_detail(
+        v28_net_pnl_sets[(prefix_name, 2.0)],
+        label,
+        horizon=20,
+    )
+    if not part.empty:
+        v28_cost_detail_parts.append(part)
+
+v28_cost_detail_20d = (
+    pd.concat(v28_cost_detail_parts, ignore_index=True)
+    if v28_cost_detail_parts else pd.DataFrame()
+)
+
+st.subheader(
+    "99 v2.8 20日保有・2R・イベント別コスト後Net R"
+)
+if v28_cost_detail_20d.empty:
+    st.info("20日保有・2Rのコスト詳細対象がありません。")
+else:
+    st.dataframe(v28_cost_detail_20d.round(4), use_container_width=True, hide_index=True)
+    st.write("📋 コピー用・v2.8イベント別Net R")
+    st.code(
+        "【99 v2.8 20日保有・2R・イベント別コスト後Net R】\n"
+        + v28_cost_detail_20d.to_csv(index=False, float_format="%.4f").rstrip(),
+        language=None,
+    )
+
+st.subheader(
+    "100 v2.8 取引コスト反映の扱い"
+)
+st.write(
+    "【研究計算を改善】v2.7のギャップ反映Exitを土台に、Entry / Exit双方へ手数料とスリッページを反映します。"
+)
+st.write(
+    "【比較維持】Gross Rも残すため、コストだけで何R減ったかを確認できます。"
+)
+st.write(
+    "【設定変更可能】画面上部の①-2で手数料率とスリッページ率を変更できます。0.00%にすれば該当コストを無効化できます。"
+)
+st.write(
+    "【未実装】板・出来高・部分約定・税金・為替コストを含む実運用約定モデル。"
+)
+st.write(
+    "【未採用】コスト結果を見てEntry / Stop / Target条件を後付け変更すること。"
 )
 
 
@@ -9559,6 +9917,12 @@ quick_copy_results = {
     "95 v2.7 20日保有・2R・ギャップでRが変化したイベント": _quick_copy_text(
         "95 v2.7 20日保有・2R・ギャップでRが変化したイベント", v27_gap_changed_20d
     ),
+    "98 v2.8 2R・ギャップ反映Gross vs コスト後Net比較": _quick_copy_text(
+        "98 v2.8 2R・ギャップ反映Gross vs コスト後Net比較", v28_cost_compare_summary
+    ),
+    "99 v2.8 20日保有・2R・イベント別コスト後Net R": _quick_copy_text(
+        "99 v2.8 20日保有・2R・イベント別コスト後Net R", v28_cost_detail_20d
+    ),
 }
 
 with quick_copy_top_placeholder.container():
@@ -9570,25 +9934,25 @@ with quick_copy_top_placeholder.container():
     quick_copy_choice = st.selectbox(
         "結果番号を選択",
         options=list(quick_copy_results.keys()),
-        index=list(quick_copy_results.keys()).index("94 v2.7 2R・ギャップ反映前後比較"),
-        key="quick_copy_choice_v27",
+        index=list(quick_copy_results.keys()).index("98 v2.8 2R・ギャップ反映Gross vs コスト後Net比較"),
+        key="quick_copy_choice_v28",
     )
 
     if st.button(
         "選択した結果のコピー欄を表示",
         use_container_width=True,
-        key="quick_copy_button_v27",
+        key="quick_copy_button_v28",
     ):
-        st.session_state["quick_copy_selected_title_v27"] = quick_copy_choice
-        st.session_state["quick_copy_selected_text_v27"] = quick_copy_results[quick_copy_choice]
+        st.session_state["quick_copy_selected_title_v28"] = quick_copy_choice
+        st.session_state["quick_copy_selected_text_v28"] = quick_copy_results[quick_copy_choice]
 
-    if st.session_state.get("quick_copy_selected_text_v27"):
+    if st.session_state.get("quick_copy_selected_text_v28"):
         st.success(
-            f"表示中：{st.session_state.get('quick_copy_selected_title_v27', '')}"
+            f"表示中：{st.session_state.get('quick_copy_selected_title_v28', '')}"
         )
         st.caption("下のコピー欄の右上にあるコピーアイコンを押すと全文をコピーできます。")
         st.code(
-            st.session_state["quick_copy_selected_text_v27"],
+            st.session_state["quick_copy_selected_text_v28"],
             language=None,
         )
 
@@ -9801,7 +10165,11 @@ st.write(
 )
 
 st.write(
-    "【未実装】手数料・スリッページを含むネット約定損益"
+    "【v2.8 実装】Entry / Exit双方の手数料・スリッページを含むNet R損益"
+)
+
+st.write(
+    "【v2.8 実装】画面から片道手数料率・片道スリッページ率を変更し、Gross RとNet Rを比較"
 )
 
 st.write(
@@ -9818,7 +10186,8 @@ st.divider()
 st.warning(
     "重要：Target先着率や平均Rだけで正式な売買ルールは決めません。"
     "同日順序不明・期間内未到達・将来データ不足を分離し、"
-    "コストや実際の約定条件もまだ含めていません。"
+    "v2.8では研究用の手数料・スリッページまで反映します。"
+    "板・出来高・部分約定・税金・為替コストなどはまだ含みません。"
 )
 
 st.info(
