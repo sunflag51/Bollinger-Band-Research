@@ -187,7 +187,7 @@ st.set_page_config(
 # 定数
 # ============================================================
 
-APP_VERSION = "3.1"
+APP_VERSION = "3.2"
 
 BB_PERIOD = 20
 BB_STD = 2.0
@@ -5697,6 +5697,282 @@ def build_v31_reconciliation_audit(
             })
     return pd.DataFrame(rows)
 
+
+
+# ============================================================
+# v3.2
+# GOOG / NVDA 20営業日 MFE / MAE 価格経路診断
+#
+# MFE = Entry後20営業日の最高値が、計画時点1Rに対して何R上へ進んだか。
+# MAE = Entry後20営業日の最安値が、計画時点1Rに対して何R下へ進んだか（正の不利幅）。
+#
+# 重要：このv3.2の主診断は「20営業日の固定観察窓」を最後まで見る。
+# 実際のStop / Target決済後の値動きも含むため、売買損益ではなく価格経路の原因診断。
+# これにより「Stopが先だったが、その後20日内に2Rへ戻った」ケースも識別する。
+# ============================================================
+
+def build_v32_path_detail(bundles: dict, horizon: int = 20) -> pd.DataFrame:
+    rows = []
+    for ticker_symbol in ["GOOG", "NVDA"]:
+        bundle = bundles.get(ticker_symbol)
+        if not bundle:
+            continue
+        data = bundle["data"]
+        for prefix_name, signal_label in [("Stop", "下落停止"), ("Rebound", "反発開始")]:
+            signals = bundle["signal_valid"].get(prefix_name, pd.DataFrame())
+            if signals is None or signals.empty:
+                continue
+
+            net20 = bundle["net_sets"].get(prefix_name, pd.DataFrame())
+            if net20 is None:
+                net20 = pd.DataFrame()
+            if not net20.empty:
+                net20 = net20[pd.to_numeric(net20["Horizon"], errors="coerce").eq(horizon)].copy()
+                net20["BB_Event_ID_num"] = pd.to_numeric(net20["BB_Event_ID"], errors="coerce")
+
+            entry_date_col = f"{prefix_name}_Entry_Date"
+            entry_price_col = f"{prefix_name}_Entry_Price"
+            risk_col = f"{prefix_name}_Risk_1R"
+            risk_pct_col = f"{prefix_name}_Risk_1R_Percent"
+
+            for signal_date, row in signals.iterrows():
+                event_id = pd.to_numeric(pd.Series([row.get("BB_Event_ID", np.nan)]), errors="coerce").iloc[0]
+                entry_date = pd.to_datetime(row.get(entry_date_col, pd.NaT), errors="coerce")
+                entry_price = pd.to_numeric(pd.Series([row.get(entry_price_col, np.nan)]), errors="coerce").iloc[0]
+                risk_1r = pd.to_numeric(pd.Series([row.get(risk_col, np.nan)]), errors="coerce").iloc[0]
+                risk_pct = pd.to_numeric(pd.Series([row.get(risk_pct_col, np.nan)]), errors="coerce").iloc[0]
+
+                base = {
+                    "銘柄": ticker_symbol,
+                    "シグナル": signal_label,
+                    "イベントID": int(event_id) if pd.notna(event_id) else np.nan,
+                    "シグナル日": signal_date,
+                    "Entry日": entry_date,
+                    "Entry価格": entry_price,
+                    "1R": risk_1r,
+                    "1R率_%": risk_pct,
+                    "観察窓": f"{horizon}営業日",
+                    "観察可能日数": 0,
+                    "20日観察完了": False,
+                    "MFE_R": np.nan,
+                    "MAE_R": np.nan,
+                    "20日終値_R": np.nan,
+                    "MFE日": pd.NaT,
+                    "MAE日": pd.NaT,
+                    "0.5R到達": False,
+                    "1R到達": False,
+                    "1.5R到達": False,
+                    "2R到達": False,
+                    "MAE1R以上": False,
+                    "2R先着結果": "照合なし",
+                    "決済種別": "",
+                    "Net実現R": np.nan,
+                }
+
+                if pd.isna(entry_date) or pd.isna(entry_price) or pd.isna(risk_1r) or float(risk_1r) <= 0:
+                    rows.append(base)
+                    continue
+                try:
+                    entry_pos = data.index.get_loc(entry_date)
+                except KeyError:
+                    rows.append(base)
+                    continue
+                if not isinstance(entry_pos, (int, np.integer)):
+                    rows.append(base)
+                    continue
+
+                available = min(int(horizon), len(data) - int(entry_pos))
+                base["観察可能日数"] = int(max(0, available))
+
+                # 既存20日2Rのfirst-hit / Net結果をイベントIDで照合する。
+                if pd.notna(event_id) and not net20.empty:
+                    match = net20[net20["BB_Event_ID_num"].eq(float(event_id))]
+                    if len(match) == 1:
+                        rr = match.iloc[0]
+                        base["2R先着結果"] = rr.get("Outcome", "")
+                        base["決済種別"] = rr.get("Exit_Type", "")
+                        if bool(rr.get("Net_R_Valid", False)):
+                            base["Net実現R"] = pd.to_numeric(
+                                pd.Series([rr.get("Net_Realized_R", np.nan)]), errors="coerce"
+                            ).iloc[0]
+
+                # 固定20営業日が全部そろわないイベントは、MFE/MAE本体集計へ入れない。
+                if available < int(horizon):
+                    rows.append(base)
+                    continue
+
+                window = data.iloc[int(entry_pos): int(entry_pos) + int(horizon)].copy()
+                highs = pd.to_numeric(window["High"], errors="coerce")
+                lows = pd.to_numeric(window["Low"], errors="coerce")
+                closes = pd.to_numeric(window["Close"], errors="coerce")
+                if highs.isna().any() or lows.isna().any() or closes.isna().any():
+                    rows.append(base)
+                    continue
+
+                max_high = float(highs.max())
+                min_low = float(lows.min())
+                mfe_r = (max_high - float(entry_price)) / float(risk_1r)
+                mae_r = (float(entry_price) - min_low) / float(risk_1r)
+                close20_r = (float(closes.iloc[-1]) - float(entry_price)) / float(risk_1r)
+
+                base.update({
+                    "20日観察完了": True,
+                    "MFE_R": float(mfe_r),
+                    "MAE_R": float(mae_r),
+                    "20日終値_R": float(close20_r),
+                    "MFE日": highs.idxmax(),
+                    "MAE日": lows.idxmin(),
+                    "0.5R到達": bool(mfe_r >= 0.5),
+                    "1R到達": bool(mfe_r >= 1.0),
+                    "1.5R到達": bool(mfe_r >= 1.5),
+                    "2R到達": bool(mfe_r >= 2.0),
+                    "MAE1R以上": bool(mae_r >= 1.0),
+                })
+                rows.append(base)
+
+    return pd.DataFrame(rows)
+
+
+def build_v32_path_summary(detail: pd.DataFrame) -> pd.DataFrame:
+    if detail is None or detail.empty:
+        return pd.DataFrame()
+    rows = []
+    for ticker_symbol in ["GOOG", "NVDA"]:
+        for signal_label in ["下落停止", "反発開始"]:
+            all_part = detail[
+                detail["銘柄"].eq(ticker_symbol) & detail["シグナル"].eq(signal_label)
+            ].copy()
+            part = all_part[all_part["20日観察完了"].eq(True)].copy()
+            if all_part.empty:
+                continue
+            n = len(part)
+            mfe = pd.to_numeric(part["MFE_R"], errors="coerce").dropna()
+            mae = pd.to_numeric(part["MAE_R"], errors="coerce").dropna()
+            close20 = pd.to_numeric(part["20日終値_R"], errors="coerce").dropna()
+            row = {
+                "銘柄": ticker_symbol,
+                "シグナル": signal_label,
+                "R有効シグナル": len(all_part),
+                "20日観察完了": n,
+                "20日観察未完了": len(all_part) - n,
+                "MFE平均R": float(mfe.mean()) if not mfe.empty else np.nan,
+                "MFE中央値R": float(mfe.median()) if not mfe.empty else np.nan,
+                "MAE平均R": float(mae.mean()) if not mae.empty else np.nan,
+                "MAE中央値R": float(mae.median()) if not mae.empty else np.nan,
+                "20日終値平均R": float(close20.mean()) if not close20.empty else np.nan,
+                "20日終値中央値R": float(close20.median()) if not close20.empty else np.nan,
+            }
+            for label, col in [("0.5R", "0.5R到達"), ("1R", "1R到達"), ("1.5R", "1.5R到達"), ("2R", "2R到達")]:
+                count = int(part[col].eq(True).sum()) if n else 0
+                row[f"MFE{label}以上_件数"] = count
+                row[f"MFE{label}以上_%"] = count / n * 100.0 if n else np.nan
+            mae1_count = int(part["MAE1R以上"].eq(True).sum()) if n else 0
+            row["MAE1R以上_件数"] = mae1_count
+            row["MAE1R以上_%"] = mae1_count / n * 100.0 if n else np.nan
+            rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def build_v32_threshold_difference(summary: pd.DataFrame) -> pd.DataFrame:
+    if summary is None or summary.empty:
+        return pd.DataFrame()
+    rows = []
+    for signal_label in ["下落停止", "反発開始"]:
+        part = summary[summary["シグナル"].eq(signal_label)]
+        goog = part[part["銘柄"].eq("GOOG")]
+        nvda = part[part["銘柄"].eq("NVDA")]
+        if goog.empty or nvda.empty:
+            continue
+        g, n = goog.iloc[0], nvda.iloc[0]
+        row = {
+            "シグナル": signal_label,
+            "GOOG_20日観察完了": int(g["20日観察完了"]),
+            "NVDA_20日観察完了": int(n["20日観察完了"]),
+            "GOOG_MFE平均R": g["MFE平均R"],
+            "NVDA_MFE平均R": n["MFE平均R"],
+            "MFE平均R差_NVDA-GOOG": float(n["MFE平均R"]) - float(g["MFE平均R"]),
+            "GOOG_MAE平均R": g["MAE平均R"],
+            "NVDA_MAE平均R": n["MAE平均R"],
+            "MAE平均R差_NVDA-GOOG": float(n["MAE平均R"]) - float(g["MAE平均R"]),
+        }
+        for label in ["0.5R", "1R", "1.5R", "2R"]:
+            gc = f"MFE{label}以上_%"
+            row[f"GOOG_MFE{label}以上_%"] = g[gc]
+            row[f"NVDA_MFE{label}以上_%"] = n[gc]
+            row[f"差_{label}_NVDA-GOOG_ポイント"] = float(n[gc]) - float(g[gc])
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def build_v32_first_hit_vs_path(detail: pd.DataFrame) -> pd.DataFrame:
+    """20日固定窓で2Rに触れたかと、2RがStopより先だったかを分ける。"""
+    if detail is None or detail.empty:
+        return pd.DataFrame()
+    rows = []
+    for ticker_symbol in ["GOOG", "NVDA"]:
+        for signal_label in ["下落停止", "反発開始"]:
+            part = detail[
+                detail["銘柄"].eq(ticker_symbol)
+                & detail["シグナル"].eq(signal_label)
+                & detail["20日観察完了"].eq(True)
+            ].copy()
+            if part.empty:
+                continue
+            n = len(part)
+            touched = part["2R到達"].eq(True)
+            first_target = part["2R先着結果"].eq("Target先着")
+            stop_first = part["2R先着結果"].eq("Stop先着")
+            ambiguous = part["2R先着結果"].eq("同日両方到達・順序不明")
+            late_after_stop = touched & stop_first
+            rows.append({
+                "銘柄": ticker_symbol,
+                "シグナル": signal_label,
+                "20日観察完了": n,
+                "20日内2R到達_順序不問": int(touched.sum()),
+                "20日内2R到達_順序不問_%": float(touched.mean() * 100.0),
+                "2RがStopより先_Target先着": int(first_target.sum()),
+                "Target先着_%": float(first_target.mean() * 100.0),
+                "Stop先着後に20日内2R到達": int(late_after_stop.sum()),
+                "Stop先着後に20日内2R到達_%": float(late_after_stop.mean() * 100.0),
+                "同日両方到達_順序不明": int(ambiguous.sum()),
+                "2R到達だがTarget先着でない": int((touched & ~first_target).sum()),
+            })
+    return pd.DataFrame(rows)
+
+
+def build_v32_audit(detail: pd.DataFrame, bundles: dict, horizon: int = 20) -> pd.DataFrame:
+    if detail is None or detail.empty:
+        return pd.DataFrame()
+    rows = []
+    for ticker_symbol in ["GOOG", "NVDA"]:
+        bundle = bundles.get(ticker_symbol)
+        if not bundle:
+            continue
+        for prefix_name, signal_label in [("Stop", "下落停止"), ("Rebound", "反発開始")]:
+            expected = len(bundle["signal_valid"].get(prefix_name, pd.DataFrame()))
+            part = detail[
+                detail["銘柄"].eq(ticker_symbol) & detail["シグナル"].eq(signal_label)
+            ].copy()
+            ids = pd.to_numeric(part["イベントID"], errors="coerce")
+            unique_n = int(ids.dropna().nunique())
+            duplicate_n = max(0, len(part) - unique_n)
+            complete_n = int(part["20日観察完了"].eq(True).sum())
+            incomplete_n = len(part) - complete_n
+            ok = len(part) == expected and unique_n == expected and duplicate_n == 0 and complete_n + incomplete_n == expected
+            rows.append({
+                "銘柄": ticker_symbol,
+                "シグナル": signal_label,
+                "R有効シグナル期待件数": expected,
+                "v3.2経路行数": len(part),
+                "ユニークイベントID": unique_n,
+                "重複イベントID行": duplicate_n,
+                f"{horizon}日観察完了": complete_n,
+                f"{horizon}日観察未完了": incomplete_n,
+                "監査": "OK" if ok else "要確認",
+            })
+    return pd.DataFrame(rows)
+
+
 # ============================================================
 # タイトル
 # ============================================================
@@ -5707,14 +5983,14 @@ st.title(
 
 st.caption(
     f"Version {APP_VERSION} ｜ "
-    "GOOG / NVDA 同一ルール・銘柄横断診断版"
+    "GOOG / NVDA MFE / MAE価格経路診断版"
 )
 
 st.info(
-    "v3.0ではv2.9までの研究結果をすべて維持し、"
-    "GOOGとNVDAを同じ期間・同じEntry / Stop / Target / ギャップ / コスト条件で同時計算します。"
-    "5・10・20営業日、2RのNet Rを銘柄別に分離して比較し、"
-    "GOOGで研究してきた条件が別銘柄でもどのように振る舞うかを診断します。条件は変更しません。"
+    "v3.2ではv3.1までの研究結果をすべて維持し、"
+    "GOOG / NVDAのEntry後20営業日の価格経路をMFE / MAEでR換算します。"
+    "0.5R・1R・1.5R・2Rへの到達率と、2RがStopより先だったかを分離し、"
+    "NVDAで2R Target到達が少なかった理由を条件変更なしで診断します。"
 )
 
 # v2.5.1: 実際の結果は後段で計算されるため、ここに空の表示場所だけ作り、
@@ -10680,6 +10956,122 @@ st.write(
     "【次段階候補】構造差が確認できても、それだけで原因とは断定せず、市場環境候補を事前定義してから検証します。"
 )
 
+
+
+# ============================================================
+# v3.2 GOOG / NVDA 20営業日 MFE / MAE 価格経路診断
+# ============================================================
+
+st.divider()
+
+st.subheader(
+    "117 v3.2 GOOG / NVDA MFE / MAE・価格経路診断ルール"
+)
+st.write(
+    "【条件固定】v3.1までのBBイベント、下落停止 / 反発開始、Entry、Stop、2R Target、ギャップ、コスト条件は変更しません。"
+)
+st.write(
+    "【MFE】Entry後20営業日の最高値が、計画時点1Rに対して最大何R上へ進んだかを測ります。"
+)
+st.write(
+    "【MAE】Entry後20営業日の最安値が、計画時点1Rに対して最大何R下へ進んだかを正の不利幅として測ります。"
+)
+st.write(
+    "【固定20日窓】Stop / Targetで実際の研究上の決済が先に起きても、原因診断では20営業日を最後まで観察します。"
+)
+st.warning(
+    "MFE / MAEは売買損益ではありません。決済後の値動きも含む反実仮想的な価格経路診断です。日足OHLCでは同一日の値動き順序も分かりません。"
+)
+
+v32_path_detail = build_v32_path_detail(v30_bundles, horizon=20)
+v32_path_summary = build_v32_path_summary(v32_path_detail)
+v32_threshold_difference = build_v32_threshold_difference(v32_path_summary)
+v32_first_hit_vs_path = build_v32_first_hit_vs_path(v32_path_detail)
+v32_audit = build_v32_audit(v32_path_detail, v30_bundles, horizon=20)
+
+st.subheader(
+    "118 v3.2 GOOG / NVDA 20営業日・MFE / MAEサマリー"
+)
+if v32_path_summary.empty:
+    st.info("MFE / MAEサマリーの対象がありません。")
+else:
+    st.dataframe(v32_path_summary.round(4), use_container_width=True, hide_index=True)
+    st.write("📋 コピー用・v3.2 MFE / MAEサマリー")
+    st.code(
+        "【118 v3.2 GOOG / NVDA 20営業日・MFE / MAEサマリー】\n"
+        + v32_path_summary.to_csv(index=False, float_format="%.4f").rstrip(),
+        language=None,
+    )
+
+st.subheader(
+    "119 v3.2 20営業日・MFE到達率・NVDA−GOOG差"
+)
+if v32_threshold_difference.empty:
+    st.info("MFE到達率の銘柄差を計算できません。")
+else:
+    st.dataframe(v32_threshold_difference.round(4), use_container_width=True, hide_index=True)
+    st.write("📋 コピー用・v3.2 MFE到達率差")
+    st.code(
+        "【119 v3.2 20営業日・MFE到達率・NVDA−GOOG差】\n"
+        + v32_threshold_difference.to_csv(index=False, float_format="%.4f").rstrip(),
+        language=None,
+    )
+
+st.subheader(
+    "120 v3.2 20営業日・2R到達 vs 2R先着"
+)
+if v32_first_hit_vs_path.empty:
+    st.info("2R到達と先着の比較対象がありません。")
+else:
+    st.dataframe(v32_first_hit_vs_path.round(4), use_container_width=True, hide_index=True)
+    st.write("📋 コピー用・v3.2 2R到達 vs 2R先着")
+    st.code(
+        "【120 v3.2 20営業日・2R到達 vs 2R先着】\n"
+        + v32_first_hit_vs_path.to_csv(index=False, float_format="%.4f").rstrip(),
+        language=None,
+    )
+
+st.subheader(
+    "121 v3.2 MFE / MAE・経路監査"
+)
+if v32_audit.empty:
+    st.info("v3.2経路監査の対象がありません。")
+else:
+    st.dataframe(v32_audit, use_container_width=True, hide_index=True)
+    st.write("📋 コピー用・v3.2 MFE / MAE経路監査")
+    st.code(
+        "【121 v3.2 MFE / MAE・経路監査】\n"
+        + v32_audit.to_csv(index=False).rstrip(),
+        language=None,
+    )
+
+st.subheader(
+    "122 v3.2 MFE / MAE・イベント別詳細"
+)
+if v32_path_detail.empty:
+    st.info("v3.2イベント別経路詳細がありません。")
+else:
+    v32_detail_display = v32_path_detail.copy()
+    st.dataframe(v32_detail_display.round(4), use_container_width=True, hide_index=True)
+    st.caption("詳細表は原因確認用です。個別イベントを見て後付けで除外条件を作りません。")
+
+st.subheader(
+    "123 v3.2 価格経路診断の扱い"
+)
+st.write(
+    "【診断目的】NVDAで2R先着が少なかった理由を、上方向MFE・下方向MAE・Stop先着後の戻りに分解します。"
+)
+st.write(
+    "【重要】20日内に2Rへ後から到達しても、Stopが先なら元の2R売買ルールでは勝ちへ変更しません。"
+)
+st.write(
+    "【未採用】MFE結果を見てNVDAだけTargetを1.5Rへ変更すること、個別の悪いイベントを除外すること。"
+)
+st.write(
+    "【次段階】MFEの0.5R / 1R / 1.5R / 2R到達率がどの段階からGOOG / NVDAで分岐するかを確認してから、次の仮説を決めます。"
+)
+
+
 # ============================================================
 # v3.1 番号選択・クイックコピー
 # ============================================================
@@ -10810,6 +11202,18 @@ quick_copy_results = {
     "115 v3.1 20日保有・2R・構造分解監査": _quick_copy_text(
         "115 v3.1 20日保有・2R・構造分解監査", v31_reconciliation
     ),
+    "118 v3.2 GOOG / NVDA 20営業日・MFE / MAEサマリー": _quick_copy_text(
+        "118 v3.2 GOOG / NVDA 20営業日・MFE / MAEサマリー", v32_path_summary
+    ),
+    "119 v3.2 20営業日・MFE到達率・NVDA−GOOG差": _quick_copy_text(
+        "119 v3.2 20営業日・MFE到達率・NVDA−GOOG差", v32_threshold_difference
+    ),
+    "120 v3.2 20営業日・2R到達 vs 2R先着": _quick_copy_text(
+        "120 v3.2 20営業日・2R到達 vs 2R先着", v32_first_hit_vs_path
+    ),
+    "121 v3.2 MFE / MAE・経路監査": _quick_copy_text(
+        "121 v3.2 MFE / MAE・経路監査", v32_audit
+    ),
 }
 
 with quick_copy_top_placeholder.container():
@@ -10821,25 +11225,25 @@ with quick_copy_top_placeholder.container():
     quick_copy_choice = st.selectbox(
         "結果番号を選択",
         options=list(quick_copy_results.keys()),
-        index=list(quick_copy_results.keys()).index("115 v3.1 20日保有・2R・構造分解監査"),
-        key="quick_copy_choice_v31",
+        index=list(quick_copy_results.keys()).index("121 v3.2 MFE / MAE・経路監査"),
+        key="quick_copy_choice_v32",
     )
 
     if st.button(
         "選択した結果のコピー欄を表示",
         use_container_width=True,
-        key="quick_copy_button_v31",
+        key="quick_copy_button_v32",
     ):
-        st.session_state["quick_copy_selected_title_v31"] = quick_copy_choice
-        st.session_state["quick_copy_selected_text_v31"] = quick_copy_results[quick_copy_choice]
+        st.session_state["quick_copy_selected_title_v32"] = quick_copy_choice
+        st.session_state["quick_copy_selected_text_v32"] = quick_copy_results[quick_copy_choice]
 
-    if st.session_state.get("quick_copy_selected_text_v31"):
+    if st.session_state.get("quick_copy_selected_text_v32"):
         st.success(
-            f"表示中：{st.session_state.get('quick_copy_selected_title_v31', '')}"
+            f"表示中：{st.session_state.get('quick_copy_selected_title_v32', '')}"
         )
         st.caption("下のコピー欄の右上にあるコピーアイコンを押すと全文をコピーできます。")
         st.code(
-            st.session_state["quick_copy_selected_text_v31"],
+            st.session_state["quick_copy_selected_text_v32"],
             language=None,
         )
 
@@ -11084,6 +11488,18 @@ st.write(
 )
 
 st.write(
+    "【v3.2 実装】GOOG / NVDAのEntry後20営業日を固定観察し、MFE / MAEを計画時点1Rで正規化"
+)
+
+st.write(
+    "【v3.2 実装】0.5R / 1R / 1.5R / 2R到達率と、2R到達がStopより先か後かを分離"
+)
+
+st.write(
+    "【v3.2 注意】固定20日MFE / MAEは決済後の価格も含む原因診断であり、実現損益ではない"
+)
+
+st.write(
     "【未実装】R期待値・最大ドローダウン等を含む本格バックテスト"
 )
 
@@ -11097,7 +11513,7 @@ st.divider()
 st.warning(
     "重要：Target先着率や平均Rだけで正式な売買ルールは決めません。"
     "同日順序不明・期間内未到達・将来データ不足を分離し、"
-    "v3.1ではv3.0までの条件を固定したまま、GOOG / NVDAの20日2Rを決済構造別に分解して診断します。"
+    "v3.2ではv3.1までの条件を固定したまま、GOOG / NVDAのEntry後20営業日のMFE / MAE価格経路を診断します。"
     "板・出来高・部分約定・税金・為替コストなどはまだ含みません。"
 )
 
