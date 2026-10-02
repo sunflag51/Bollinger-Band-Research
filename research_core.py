@@ -180,6 +180,11 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 import numpy as np
+from sklearn.pipeline import Pipeline
+from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import accuracy_score, balanced_accuracy_score, roc_auc_score, brier_score_loss
 
 
 # v3.4.2
@@ -204,7 +209,7 @@ st.set_page_config(
 # 定数
 # ============================================================
 
-APP_VERSION = "4.2.0"
+APP_VERSION = "5.0.0"
 
 BB_PERIOD = 20
 BB_STD = 2.0
@@ -8119,3 +8124,267 @@ def build_v420_current_results(commission_rate: float, slippage_rate: float):
     rolling5=build_v42_rolling5(events)
     audit=build_v42_audit(events,event_diff,year_diff,rolling3,rolling5)
     return base+(event_diff,year_diff,rolling3,rolling5,audit)
+
+
+# ============================================================
+# v5.0.0 AI導入前・固定特徴量Walk-Forward検証
+# 売買条件は変更しない。
+# AIを売買ルールへ採用するのではなく、固定した4特徴量と固定ロジスティック回帰が
+# 「20日以内に2R TargetがStopより先に来るか」を未来年で識別できるかだけを検証する。
+#
+# 重要:
+# ・特徴量はシグナル確定日までに分かる情報だけ。
+# ・v3.8で既に使った4特徴量を固定し、結果を見て追加・削除しない。
+# ・Target先着=1 / Stop先着=0。期間内未到達・同日順序不明等は教師ラベルから除外。
+# ・学習は過去のみ、テストは次の1年度。未来年を標準化・欠損補完・学習へ使わない。
+# ・モデル/正則化/閾値は固定。ハイパーパラメータ探索をしない。
+# ・P(Target)>=0.50 を「AI選別」とするが、v5.0では研究上の比較であり売買採用ではない。
+# ============================================================
+
+V50_FEATURES = ["BandWidth", "HistVol_20D_Pct", "Return_20D_Pct", "Close_vs_MA50_Pct"]
+V50_FEATURE_LABELS = {
+    "BandWidth": "BandWidth_%",
+    "HistVol_20D_Pct": "過去20日年率Vol_%",
+    "Return_20D_Pct": "20日騰落率_%",
+    "Close_vs_MA50_Pct": "MA50乖離_%",
+}
+V50_THRESHOLD = 0.50
+V50_MIN_TRAIN_RESOLVED = 20
+V50_MIN_CLASS_COUNT = 5
+V50_RANDOM_STATE = 5002026
+
+
+def build_v50_feature_spec() -> pd.DataFrame:
+    rows = [
+        {"項目":"モデル", "固定仕様":"L2正則化ロジスティック回帰", "未来情報":"使用しない"},
+        {"項目":"教師ラベル", "固定仕様":"20日2R Target先着=1 / Stop先着=0", "未来情報":"結果ラベルは学習時のみ"},
+        {"項目":"特徴量1", "固定仕様":"BandWidth（シグナル日終値まで）", "未来情報":"使用しない"},
+        {"項目":"特徴量2", "固定仕様":"過去20日年率Vol（シグナル日まで）", "未来情報":"使用しない"},
+        {"項目":"特徴量3", "固定仕様":"20日騰落率（シグナル日まで）", "未来情報":"使用しない"},
+        {"項目":"特徴量4", "固定仕様":"終値のMA50乖離（シグナル日まで）", "未来情報":"使用しない"},
+        {"項目":"欠損補完", "固定仕様":"学習期間だけで中央値を計算", "未来情報":"テスト年を使わない"},
+        {"項目":"標準化", "固定仕様":"学習期間だけで平均・標準偏差を計算", "未来情報":"テスト年を使わない"},
+        {"項目":"Walk-Forward", "固定仕様":"過去累積で学習→次1年度だけ予測", "未来情報":"未来年を学習しない"},
+        {"項目":"学習開始条件", "固定仕様":f"解決済み20件以上かつTarget/Stop各{V50_MIN_CLASS_COUNT}件以上", "未来情報":"件数条件のみ"},
+        {"項目":"AI選別閾値", "固定仕様":f"P(Target) >= {V50_THRESHOLD:.2f}", "未来情報":"結果を見て最適化しない"},
+        {"項目":"ハイパーパラメータ", "固定仕様":"C=1.0固定・探索なし", "未来情報":"結果を見て調整しない"},
+    ]
+    return pd.DataFrame(rows)
+
+
+def _v50_feature_frame(period_bundles: dict) -> pd.DataFrame:
+    parts=[]
+    for period in ["前5年","現5年"]:
+        for ticker in ["GOOG","NVDA"]:
+            b=period_bundles.get(period,{}).get(ticker)
+            if not b:
+                continue
+            data=b.get("data",pd.DataFrame()).copy()
+            if data.empty:
+                continue
+            close=pd.to_numeric(data["Close"],errors="coerce")
+            histvol=close.pct_change().rolling(20,min_periods=20).std(ddof=0)*np.sqrt(252)*100.0
+            ret20=close.pct_change(20)*100.0
+            ma50=close.rolling(50,min_periods=50).mean()
+            ma50dev=(close/ma50-1.0)*100.0
+            maps={
+                "BandWidth":pd.Series(pd.to_numeric(data["BandWidth"],errors="coerce").values,index=pd.to_datetime(data.index)),
+                "HistVol_20D_Pct":pd.Series(histvol.values,index=pd.to_datetime(data.index)),
+                "Return_20D_Pct":pd.Series(ret20.values,index=pd.to_datetime(data.index)),
+                "Close_vs_MA50_Pct":pd.Series(ma50dev.values,index=pd.to_datetime(data.index)),
+            }
+            for prefix,label in [("Stop","下落停止"),("Rebound","反発開始")]:
+                sig=b.get("signal_valid",{}).get(prefix,pd.DataFrame()).copy()
+                out=b.get("net_sets",{}).get(prefix,pd.DataFrame()).copy()
+                if sig.empty or out.empty:
+                    continue
+                sig=sig[["BB_Event_ID"]].copy()
+                sig["Signal_Date"]=pd.to_datetime(sig.index).values
+                for col,mp in maps.items():
+                    sig[col]=pd.to_datetime(sig["Signal_Date"]).map(mp)
+                out=out[pd.to_numeric(out["Horizon"],errors="coerce").eq(20)].copy()
+                keep=[c for c in ["BB_Event_ID","Outcome","Net_R_Valid","Net_Realized_R"] if c in out.columns]
+                out=out[keep].drop_duplicates("BB_Event_ID")
+                z=sig.merge(out,on="BB_Event_ID",how="left",validate="one_to_one")
+                z["期間"]=period; z["銘柄"]=ticker; z["シグナル"]=label
+                z["テスト年"]=pd.to_datetime(z["Signal_Date"]).map(_v39_test_year)
+                z["教師ラベル"]=np.where(z["Outcome"].eq("Target先着"),1,
+                                  np.where(z["Outcome"].eq("Stop先着"),0,np.nan))
+                z["特徴量計算可能数"]=z[V50_FEATURES].apply(pd.to_numeric,errors="coerce").notna().sum(axis=1)
+                parts.append(z)
+    return pd.concat(parts,ignore_index=True) if parts else pd.DataFrame()
+
+
+def _v50_pipeline() -> Pipeline:
+    return Pipeline([
+        ("imputer",SimpleImputer(strategy="median")),
+        ("scaler",StandardScaler()),
+        ("model",LogisticRegression(C=1.0,solver="lbfgs",max_iter=2000,random_state=V50_RANDOM_STATE)),
+    ])
+
+
+def _v50_safe_auc(y, p):
+    y=np.asarray(y,dtype=int); p=np.asarray(p,dtype=float)
+    return float(roc_auc_score(y,p)) if len(np.unique(y))==2 else np.nan
+
+
+def _v50_safe_balacc(y, pred):
+    y=np.asarray(y,dtype=int); pred=np.asarray(pred,dtype=int)
+    return float(balanced_accuracy_score(y,pred)) if len(np.unique(y))==2 else np.nan
+
+
+def build_v50_walk_forward(feature_frame: pd.DataFrame):
+    class_rows=[]; trade_rows=[]; pred_parts=[]
+    if feature_frame is None or feature_frame.empty:
+        return pd.DataFrame(),pd.DataFrame(),pd.DataFrame()
+    for ticker in ["GOOG","NVDA"]:
+        for signal in ["下落停止","反発開始"]:
+            p=feature_frame[(feature_frame["銘柄"]==ticker)&(feature_frame["シグナル"]==signal)].copy()
+            p["Signal_Date"]=pd.to_datetime(p["Signal_Date"],errors="coerce")
+            p=p[p["Signal_Date"].notna()].sort_values("Signal_Date").copy()
+            for yr in V42_CANONICAL_YEARS:
+                test=p[p["テスト年"]==yr].copy()
+                if test.empty:
+                    continue
+                cutoff=pd.Timestamp(int(yr.split('-')[0]),10,1)
+                train=p[p["Signal_Date"]<cutoff].copy()
+                tr=train[train["教師ラベル"].notna()].copy()
+                ytr=pd.to_numeric(tr["教師ラベル"],errors="coerce").astype(int) if len(tr) else pd.Series(dtype=int)
+                nt=int((ytr==1).sum()); ns=int((ytr==0).sum())
+                eligible=(len(tr)>=V50_MIN_TRAIN_RESOLVED and nt>=V50_MIN_CLASS_COUNT and ns>=V50_MIN_CLASS_COUNT)
+                if not eligible:
+                    continue
+                model=_v50_pipeline()
+                Xtr=tr[V50_FEATURES].apply(pd.to_numeric,errors="coerce")
+                model.fit(Xtr,ytr)
+                Xte=test[V50_FEATURES].apply(pd.to_numeric,errors="coerce")
+                prob=model.predict_proba(Xte)[:,1]
+                pred=(prob>=V50_THRESHOLD).astype(int)
+                test["AI_Target確率"]=prob
+                test["AI選別"]=pred.astype(bool)
+                test["学習件数"]=len(tr)
+                test["学習Target件数"]=nt
+                test["学習Stop件数"]=ns
+                pred_parts.append(test)
+
+                resolved=test[test["教師ラベル"].notna()].copy()
+                if len(resolved):
+                    yr_true=pd.to_numeric(resolved["教師ラベル"],errors="coerce").astype(int).to_numpy()
+                    yr_prob=pd.to_numeric(resolved["AI_Target確率"],errors="coerce").to_numpy(float)
+                    yr_pred=(yr_prob>=V50_THRESHOLD).astype(int)
+                    base_prob=float(ytr.mean())
+                    class_rows.append({
+                        "テスト年":yr,"銘柄":ticker,"シグナル":signal,
+                        "学習解決済み":len(tr),"学習Target":nt,"学習Stop":ns,
+                        "テスト解決済み":len(resolved),"テストTarget":int((yr_true==1).sum()),"テストStop":int((yr_true==0).sum()),
+                        "AI選別_解決済み":int(yr_pred.sum()),"Accuracy":float(accuracy_score(yr_true,yr_pred)),
+                        "Balanced_Accuracy":_v50_safe_balacc(yr_true,yr_pred),"AUC":_v50_safe_auc(yr_true,yr_prob),
+                        "Brier":float(brier_score_loss(yr_true,yr_prob)),
+                        "過去Target率基準_Brier":float(brier_score_loss(yr_true,np.full(len(yr_true),base_prob))),
+                    })
+                valid=test[test["Net_R_Valid"].eq(True)].copy() if "Net_R_Valid" in test.columns else pd.DataFrame()
+                valid["Net_R"]=pd.to_numeric(valid.get("Net_Realized_R"),errors="coerce") if not valid.empty else np.nan
+                valid=valid[valid["Net_R"].notna()].copy() if not valid.empty else valid
+                selected=valid[valid["AI選別"].eq(True)].copy() if not valid.empty else valid
+                skipped=valid[valid["AI選別"].eq(False)].copy() if not valid.empty else valid
+                def mean_r(z): return float(z["Net_R"].mean()) if len(z) else np.nan
+                def total_r(z): return float(z["Net_R"].sum()) if len(z) else np.nan
+                trade_rows.append({
+                    "テスト年":yr,"銘柄":ticker,"シグナル":signal,"全件Net_R件数":len(valid),
+                    "全件合計R":total_r(valid),"全件平均R":mean_r(valid),"AI選別件数":len(selected),
+                    "AI選別率_%":len(selected)/len(valid)*100.0 if len(valid) else np.nan,
+                    "AI選別合計R":total_r(selected),"AI選別平均R":mean_r(selected),
+                    "AI見送り件数":len(skipped),"AI見送り平均R":mean_r(skipped),
+                    "平均R差_AI-全件":mean_r(selected)-mean_r(valid) if len(selected) and len(valid) else np.nan,
+                })
+    preds=pd.concat(pred_parts,ignore_index=True) if pred_parts else pd.DataFrame()
+    return pd.DataFrame(class_rows),pd.DataFrame(trade_rows),preds
+
+
+def build_v50_oos_summary(preds: pd.DataFrame) -> pd.DataFrame:
+    rows=[]
+    if preds is None or preds.empty:
+        return pd.DataFrame()
+    for ticker in ["GOOG","NVDA"]:
+        for signal in ["下落停止","反発開始"]:
+            p=preds[(preds["銘柄"]==ticker)&(preds["シグナル"]==signal)].copy()
+            valid=p[p["Net_R_Valid"].eq(True)].copy() if "Net_R_Valid" in p.columns else pd.DataFrame()
+            if not valid.empty:
+                valid["Net_R"]=pd.to_numeric(valid["Net_Realized_R"],errors="coerce")
+                valid=valid[valid["Net_R"].notna()].copy()
+            sel=valid[valid["AI選別"].eq(True)].copy() if not valid.empty else valid
+            skip=valid[valid["AI選別"].eq(False)].copy() if not valid.empty else valid
+            def stats(z):
+                if z is None or len(z)==0:return (0,np.nan,np.nan,np.nan,0,0)
+                r=pd.to_numeric(z["Net_R"],errors="coerce").dropna()
+                return (len(r),float(r.sum()),float(r.mean()),float(r.median()),int((r>0).sum()),int((r<0).sum()))
+            an,at,am,amed,ap,aneg=stats(valid); sn,st,sm,smed,sp,sneg=stats(sel); kn,kt,km,kmed,kp,kneg=stats(skip)
+            rows.append({"銘柄":ticker,"シグナル":signal,"OOS年度数":int(p["テスト年"].nunique()),
+                         "全件数":an,"全件合計R":at,"全件平均R":am,"全件中央値R":amed,"全件プラス":ap,"全件マイナス":aneg,
+                         "AI選別件数":sn,"AI選別率_%":sn/an*100.0 if an else np.nan,"AI選別合計R":st,"AI選別平均R":sm,"AI選別中央値R":smed,"AI選別プラス":sp,"AI選別マイナス":sneg,
+                         "AI見送り件数":kn,"AI見送り平均R":km,"平均R差_AI-全件":sm-am if sn and an else np.nan})
+    return pd.DataFrame(rows)
+
+
+def build_v50_probability_summary(preds: pd.DataFrame) -> pd.DataFrame:
+    rows=[]
+    if preds is None or preds.empty:return pd.DataFrame()
+    for ticker in ["GOOG","NVDA"]:
+        for signal in ["下落停止","反発開始"]:
+            p=preds[(preds["銘柄"]==ticker)&(preds["シグナル"]==signal)&preds["教師ラベル"].notna()].copy()
+            if p.empty: continue
+            y=pd.to_numeric(p["教師ラベル"],errors="coerce").astype(int).to_numpy()
+            pr=pd.to_numeric(p["AI_Target確率"],errors="coerce").to_numpy(float)
+            pdx=(pr>=V50_THRESHOLD).astype(int)
+            # 各イベントの予測時点で使った過去Target率を、固定モデルの単純基準確率として再現。
+            base=np.divide(pd.to_numeric(p["学習Target件数"],errors="coerce").to_numpy(float),
+                           pd.to_numeric(p["学習件数"],errors="coerce").to_numpy(float))
+            rows.append({"銘柄":ticker,"シグナル":signal,"OOS解決済み件数":len(p),"Target件数":int((y==1).sum()),"Stop件数":int((y==0).sum()),
+                         "Accuracy":float(accuracy_score(y,pdx)),"Balanced_Accuracy":_v50_safe_balacc(y,pdx),"AUC":_v50_safe_auc(y,pr),
+                         "Brier":float(brier_score_loss(y,pr)),"過去Target率基準_Brier":float(brier_score_loss(y,base)),
+                         "Brier改善_基準-AI":float(brier_score_loss(y,base)-brier_score_loss(y,pr)),
+                         "AI平均Target確率_%":float(np.mean(pr)*100.0),"実Target率_%":float(np.mean(y)*100.0)})
+    return pd.DataFrame(rows)
+
+
+def build_v50_audit(feature_frame: pd.DataFrame, class_year: pd.DataFrame, trade_year: pd.DataFrame, preds: pd.DataFrame) -> pd.DataFrame:
+    rows=[]
+    for ticker in ["GOOG","NVDA"]:
+        for signal in ["下落停止","反発開始"]:
+            p=feature_frame[(feature_frame["銘柄"]==ticker)&(feature_frame["シグナル"]==signal)].copy()
+            unique=p[["期間","BB_Event_ID"]].drop_duplicates().shape[0] if not p.empty else 0
+            resolved=p[p["教師ラベル"].notna()].copy() if not p.empty else p
+            target=int(resolved["教師ラベル"].eq(1).sum()) if not resolved.empty else 0
+            stop=int(resolved["教師ラベル"].eq(0).sum()) if not resolved.empty else 0
+            pp=preds[(preds["銘柄"]==ticker)&(preds["シグナル"]==signal)].copy() if preds is not None and not preds.empty else pd.DataFrame()
+            cy=class_year[(class_year["銘柄"]==ticker)&(class_year["シグナル"]==signal)].copy() if class_year is not None and not class_year.empty else pd.DataFrame()
+            ty=trade_year[(trade_year["銘柄"]==ticker)&(trade_year["シグナル"]==signal)].copy() if trade_year is not None and not trade_year.empty else pd.DataFrame()
+            pred_unique=pp[["期間","BB_Event_ID"]].drop_duplicates().shape[0] if not pp.empty else 0
+            all_features=int(p[V50_FEATURES].apply(pd.to_numeric,errors="coerce").notna().all(axis=1).sum()) if not p.empty else 0
+            checks=[len(p)==unique, target+stop==len(resolved), len(pp)==pred_unique,
+                    (len(cy)==int(pp.loc[pp["教師ラベル"].notna(),"テスト年"].nunique()) if not pp.empty else len(cy)==0),
+                    (len(ty)==int(pp["テスト年"].nunique()) if not pp.empty else len(ty)==0)]
+            rows.append({"銘柄":ticker,"シグナル":signal,"全シグナル行":len(p),"ユニークイベント":unique,
+                         "4特徴量全件計算可能":all_features,"教師ラベル解決済み":len(resolved),"Target":target,"Stop":stop,
+                         "WalkForward_OOS行":len(pp),"OOSユニークイベント":pred_unique,"OOS年度数":int(pp["テスト年"].nunique()) if not pp.empty else 0,
+                         "年別分類行":len(cy),"年別Net_R比較行":len(ty),"固定特徴量数":len(V50_FEATURES),"AI選別閾値":V50_THRESHOLD,
+                         "母集団一致":"OK" if all(checks) else "要確認"})
+    return pd.DataFrame(rows)
+
+
+@st.cache_data(persist="disk", show_spinner=False)
+def build_v500_current_results(commission_rate: float, slippage_rate: float):
+    base=build_v420_current_results(commission_rate,slippage_rate)
+    windows=build_v34_windows(); period_bundles={"前5年":{},"現5年":{}}
+    for period_name in ["前5年","現5年"]:
+        eval_start,eval_end=windows[period_name]
+        for ticker in ["GOOG","NVDA"]:
+            prepared=prepare_data_fixed_window(ticker,eval_start,eval_end,V34_WARMUP_CALENDAR_DAYS)
+            period_bundles[period_name][ticker]=build_v30_ticker_bundle(ticker,prepared,commission_rate,slippage_rate)
+    feature_frame=_v50_feature_frame(period_bundles)
+    feature_spec=build_v50_feature_spec()
+    class_year,trade_year,preds=build_v50_walk_forward(feature_frame)
+    oos_summary=build_v50_oos_summary(preds)
+    probability_summary=build_v50_probability_summary(preds)
+    audit=build_v50_audit(feature_frame,class_year,trade_year,preds)
+    return base+(feature_spec,class_year,trade_year,oos_summary,probability_summary,audit)

@@ -1,27 +1,28 @@
 import streamlit as st
-from research_core import APP_VERSION, V34_WARMUP_CALENDAR_DAYS, build_v420_current_results
+from research_core import APP_VERSION, V34_WARMUP_CALENDAR_DAYS, build_v500_current_results
 
 st.set_page_config(page_title="GOOG・NVDA BB研究", page_icon="📊", layout="wide")
 st.title("📊 GOOG・NVDA BB下限研究")
-st.caption(f"Version {APP_VERSION} ｜ v4.2.0 時間劣化の直接Bootstrap検証")
-st.info("v4.2.0では売買条件を変更しません。v4.1までと同じ20日・2R・Net Rを使い、現5年平均R－前5年平均Rの差を直接Bootstrapし、3年・5年ローリング窓で時間劣化の形を診断します。")
+st.caption(f"Version {APP_VERSION} ｜ v5.0.0 AI導入前・固定特徴量Walk-Forward検証")
+st.info("v5.0.0では売買条件を変更しません。固定した4特徴量と単純なロジスティック回帰を使い、過去だけで学習→次1年度だけを予測するWalk-ForwardでAIの追加価値を検証します。")
 st.write("【固定全期間】2016-10-01～2026-09-30 ｜ 前5年/現5年の固定窓も維持")
-st.write("【重要】差Bootstrapは「現5年平均R－前5年平均R」を再標本化する診断です。マイナスは現5年の方が弱いことを示しますが、将来利益を保証・予測するものではありません。")
+st.write("【重要】AIはまだ採用しません。Target先着=1 / Stop先着=0を教師ラベルにし、P(Target) 0.50以上の選別が未知の次年度で全件取引より改善するかだけを検査します。")
 
 st.subheader("研究用コスト設定")
 c1,c2=st.columns(2)
-with c1: cp=st.number_input("売買手数料率（片道・%）",0.0,5.0,0.10,0.01,format="%.2f",key="v420_commission")
-with c2: sp=st.number_input("スリッページ率（片道・%）",0.0,5.0,0.10,0.01,format="%.2f",key="v420_slippage")
+with c1: cp=st.number_input("売買手数料率（片道・%）",0.0,5.0,0.10,0.01,format="%.2f",key="v500_commission")
+with c2: sp=st.number_input("スリッページ率（片道・%）",0.0,5.0,0.10,0.01,format="%.2f",key="v500_slippage")
 
-with st.spinner("固定10年結果とv4.2時間劣化診断を読み込んでいます。初回だけ時間がかかります..."):
-    results=build_v420_current_results(cp/100.0,sp/100.0)
+with st.spinner("固定10年結果とv5.0 Walk-Forward AI検証を読み込んでいます。初回だけ時間がかかります..."):
+    results=build_v500_current_results(cp/100.0,sp/100.0)
     (windows,v34_audit,v34_net,v34_diff,v34_rec,v35_exit,v35_path,v35_risk,v35_diff,v35_audit,
      v36_env,v36_outcome,v36_diff,v36_audit,v37_state,v37_outcome,v37_diff,v37_audit,
      v38_qdist,v38_repro,v38_combo,v38_audit,v39_yearly,v39_expanding,v39_consistency,v39_audit,
      v40_structure,v40_sensitivity,v40_period,v40_yearly,v40_audit,
      v41_event_boot,v41_period_boot,v41_year_boot,v41_loo,v41_loo_summary,v41_audit,
-     v42_event_diff,v42_year_diff,v42_rolling3,v42_rolling5,v42_audit)=results
-st.success("v4.2.0 時間劣化の直接Bootstrap検証の読み込み完了")
+     v42_event_diff,v42_year_diff,v42_rolling3,v42_rolling5,v42_audit,
+     v50_feature_spec,v50_class_year,v50_trade_year,v50_oos_summary,v50_probability,v50_audit)=results
+st.success("v5.0.0 AI導入前・固定特徴量Walk-Forward検証の読み込み完了")
 st.caption(f"前5年: {windows['前5年'][0].date()} ～ {windows['前5年'][1].date()} ｜ 現5年: {windows['現5年'][0].date()} ～ {windows['現5年'][1].date()} ｜ ウォームアップ: {V34_WARMUP_CALENDAR_DAYS}暦日")
 
 def copy_text(title,frame,float_format=None):
@@ -35,6 +36,16 @@ def show(num,title,df,expanded=False,ff="%.4f"):
         st.dataframe(df.round(4) if df is not None else df,use_container_width=True,hide_index=True)
         st.code(copy_text(f"{num} {title}",df,float_format=ff),language=None)
 
+st.subheader("🤖 v5.0 AI導入前・固定特徴量Walk-Forward結果")
+st.caption("最初は177番の母集団監査を確認します。AIは研究比較のみで、売買条件にはまだ採用していません。")
+show(177,"v5.0 AI導入前・母集団監査",v50_audit,True,None)
+show(172,"v5.0 固定特徴量・AI学習仕様",v50_feature_spec,False,None)
+show(173,"v5.0 年別Walk-Forward・分類結果",v50_class_year)
+show(174,"v5.0 年別Walk-Forward・AI選別Net R",v50_trade_year)
+show(175,"v5.0 OOS総合集計・AI vs 全件",v50_oos_summary)
+show(176,"v5.0 OOS予測確率・識別校正サマリー",v50_probability)
+
+st.divider();
 st.subheader("📋 v4.2 結果・コピー欄")
 st.caption("番号選択ボタンはありません。最初は171番の監査を確認します。")
 show(171,"v4.2 時間劣化・母集団監査",v42_audit,True,None)
@@ -96,7 +107,16 @@ show(130,"v3.4.1 固定5年窓・監査サマリー",v34_audit,False,None)
 show(131,"v3.4.1 前5年 vs 現5年・2Rコスト後Net R比較",v34_net)
 show(132,"v3.4.1 20日保有・2R・前5年→現5年差",v34_diff)
 
-st.divider();st.subheader("v4.2.0の研究上の扱い")
+st.divider();st.subheader("v5.0.0の研究上の扱い")
+st.write("【固定】特徴量はBandWidth・過去20日Vol・20日騰落率・MA50乖離の4つだけです。v3.8で既に使った情報から固定し、v5.0の結果を見て追加・削除しません。")
+st.write("【固定】モデルはL2ロジスティック回帰、C=1.0、閾値0.50。ハイパーパラメータ探索はしません。")
+st.write("【時系列厳守】欠損補完・標準化・モデル学習は過去累積だけで行い、次1年度を予測します。未来年は学習処理へ入りません。")
+st.write("【教師ラベル】20日2RのTarget先着=1、Stop先着=0。期間内未到達・同日順序不明は教師ラベルから除外します。")
+st.write("【Net R比較】AI選別はP(Target)>=0.50のイベントだけを残した研究上の比較です。全件との合計R・平均Rの両方を確認します。")
+st.write("【未採用】AIによる実売買、特徴量追加、閾値最適化、複雑モデル、GOOG/NVDA別の後付け調整。")
+st.warning("イベント数は少数です。AUCや平均Rが良くても、複数の次年度で再現しなければAIの追加価値とは判定しません。v5.0はAI採用試験の入口です。")
+
+st.divider();st.subheader("v4.2.0の保存済み研究上の扱い")
 st.write("【検証中】167番はイベント単位、168番は年単位のまとまりを残して『現5年平均R－前5年平均R』を直接Bootstrapします。")
 st.write("【重要】差がマイナスなら現5年の平均Rが前5年より低いことを意味します。『現5年が弱い割合』は将来の下落確率ではなく、観測済み標本の再標本化結果です。")
 st.write("【重要】169番の3年ローリングは変化時期を見やすくしますが窓が短く、イベント数も少なくなるため変動が大きくなります。170番の5年ローリングはより平滑ですが、隣接窓が多くの同じイベントを共有します。")
