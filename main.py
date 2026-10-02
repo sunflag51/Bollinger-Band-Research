@@ -2,7 +2,7 @@
 # GOOG / NVDA
 # Bollinger Band Lower-Band Research Program
 #
-# Version : 3.3
+# Version : 3.4
 #
 # v1.4まで
 # ・BB下限イベント
@@ -160,6 +160,15 @@
 # ・GOOGで見た結果を理由にNVDA側の条件を変更しない
 # ・銘柄横断の再現性診断であり、正式な売買条件の採用判定ではない
 #
+# v3.4
+# ・v3.3までの売買条件・コスト条件を固定したまま、時間方向の別5年間検証を追加
+# ・最新日を基準に「現5年」と、その直前の重ならない「前5年」をカレンダー日で固定
+# ・各5年窓の前に400暦日のウォームアップを取得し、BB20日・BandWidth125日を評価開始前に計算
+# ・ウォームアップ日は指標計算だけに使い、BBイベントID・Entry・損益の評価母集団には含めない
+# ・GOOG / NVDA、下落停止 / 反発開始、5 / 10 / 20営業日、2R、ギャップ、コスト条件を変更しない
+# ・前5年の結果を見て条件を変更せず、現5年との再現性だけを診断
+# ・前5年は「未使用過去期間による時間方向の外部検証」であり、将来データによる前向きOOSではない
+#
 # 重要
 # v3.0は日足ベースの研究用ネットR損益＋時系列安定性＋銘柄横断診断まで。
 # 板・出来高・部分約定・税金・為替コストなどはまだ含めない。
@@ -187,7 +196,7 @@ st.set_page_config(
 # 定数
 # ============================================================
 
-APP_VERSION = "3.3"
+APP_VERSION = "3.4"
 
 BB_PERIOD = 20
 BB_STD = 2.0
@@ -263,6 +272,53 @@ def get_stock_data(ticker: str, period: str) -> pd.DataFrame:
         )
 
         return data
+
+    except Exception:
+        return pd.DataFrame()
+
+
+# ============================================================
+# v3.4 固定日付範囲の株価データ取得
+# ============================================================
+
+@st.cache_data(ttl=3600)
+def get_stock_data_range(
+    ticker: str,
+    start_date,
+    end_date,
+) -> pd.DataFrame:
+    """start_date以上、end_date以下を取得する。yfinanceのendは排他的なので+1日する。"""
+    try:
+        start_ts = pd.Timestamp(start_date).normalize()
+        end_ts = pd.Timestamp(end_date).normalize()
+        if end_ts < start_ts:
+            return pd.DataFrame()
+
+        data = yf.download(
+            ticker,
+            start=start_ts.strftime("%Y-%m-%d"),
+            end=(end_ts + pd.Timedelta(days=1)).strftime("%Y-%m-%d"),
+            interval="1d",
+            auto_adjust=False,
+            progress=False,
+            multi_level_index=False,
+        )
+        if data is None or data.empty:
+            return pd.DataFrame()
+
+        data = data.copy()
+        if getattr(data.index, "tz", None) is not None:
+            data.index = data.index.tz_localize(None)
+        data.index = pd.to_datetime(data.index).normalize()
+
+        required_columns = ["Open", "High", "Low", "Close", "Volume"]
+        for column in required_columns:
+            if column not in data.columns:
+                return pd.DataFrame()
+            data[column] = pd.to_numeric(data[column], errors="coerce")
+
+        data = data.dropna(subset=["Open", "High", "Low", "Close"])
+        return data.sort_index()
 
     except Exception:
         return pd.DataFrame()
@@ -6227,20 +6283,266 @@ def build_v33_audit(detail: pd.DataFrame, v32_detail: pd.DataFrame) -> pd.DataFr
 # タイトル
 # ============================================================
 
+# ============================================================
+# v3.4
+# 固定ルール・別5年間による時間方向検証
+# ============================================================
+
+V34_WARMUP_CALENDAR_DAYS = 400
+
+
+def prepare_data_fixed_window(
+    ticker_symbol: str,
+    evaluation_start,
+    evaluation_end,
+    warmup_calendar_days: int = V34_WARMUP_CALENDAR_DAYS,
+) -> pd.DataFrame:
+    """
+    評価開始前のウォームアップでBB / BandWidth等を計算し、
+    評価窓へ入ってからBBイベントIDを新規に開始する。
+    ウォームアップ日はイベント件数・Entry・損益へ含めない。
+    """
+    eval_start = pd.Timestamp(evaluation_start).normalize()
+    eval_end = pd.Timestamp(evaluation_end).normalize()
+    warmup_start = eval_start - pd.Timedelta(days=int(warmup_calendar_days))
+
+    raw = get_stock_data_range(ticker_symbol, warmup_start, eval_end)
+    if raw is None or raw.empty:
+        return pd.DataFrame()
+
+    # 事前情報として使える指標・前日比較はウォームアップ込みで計算する。
+    df = calculate_bollinger_bands(raw, BB_PERIOD, BB_STD)
+    df = calculate_bandwidth(df)
+    df = calculate_lower_band_distance(df)
+    df = calculate_bandwidth_state(df, SQUEEZE_LOOKBACK)
+    df["BandWidth_Direction"] = df.apply(classify_bandwidth_direction, axis=1)
+    df["Squeeze_State"] = df.apply(classify_squeeze_state, axis=1)
+    df = calculate_lower_band_events(df)
+    df["Lower_Band_Event"] = df.apply(classify_lower_band_event, axis=1)
+    df = calculate_downside_expansion(df)
+    df["Downside_Expansion_State"] = df.apply(classify_downside_expansion, axis=1)
+    df = calculate_decline_stop_conditions(df)
+    df = calculate_rebound_start_conditions(df)
+
+    # ここで評価窓へ切る。イベントIDは評価窓の外から持ち込まない。
+    df = df.loc[(df.index >= eval_start) & (df.index <= eval_end)].copy()
+    if df.empty:
+        return pd.DataFrame()
+
+    df = calculate_lower_event_window(df, LOWER_EVENT_OBSERVATION_DAYS)
+    df = calculate_decline_stop_candidates(df)
+    df["Decline_Stop_State"] = df.apply(classify_decline_stop, axis=1)
+    df = calculate_fixed_bb_event_units(df, LOWER_EVENT_OBSERVATION_DAYS)
+    df = calculate_event_completion(df, LOWER_EVENT_OBSERVATION_DAYS)
+    df = calculate_first_decline_stop_per_event(df)
+    df = calculate_first_rebound_start_per_event(df)
+    df = calculate_first_stop_bb_state(df)
+    df = calculate_first_rebound_bb_state(df)
+    df = calculate_event_results(df)
+    df = calculate_r_design(df, "First_Decline_Stop_In_Event", "Stop")
+    df = calculate_r_design(df, "First_Rebound_Start_In_Event", "Rebound")
+    df = calculate_wait_rebound_after_stop(df)
+    df = calculate_r_design(df, "Wait_Rebound_After_Stop", "WaitRebound")
+    return df
+
+
+def build_v34_windows(latest_date):
+    """最新日から重複しない2つの5暦年窓を作る。"""
+    current_end = pd.Timestamp(latest_date).normalize()
+    current_start = current_end - pd.DateOffset(years=5) + pd.Timedelta(days=1)
+    prior_end = current_start - pd.Timedelta(days=1)
+    prior_start = prior_end - pd.DateOffset(years=5) + pd.Timedelta(days=1)
+    return {
+        "前5年": (prior_start, prior_end),
+        "現5年": (current_start, current_end),
+    }
+
+
+def build_v34_audit(period_bundles: dict, windows: dict) -> pd.DataFrame:
+    rows = []
+    prior_start, prior_end = windows.get("前5年", (pd.NaT, pd.NaT))
+    current_start, current_end = windows.get("現5年", (pd.NaT, pd.NaT))
+    overlap = not (
+        pd.isna(prior_end) or pd.isna(current_start) or prior_end < current_start
+    )
+
+    for period_name in ["前5年", "現5年"]:
+        req_start, req_end = windows.get(period_name, (pd.NaT, pd.NaT))
+        for ticker_symbol in ["GOOG", "NVDA"]:
+            bundle = period_bundles.get(period_name, {}).get(ticker_symbol)
+            if not bundle:
+                rows.append({
+                    "期間": period_name,
+                    "銘柄": ticker_symbol,
+                    "評価開始日": req_start,
+                    "評価終了日": req_end,
+                    "実データ開始日": pd.NaT,
+                    "実データ終了日": pd.NaT,
+                    "観察完了BBイベント": 0,
+                    "独立台帳行数": 0,
+                    "ユニークイベントID": 0,
+                    "重複イベントID行": 0,
+                    "下落停止R計算可能": 0,
+                    "反発開始R計算可能": 0,
+                    "期間重複": "なし" if not overlap else "あり",
+                    "監査": "データなし",
+                })
+                continue
+
+            data = bundle.get("data", pd.DataFrame())
+            ledger = bundle.get("ledger", pd.DataFrame())
+            completed_count = len(bundle.get("completed_starts", pd.DataFrame()))
+            ledger_count = len(ledger)
+            unique_count = (
+                int(pd.to_numeric(ledger["イベントID"], errors="coerce").nunique())
+                if ledger is not None and not ledger.empty else 0
+            )
+            duplicate_count = max(0, ledger_count - unique_count)
+            actual_start = data.index.min() if data is not None and not data.empty else pd.NaT
+            actual_end = data.index.max() if data is not None and not data.empty else pd.NaT
+            date_ok = (
+                pd.notna(actual_start) and pd.notna(actual_end)
+                and actual_start >= pd.Timestamp(req_start)
+                and actual_end <= pd.Timestamp(req_end)
+            )
+            audit_ok = (
+                date_ok
+                and not overlap
+                and completed_count == ledger_count == unique_count
+                and duplicate_count == 0
+            )
+            rows.append({
+                "期間": period_name,
+                "銘柄": ticker_symbol,
+                "評価開始日": req_start,
+                "評価終了日": req_end,
+                "実データ開始日": actual_start,
+                "実データ終了日": actual_end,
+                "観察完了BBイベント": completed_count,
+                "独立台帳行数": ledger_count,
+                "ユニークイベントID": unique_count,
+                "重複イベントID行": duplicate_count,
+                "下落停止R計算可能": len(bundle.get("signal_valid", {}).get("Stop", pd.DataFrame())),
+                "反発開始R計算可能": len(bundle.get("signal_valid", {}).get("Rebound", pd.DataFrame())),
+                "期間重複": "なし" if not overlap else "あり",
+                "監査": "OK" if audit_ok else "要確認",
+            })
+    return pd.DataFrame(rows)
+
+
+def build_v34_net_summary(period_bundles: dict) -> pd.DataFrame:
+    rows = []
+    for period_name in ["前5年", "現5年"]:
+        for ticker_symbol in ["GOOG", "NVDA"]:
+            bundle = period_bundles.get(period_name, {}).get(ticker_symbol)
+            if not bundle:
+                continue
+            completed_count = len(bundle.get("completed_starts", pd.DataFrame()))
+            for prefix_name, signal_label in [("Stop", "下落停止"), ("Rebound", "反発開始")]:
+                results = bundle.get("net_sets", {}).get(prefix_name, pd.DataFrame())
+                if results is None or results.empty:
+                    continue
+                for horizon in FIRST_HIT_HORIZONS:
+                    part = results[
+                        pd.to_numeric(results["Horizon"], errors="coerce").eq(horizon)
+                    ].copy()
+                    valid = part[part["Net_R_Valid"].eq(True)].copy()
+                    gross_r = pd.to_numeric(valid["Gross_Realized_R"], errors="coerce").dropna()
+                    net_r = pd.to_numeric(valid["Net_Realized_R"], errors="coerce").dropna()
+                    cost_r = pd.to_numeric(valid["Cost_R"], errors="coerce").dropna()
+                    rows.append({
+                        "期間": period_name,
+                        "銘柄": ticker_symbol,
+                        "シグナル": signal_label,
+                        "保有期間": f"{horizon}営業日",
+                        "観察完了BBイベント": completed_count,
+                        "シグナル対象": len(part),
+                        "Net_R計算可能": len(net_r),
+                        "Gross合計R": float(gross_r.sum()) if not gross_r.empty else np.nan,
+                        "Net合計R": float(net_r.sum()) if not net_r.empty else np.nan,
+                        "コスト合計R": float(cost_r.sum()) if not cost_r.empty else np.nan,
+                        "Net平均R": float(net_r.mean()) if not net_r.empty else np.nan,
+                        "Net中央値R": float(net_r.median()) if not net_r.empty else np.nan,
+                        "NetプラスR": int((net_r > 0).sum()),
+                        "NetマイナスR": int((net_r < 0).sum()),
+                        "NetゼロR": int((net_r.abs() <= 1e-12).sum()),
+                    })
+    return pd.DataFrame(rows)
+
+
+def build_v34_20d_difference(summary: pd.DataFrame) -> pd.DataFrame:
+    if summary is None or summary.empty:
+        return pd.DataFrame()
+    rows = []
+    part = summary[summary["保有期間"].eq("20営業日")].copy()
+    for ticker_symbol in ["GOOG", "NVDA"]:
+        for signal_label in ["下落停止", "反発開始"]:
+            g = part[(part["銘柄"].eq(ticker_symbol)) & (part["シグナル"].eq(signal_label))]
+            prior = g[g["期間"].eq("前5年")]
+            current = g[g["期間"].eq("現5年")]
+            if prior.empty or current.empty:
+                continue
+            a = prior.iloc[0]
+            b = current.iloc[0]
+            rows.append({
+                "銘柄": ticker_symbol,
+                "シグナル": signal_label,
+                "前5年_Net_R計算可能": int(a["Net_R計算可能"]),
+                "現5年_Net_R計算可能": int(b["Net_R計算可能"]),
+                "前5年_Net合計R": a["Net合計R"],
+                "現5年_Net合計R": b["Net合計R"],
+                "前5年_Net平均R": a["Net平均R"],
+                "現5年_Net平均R": b["Net平均R"],
+                "平均R差_現5年-前5年": (
+                    float(b["Net平均R"]) - float(a["Net平均R"])
+                    if pd.notna(a["Net平均R"]) and pd.notna(b["Net平均R"])
+                    else np.nan
+                ),
+                "前5年_Net中央値R": a["Net中央値R"],
+                "現5年_Net中央値R": b["Net中央値R"],
+                "前5年_プラスR": int(a["NetプラスR"]),
+                "前5年_マイナスR": int(a["NetマイナスR"]),
+                "現5年_プラスR": int(b["NetプラスR"]),
+                "現5年_マイナスR": int(b["NetマイナスR"]),
+            })
+    return pd.DataFrame(rows)
+
+
+def build_v34_reconciliation(audit: pd.DataFrame, summary: pd.DataFrame) -> pd.DataFrame:
+    """監査OKと5/10/20日結果の存在を期間×銘柄単位で確認する。"""
+    rows = []
+    for period_name in ["前5年", "現5年"]:
+        for ticker_symbol in ["GOOG", "NVDA"]:
+            a = audit[(audit["期間"].eq(period_name)) & (audit["銘柄"].eq(ticker_symbol))]
+            s = summary[(summary["期間"].eq(period_name)) & (summary["銘柄"].eq(ticker_symbol))]
+            expected_rows = 2 * len(FIRST_HIT_HORIZONS)
+            actual_rows = len(s)
+            audit_status = a.iloc[0]["監査"] if not a.empty else "データなし"
+            rows.append({
+                "期間": period_name,
+                "銘柄": ticker_symbol,
+                "監査サマリー": audit_status,
+                "期待集計行数": expected_rows,
+                "実集計行数": actual_rows,
+                "集計行数差": actual_rows - expected_rows,
+                "最終監査": "OK" if audit_status == "OK" and actual_rows == expected_rows else "要確認",
+            })
+    return pd.DataFrame(rows)
+
+
 st.title(
     "📊 GOOG・NVDA BB下限研究"
 )
 
 st.caption(
     f"Version {APP_VERSION} ｜ "
-    "Stop先着→その後2R・価格経路分解版"
+    "固定ルール・別5年間時間方向検証版"
 )
 
 st.info(
-    "v3.3ではv3.2までの研究結果をすべて維持し、"
-    "下落停止でStopが先だった後に20営業日内で2Rへ戻った価格経路を分解します。"
-    "Stop到達日、2R初回到達日、回復までの最大MAE、Stopを何R超えて下落したかを測り、"
-    "Stopを広げるなどの条件変更はせず原因診断だけを行います。"
+    "v3.4ではv3.3までの研究結果をすべて維持し、売買条件を変更せず時間方向の別5年間検証を追加します。"
+    "最新日を基準に現5年と、その直前の重ならない前5年を作り、GOOG / NVDAへ同じルール・同じコストを適用します。"
+    "前5年の結果を見て条件を調整せず、現在5年間で見えた特徴が別時期にも再現するかだけを確認します。"
 )
 
 # v2.5.1: 実際の結果は後段で計算されるため、ここに空の表示場所だけ作り、
@@ -11422,7 +11724,153 @@ st.write(
 )
 
 # ============================================================
-# v3.3 番号選択・クイックコピー
+# v3.4 固定ルール・別5年間による時間方向検証
+# ============================================================
+
+st.divider()
+
+st.subheader(
+    "129 v3.4 固定ルール・別5年間時間方向検証ルール"
+)
+st.write(
+    "【条件固定】BBイベント、下落停止、反発開始、翌営業日Open Entry、イベント起点1R Stop、2R Target、5 / 10 / 20営業日を変更しません。"
+)
+st.write(
+    f"【コスト固定】画面上部と同じ片道手数料 {commission_percent:.2f}%、片道スリッページ {slippage_percent:.2f}% を両期間・両銘柄へ使用します。"
+)
+st.write(
+    f"【ウォームアップ】各評価窓の前 {V34_WARMUP_CALENDAR_DAYS} 暦日を指標計算だけに使用し、イベントID・Entry・損益の母集団には含めません。"
+)
+st.write(
+    "【期間分離】最新データ日を基準に、重ならない現5年と直前の前5年をカレンダー日で固定します。"
+)
+st.warning(
+    "前5年はこの研究で条件調整に使っていない過去期間を時間方向に確認するものです。ただし将来データによる前向きOOSではありません。結果を見てルールを変更すると、この検証期間も以後は未使用ではなくなります。"
+)
+
+# v3.0で取得済みの両銘柄から、共通して存在する最新取引日を基準日にする。
+v34_latest_candidates = []
+for _sym in ["GOOG", "NVDA"]:
+    _bundle = v30_bundles.get(_sym)
+    if _bundle and _bundle.get("data") is not None and not _bundle["data"].empty:
+        v34_latest_candidates.append(pd.Timestamp(_bundle["data"].index.max()).normalize())
+
+v34_period_bundles = {"前5年": {}, "現5年": {}}
+v34_windows = {}
+v34_audit = pd.DataFrame()
+v34_net_summary = pd.DataFrame()
+v34_20d_difference = pd.DataFrame()
+v34_reconciliation = pd.DataFrame()
+
+if not v34_latest_candidates:
+    st.error("v3.4の基準となる最新取引日を取得できませんでした。")
+else:
+    v34_common_latest = min(v34_latest_candidates)
+    v34_windows = build_v34_windows(v34_common_latest)
+
+    st.caption(
+        "前5年: "
+        f"{v34_windows['前5年'][0].date()} ～ {v34_windows['前5年'][1].date()} ｜ "
+        "現5年: "
+        f"{v34_windows['現5年'][0].date()} ～ {v34_windows['現5年'][1].date()}"
+    )
+
+    for _period_name in ["前5年", "現5年"]:
+        _eval_start, _eval_end = v34_windows[_period_name]
+        for _sym in ["GOOG", "NVDA"]:
+            with st.spinner(f"v3.4: {_sym} {_period_name} を固定ルールで計算しています..."):
+                _prepared = prepare_data_fixed_window(
+                    _sym,
+                    _eval_start,
+                    _eval_end,
+                    V34_WARMUP_CALENDAR_DAYS,
+                )
+                v34_period_bundles[_period_name][_sym] = build_v30_ticker_bundle(
+                    _sym,
+                    _prepared,
+                    commission_rate,
+                    slippage_rate,
+                )
+
+    v34_audit = build_v34_audit(v34_period_bundles, v34_windows)
+    v34_net_summary = build_v34_net_summary(v34_period_bundles)
+    v34_20d_difference = build_v34_20d_difference(v34_net_summary)
+    v34_reconciliation = build_v34_reconciliation(v34_audit, v34_net_summary)
+
+st.subheader(
+    "130 v3.4 固定5年窓・監査サマリー"
+)
+if v34_audit.empty:
+    st.info("v3.4固定5年窓の監査対象がありません。")
+else:
+    st.dataframe(v34_audit, use_container_width=True, hide_index=True)
+    st.write("📋 コピー用・v3.4固定5年窓監査")
+    st.code(
+        "【130 v3.4 固定5年窓・監査サマリー】\n"
+        + v34_audit.to_csv(index=False, date_format="%Y-%m-%d").rstrip(),
+        language=None,
+    )
+
+st.subheader(
+    "131 v3.4 前5年 vs 現5年・2Rコスト後Net R比較"
+)
+if v34_net_summary.empty:
+    st.info("v3.4のNet R比較対象がありません。")
+else:
+    st.dataframe(v34_net_summary.round(4), use_container_width=True, hide_index=True)
+    st.write("📋 コピー用・v3.4前5年 vs 現5年Net R")
+    st.code(
+        "【131 v3.4 前5年 vs 現5年・2Rコスト後Net R比較】\n"
+        + v34_net_summary.to_csv(index=False, float_format="%.4f").rstrip(),
+        language=None,
+    )
+
+st.subheader(
+    "132 v3.4 20日保有・2R・前5年→現5年差"
+)
+if v34_20d_difference.empty:
+    st.info("v3.4の20日2R期間差を計算できませんでした。")
+else:
+    st.dataframe(v34_20d_difference.round(4), use_container_width=True, hide_index=True)
+    st.write("📋 コピー用・v3.4 20日2R期間差")
+    st.code(
+        "【132 v3.4 20日保有・2R・前5年→現5年差】\n"
+        + v34_20d_difference.to_csv(index=False, float_format="%.4f").rstrip(),
+        language=None,
+    )
+
+st.subheader(
+    "133 v3.4 時間方向検証・最終監査"
+)
+if v34_reconciliation.empty:
+    st.info("v3.4時間方向検証の最終監査対象がありません。")
+else:
+    st.dataframe(v34_reconciliation, use_container_width=True, hide_index=True)
+    st.write("📋 コピー用・v3.4時間方向検証最終監査")
+    st.code(
+        "【133 v3.4 時間方向検証・最終監査】\n"
+        + v34_reconciliation.to_csv(index=False).rstrip(),
+        language=None,
+    )
+
+st.subheader(
+    "134 v3.4 時間方向検証結果の扱い"
+)
+st.write(
+    "【検証目的】現在5年間で見えたGOOG / NVDAの差が、その直前の別5年間でも同じ方向に現れるかを確認します。"
+)
+st.write(
+    "【重要】前5年が良い / 悪いという結果を見て、期間・Stop・Target・1R率・銘柄専用条件を後付け変更しません。"
+)
+st.write(
+    "【比較方法】まず監査を通し、その後に5 / 10 / 20営業日のNet R、最後に20日2Rの期間差を読みます。"
+)
+st.write(
+    "【未採用】前5年の結果を使ったパラメータ最適化、NVDA専用救済ルール、Stop幅拡大、極小1R除外。"
+)
+
+# ============================================================
+# v3.4 番号選択・クイックコピー
 # ============================================================
 
 # 長いページをスクロールしなくても、サイドバーから番号を選んで
@@ -11573,6 +12021,18 @@ quick_copy_results = {
     "127 v3.3 Stop先着→その後2R・経路監査": _quick_copy_text(
         "127 v3.3 Stop先着→その後2R・経路監査", v33_audit
     ),
+    "130 v3.4 固定5年窓・監査サマリー": _quick_copy_text(
+        "130 v3.4 固定5年窓・監査サマリー", v34_audit
+    ),
+    "131 v3.4 前5年 vs 現5年・2Rコスト後Net R比較": _quick_copy_text(
+        "131 v3.4 前5年 vs 現5年・2Rコスト後Net R比較", v34_net_summary
+    ),
+    "132 v3.4 20日保有・2R・前5年→現5年差": _quick_copy_text(
+        "132 v3.4 20日保有・2R・前5年→現5年差", v34_20d_difference
+    ),
+    "133 v3.4 時間方向検証・最終監査": _quick_copy_text(
+        "133 v3.4 時間方向検証・最終監査", v34_reconciliation
+    ),
 }
 
 with quick_copy_top_placeholder.container():
@@ -11584,25 +12044,25 @@ with quick_copy_top_placeholder.container():
     quick_copy_choice = st.selectbox(
         "結果番号を選択",
         options=list(quick_copy_results.keys()),
-        index=list(quick_copy_results.keys()).index("127 v3.3 Stop先着→その後2R・経路監査"),
-        key="quick_copy_choice_v33",
+        index=list(quick_copy_results.keys()).index("133 v3.4 時間方向検証・最終監査"),
+        key="quick_copy_choice_v34",
     )
 
     if st.button(
         "選択した結果のコピー欄を表示",
         use_container_width=True,
-        key="quick_copy_button_v33",
+        key="quick_copy_button_v34",
     ):
-        st.session_state["quick_copy_selected_title_v33"] = quick_copy_choice
-        st.session_state["quick_copy_selected_text_v33"] = quick_copy_results[quick_copy_choice]
+        st.session_state["quick_copy_selected_title_v34"] = quick_copy_choice
+        st.session_state["quick_copy_selected_text_v34"] = quick_copy_results[quick_copy_choice]
 
-    if st.session_state.get("quick_copy_selected_text_v33"):
+    if st.session_state.get("quick_copy_selected_text_v34"):
         st.success(
             f"表示中：{st.session_state.get('quick_copy_selected_title_v33', '')}"
         )
         st.caption("下のコピー欄の右上にあるコピーアイコンを押すと全文をコピーできます。")
         st.code(
-            st.session_state["quick_copy_selected_text_v33"],
+            st.session_state["quick_copy_selected_text_v34"],
             language=None,
         )
 
@@ -11867,6 +12327,14 @@ st.write(
 )
 
 st.write(
+    "【v3.4 実装】売買条件を固定し、重ならない前5年 / 現5年を同じウォームアップ・同じコストで時間方向比較"
+)
+
+st.write(
+    "【v3.4 注意】前5年は未使用過去期間の検証であり、将来データによる前向きOOSではない"
+)
+
+st.write(
     "【未実装】R期待値・最大ドローダウン等を含む本格バックテスト"
 )
 
@@ -11880,7 +12348,7 @@ st.divider()
 st.warning(
     "重要：Target先着率や平均Rだけで正式な売買ルールは決めません。"
     "同日順序不明・期間内未到達・将来データ不足を分離し、"
-    "v3.3ではv3.2までの条件を固定したまま、Stop先着後の20営業日価格経路と2R回復までの下振れ深度を診断します。"
+    "v3.4ではv3.3までの条件を固定したまま、重ならない前5年 / 現5年で時間方向の再現性を診断します。"
     "板・出来高・部分約定・税金・為替コストなどはまだ含みません。"
 )
 
