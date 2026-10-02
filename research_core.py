@@ -204,7 +204,7 @@ st.set_page_config(
 # 定数
 # ============================================================
 
-APP_VERSION = "3.6.0"
+APP_VERSION = "3.6.1"
 
 BB_PERIOD = 20
 BB_STD = 2.0
@@ -6995,7 +6995,7 @@ def build_v350_current_results(
 
 
 # ============================================================
-# v3.6.0 相場環境・レジーム診断
+# v3.6.1 相場環境・レジーム診断
 # 売買条件は変更せず、シグナル確定日に既に分かっている情報だけを記録する。
 # ============================================================
 
@@ -7011,6 +7011,13 @@ def _v36_signal_environment(period_bundles: dict) -> pd.DataFrame:
                 sig = bundle.get("signal_valid", {}).get(prefix, pd.DataFrame()).copy()
                 if sig.empty:
                     continue
+
+                # v3.6.1修正:
+                # pandas.mergeは元のDatetimeIndexをRangeIndexへ変える。
+                # v3.6.0はmerge後のindexでVolを参照したため全件NaNになっていた。
+                # 必ずmerge前にシグナル日を列として保存する。
+                sig["_Signal_Date_v361"] = pd.to_datetime(sig.index).values
+
                 # 20日2Rの実現結果は分類ラベルとしてのみ後から結合する。
                 out = bundle.get("net_sets", {}).get(prefix, pd.DataFrame()).copy()
                 if not out.empty:
@@ -7024,10 +7031,14 @@ def _v36_signal_environment(period_bundles: dict) -> pd.DataFrame:
                 if "HistVol_20D_Pct" not in data.columns:
                     close = pd.to_numeric(data["Close"], errors="coerce")
                     histvol = close.pct_change().rolling(20, min_periods=20).std(ddof=0) * np.sqrt(252) * 100.0
-                    hv_map = pd.Series(histvol.values, index=data.index)
+                    hv_map = pd.Series(histvol.values, index=pd.to_datetime(data.index))
                 else:
-                    hv_map = pd.Series(data["HistVol_20D_Pct"].values, index=data.index)
-                sig["HistVol_20D_Pct"] = [hv_map.get(idx, np.nan) for idx in sig.index]
+                    hv_map = pd.Series(
+                        pd.to_numeric(data["HistVol_20D_Pct"], errors="coerce").values,
+                        index=pd.to_datetime(data.index),
+                    )
+                sig["HistVol_20D_Pct"] = pd.to_datetime(sig["_Signal_Date_v361"]).map(hv_map)
+                sig.drop(columns=["_Signal_Date_v361"], inplace=True)
                 sig["期間"] = period_name
                 sig["銘柄"] = ticker_symbol
                 sig["シグナル"] = label

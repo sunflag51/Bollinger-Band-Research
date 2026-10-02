@@ -3,8 +3,8 @@ from research_core import APP_VERSION, V34_WARMUP_CALENDAR_DAYS, build_v360_curr
 
 st.set_page_config(page_title="GOOG・NVDA BB研究", page_icon="📊", layout="wide")
 st.title("📊 GOOG・NVDA BB下限研究")
-st.caption(f"Version {APP_VERSION} ｜ v3.6 相場環境・レジーム診断")
-st.info("v3.6では売買条件を変更しません。シグナル確定日に既に分かっているBandWidth・過去125日のBandWidth位置・BandWidth方向・過去20日ボラティリティを記録し、前5年/現5年とTarget先着/Stop先着の環境差を診断します。")
+st.caption(f"Version {APP_VERSION} ｜ v3.6.1 相場環境・レジーム診断")
+st.info("v3.6.1では売買条件を変更しません。シグナル確定日に既に分かっているBandWidth・過去125日のBandWidth位置・BandWidth方向・過去20日ボラティリティを記録し、前5年/現5年とTarget先着/Stop先着の環境差を診断します。")
 st.write("【固定評価期間】前5年=2016-10-01～2021-09-30 ｜ 現5年=2021-10-01～2026-09-30")
 st.write("【重要】v3.6の環境指標は診断用です。売買フィルターにはまだ使用しません。")
 
@@ -18,7 +18,7 @@ with c2:
 with st.spinner("固定5年検証とv3.6環境診断を読み込んでいます。初回だけ時間がかかります..."):
     (windows,v34_audit,v34_net,v34_diff,v34_rec,v35_exit,v35_path,v35_risk,v35_diff,v35_audit,
      v36_env,v36_outcome,v36_diff,v36_audit)=build_v360_current_results(cp/100.0,sp/100.0)
-st.success("v3.6 相場環境・レジーム診断の読み込み完了")
+st.success("v3.6.1 相場環境・レジーム診断の読み込み完了")
 st.caption(f"前5年: {windows['前5年'][0].date()} ～ {windows['前5年'][1].date()} ｜ 現5年: {windows['現5年'][0].date()} ～ {windows['現5年'][1].date()} ｜ ウォームアップ: {V34_WARMUP_CALENDAR_DAYS}暦日")
 
 def copy_text(title,frame,float_format=None,date_format=None):
@@ -53,7 +53,7 @@ show(130,"v3.4.1 固定5年窓・監査サマリー",v34_audit,False,None)
 show(131,"v3.4.1 前5年 vs 現5年・2Rコスト後Net R比較",v34_net)
 show(132,"v3.4.1 20日保有・2R・前5年→現5年差",v34_diff)
 
-st.divider();st.subheader("v3.6の研究上の扱い")
+st.divider();st.subheader("v3.6.1の研究上の扱い")
 st.write("【検証中】現5年で深い下方向の振れが増えた背景に、BandWidthの位置・収縮/拡大・直前20日ボラティリティの環境差があるかを記述的に確認します。")
 st.write("【未採用】Squeeze/BandWidth/ボラティリティを売買フィルターにすること。結果を見て閾値を最適化すること。Stop幅を変更すること。")
 st.warning("この画面のTarget/Stop別比較は原因候補を探す診断です。結果を知った後の分類なので、そのまま未来の売買条件として使うことはできません。")
