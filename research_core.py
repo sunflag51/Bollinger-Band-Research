@@ -2,7 +2,7 @@
 # GOOG / NVDA
 # Bollinger Band Lower-Band Research Program
 #
-# Version : 3.4.2
+# Version : 3.4.3
 #
 # v1.4まで
 # ・BB下限イベント
@@ -204,7 +204,7 @@ st.set_page_config(
 # 定数
 # ============================================================
 
-APP_VERSION = "3.4.2"
+APP_VERSION = "3.4.3"
 
 BB_PERIOD = 20
 BB_STD = 2.0
@@ -6641,3 +6641,46 @@ def build_v342_cached_time_validation(
     return period_bundles, windows, audit, net_summary, difference_20d, reconciliation
 
 
+
+
+# ============================================================
+# v3.4.3 軽量サマリーキャッシュ
+# ============================================================
+
+@st.cache_data(persist="disk", show_spinner=False)
+def build_v343_current_results(
+    commission_rate: float,
+    slippage_rate: float,
+):
+    """
+    固定5年検証の画面表示に必要な小さい表だけを返す。
+    大きな period_bundles を main.py 側へ返さないことで、
+    Streamlit の再実行・シリアライズ・メモリ負荷を下げる。
+    売買条件と集計式は v3.4.1 / v3.4.2 から変更しない。
+    """
+    windows = build_v34_windows()
+    period_bundles = {"前5年": {}, "現5年": {}}
+
+    for period_name in ["前5年", "現5年"]:
+        eval_start, eval_end = windows[period_name]
+        for ticker_symbol in ["GOOG", "NVDA"]:
+            prepared = prepare_data_fixed_window(
+                ticker_symbol,
+                eval_start,
+                eval_end,
+                V34_WARMUP_CALENDAR_DAYS,
+            )
+            period_bundles[period_name][ticker_symbol] = build_v30_ticker_bundle(
+                ticker_symbol,
+                prepared,
+                commission_rate,
+                slippage_rate,
+            )
+
+    audit = build_v34_audit(period_bundles, windows)
+    net_summary = build_v34_net_summary(period_bundles)
+    difference_20d = build_v34_20d_difference(net_summary)
+    reconciliation = build_v34_reconciliation(audit, net_summary)
+
+    # main.py へは必要な小さい結果だけ返す。
+    return windows, audit, net_summary, difference_20d, reconciliation
