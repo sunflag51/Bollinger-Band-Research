@@ -2,7 +2,7 @@
 # GOOG / NVDA
 # Bollinger Band Lower-Band Research Program
 #
-# Version : 3.7.0
+# Version : 3.8.0
 #
 # v1.4まで
 # ・BB下限イベント
@@ -204,7 +204,7 @@ st.set_page_config(
 # 定数
 # ============================================================
 
-APP_VERSION = "3.7.0"
+APP_VERSION = "3.8.0"
 
 BB_PERIOD = 20
 BB_STD = 2.0
@@ -7324,8 +7324,133 @@ def build_v37_audit(period_bundles: dict, state: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+
+# ============================================================
+# v3.8.0 分布・複合条件の再現性診断
+# 前5年の「特徴量分布だけ」から固定境界を作り、現5年へそのまま適用する。
+# Target/Stop結果を使って境界を最適化しない。
+# ============================================================
+
+def _v38_feature_frame(env: pd.DataFrame, state: pd.DataFrame) -> pd.DataFrame:
+    keys = ["期間", "銘柄", "シグナル", "BB_Event_ID"]
+    ecols = keys + ["Outcome", "BandWidth", "HistVol_20D_Pct"]
+    scols = keys + ["Return_20D_Pct", "Close_vs_MA50_Pct"]
+    e = env[[c for c in ecols if c in env.columns]].copy()
+    s = state[[c for c in scols if c in state.columns]].copy()
+    # Outcomeはv3.6側を正とし、特徴量だけを1イベント1行で結合する。
+    return e.merge(s, on=keys, how="inner", validate="one_to_one")
+
+
+def _v38_prior_quartile_edges(x: pd.Series):
+    x = pd.to_numeric(x, errors="coerce").dropna()
+    if x.empty:
+        return None
+    q = x.quantile([0.25, 0.50, 0.75]).to_numpy(dtype=float)
+    if len(set(q.tolist())) < 3:
+        return None
+    return [-np.inf, q[0], q[1], q[2], np.inf]
+
+
+def build_v38_quartile_distribution(features: pd.DataFrame) -> pd.DataFrame:
+    rows = []
+    specs = [
+        ("BandWidth", "BandWidth"),
+        ("HistVol_20D_Pct", "20日Vol"),
+        ("Return_20D_Pct", "20日騰落率"),
+        ("Close_vs_MA50_Pct", "MA50乖離"),
+    ]
+    labels = ["Q1", "Q2", "Q3", "Q4"]
+    for ticker in ["GOOG", "NVDA"]:
+        for signal in ["下落停止", "反発開始"]:
+            prior = features[(features["期間"]=="前5年") & (features["銘柄"]==ticker) & (features["シグナル"]==signal)]
+            for col, name in specs:
+                edges = _v38_prior_quartile_edges(prior[col])
+                if edges is None: continue
+                for period in ["前5年", "現5年"]:
+                    p = features[(features["期間"]==period) & (features["銘柄"]==ticker) & (features["シグナル"]==signal)].copy()
+                    vals = pd.to_numeric(p[col], errors="coerce")
+                    p["_bin"] = pd.cut(vals, bins=edges, labels=labels, include_lowest=True)
+                    for b in labels:
+                        z = p[p["_bin"].astype(str)==b].copy()
+                        resolved = z[z["Outcome"].isin(["Target先着","Stop先着"])].copy()
+                        nt = int(resolved["Outcome"].eq("Target先着").sum())
+                        ns = int(resolved["Outcome"].eq("Stop先着").sum())
+                        nr = nt + ns
+                        rows.append({
+                            "期間":period,"銘柄":ticker,"シグナル":signal,"指標":name,"前5年固定帯":b,
+                            "帯内件数":len(z),"Target先着":nt,"Stop先着":ns,"判定済件数":nr,
+                            "Target率_%":nt/nr*100.0 if nr else np.nan,
+                            "Stop率_%":ns/nr*100.0 if nr else np.nan,
+                            "前5年Q1上限":edges[1],"前5年中央値":edges[2],"前5年Q3上限":edges[3],
+                        })
+    return pd.DataFrame(rows)
+
+
+def build_v38_quartile_repro(qdist: pd.DataFrame) -> pd.DataFrame:
+    rows=[]
+    if qdist is None or qdist.empty: return pd.DataFrame()
+    for ticker in ["GOOG","NVDA"]:
+        for signal in ["下落停止","反発開始"]:
+            for metric in ["BandWidth","20日Vol","20日騰落率","MA50乖離"]:
+                for b in ["Q1","Q2","Q3","Q4"]:
+                    a=qdist[(qdist["期間"]=="前5年")&(qdist["銘柄"]==ticker)&(qdist["シグナル"]==signal)&(qdist["指標"]==metric)&(qdist["前5年固定帯"]==b)]
+                    c=qdist[(qdist["期間"]=="現5年")&(qdist["銘柄"]==ticker)&(qdist["シグナル"]==signal)&(qdist["指標"]==metric)&(qdist["前5年固定帯"]==b)]
+                    if len(a)!=1 or len(c)!=1: continue
+                    av=a.iloc[0]["Target率_%"]; cv=c.iloc[0]["Target率_%"]
+                    rows.append({"銘柄":ticker,"シグナル":signal,"指標":metric,"前5年固定帯":b,
+                                 "前5年_判定済件数":a.iloc[0]["判定済件数"],"現5年_判定済件数":c.iloc[0]["判定済件数"],
+                                 "前5年_Target率_%":av,"現5年_Target率_%":cv,
+                                 "Target率差_現-前_pt":cv-av if pd.notna(av) and pd.notna(cv) else np.nan})
+    return pd.DataFrame(rows)
+
+
+def build_v38_composite(features: pd.DataFrame) -> pd.DataFrame:
+    rows=[]
+    pairs=[("HistVol_20D_Pct","20日Vol","Return_20D_Pct","20日騰落率"),
+           ("BandWidth","BandWidth","Close_vs_MA50_Pct","MA50乖離")]
+    for ticker in ["GOOG","NVDA"]:
+        for signal in ["下落停止","反発開始"]:
+            prior=features[(features["期間"]=="前5年")&(features["銘柄"]==ticker)&(features["シグナル"]==signal)]
+            for c1,n1,c2,n2 in pairs:
+                m1=pd.to_numeric(prior[c1],errors="coerce").median(); m2=pd.to_numeric(prior[c2],errors="coerce").median()
+                if pd.isna(m1) or pd.isna(m2): continue
+                for period in ["前5年","現5年"]:
+                    p=features[(features["期間"]==period)&(features["銘柄"]==ticker)&(features["シグナル"]==signal)].copy()
+                    v1=pd.to_numeric(p[c1],errors="coerce"); v2=pd.to_numeric(p[c2],errors="coerce")
+                    p["_cell"]=np.where(v1.isna()|v2.isna(),np.nan,
+                        np.where(v1<=m1,"低","高")+pd.Series(np.where(v2<=m2,"低","高"),index=p.index))
+                    for cell in ["低低","低高","高低","高高"]:
+                        z=p[p["_cell"]==cell]; r=z[z["Outcome"].isin(["Target先着","Stop先着"])]
+                        nt=int(r["Outcome"].eq("Target先着").sum()); ns=int(r["Outcome"].eq("Stop先着").sum()); nr=nt+ns
+                        rows.append({"期間":period,"銘柄":ticker,"シグナル":signal,"組合せ":f"{n1}×{n2}",
+                                     "前5年中央値セル":cell,"帯内件数":len(z),"判定済件数":nr,"Target先着":nt,"Stop先着":ns,
+                                     "Target率_%":nt/nr*100.0 if nr else np.nan,"Stop率_%":ns/nr*100.0 if nr else np.nan,
+                                     f"{n1}_前5年中央値":m1,f"{n2}_前5年中央値":m2})
+    return pd.DataFrame(rows)
+
+
+def build_v38_audit(features: pd.DataFrame, qdist: pd.DataFrame) -> pd.DataFrame:
+    rows=[]
+    for period in ["前5年","現5年"]:
+        for ticker in ["GOOG","NVDA"]:
+            for signal in ["下落停止","反発開始"]:
+                p=features[(features["期間"]==period)&(features["銘柄"]==ticker)&(features["シグナル"]==signal)]
+                unique=pd.to_numeric(p.get("BB_Event_ID"),errors="coerce").nunique() if not p.empty else 0
+                row={"期間":period,"銘柄":ticker,"シグナル":signal,"v3.8結合行数":len(p),"ユニークイベントID":int(unique)}
+                for col,name in [("BandWidth","BandWidth"),("HistVol_20D_Pct","20日Vol"),("Return_20D_Pct","20日騰落率"),("Close_vs_MA50_Pct","MA50乖離")]:
+                    row[f"{name}計算可能"]=int(pd.to_numeric(p.get(col),errors="coerce").notna().sum()) if not p.empty else 0
+                # 各指標のQ1-Q4合計が、その指標の計算可能件数と一致するか。
+                checks=[]
+                for name in ["BandWidth","20日Vol","20日騰落率","MA50乖離"]:
+                    z=qdist[(qdist["期間"]==period)&(qdist["銘柄"]==ticker)&(qdist["シグナル"]==signal)&(qdist["指標"]==name)]
+                    checks.append(int(z["帯内件数"].sum())==row[f"{name}計算可能"] if not z.empty else False)
+                row["分位帯合計一致"]="OK" if all(checks) else "要確認"
+                row["母集団一致"]="OK" if len(p)==unique else "要確認"
+                rows.append(row)
+    return pd.DataFrame(rows)
+
 @st.cache_data(persist="disk", show_spinner=False)
-def build_v370_current_results(commission_rate: float, slippage_rate: float):
+def build_v380_current_results(commission_rate: float, slippage_rate: float):
     windows = build_v34_windows()
     period_bundles = {"前5年": {}, "現5年": {}}
     for period_name in ["前5年", "現5年"]:
@@ -7354,7 +7479,13 @@ def build_v370_current_results(commission_rate: float, slippage_rate: float):
     outcome_state = build_v37_outcome_state(state)
     state_difference = build_v37_period_difference(state_summary)
     v37_audit = build_v37_audit(period_bundles, state)
+    features = _v38_feature_frame(env, state)
+    v38_qdist = build_v38_quartile_distribution(features)
+    v38_repro = build_v38_quartile_repro(v38_qdist)
+    v38_combo = build_v38_composite(features)
+    v38_audit = build_v38_audit(features, v38_qdist)
     return (windows, audit, net_summary, difference_20d, reconciliation,
             exit_summary, path_summary, risk_summary, period_difference, v35_audit,
             env_summary, outcome_env, env_difference, v36_audit,
-            state_summary, outcome_state, state_difference, v37_audit)
+            state_summary, outcome_state, state_difference, v37_audit,
+            v38_qdist, v38_repro, v38_combo, v38_audit)
