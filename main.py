@@ -1,10 +1,10 @@
 import streamlit as st
-from research_core import APP_VERSION, V34_WARMUP_CALENDAR_DAYS, build_v500_current_results
+from research_core import APP_VERSION, V34_WARMUP_CALENDAR_DAYS, build_v510_current_results
 
 st.set_page_config(page_title="GOOG・NVDA BB研究", page_icon="📊", layout="wide")
 st.title("📊 GOOG・NVDA BB下限研究")
-st.caption(f"Version {APP_VERSION} ｜ v5.0.0 AI導入前・固定特徴量Walk-Forward検証")
-st.info("v5.0.0では売買条件を変更しません。固定した4特徴量と単純なロジスティック回帰を使い、過去だけで学習→次1年度だけを予測するWalk-ForwardでAIの追加価値を検証します。")
+st.caption(f"Version {APP_VERSION} ｜ v5.1.0 AI改善の頑健性・依存度検証")
+st.info("v5.1.0では売買条件・4特徴量・モデル・正式閾値0.50を変更しません。v5.0で見えたAI改善が、少数大勝ち・特定年度・特定特徴量・0.50近傍の確率に依存していないかを壊しにいきます。")
 st.write("【固定全期間】2016-10-01～2026-09-30 ｜ 前5年/現5年の固定窓も維持")
 st.write("【重要】AIはまだ採用しません。Target先着=1 / Stop先着=0を教師ラベルにし、P(Target) 0.50以上の選別が未知の次年度で全件取引より改善するかだけを検査します。")
 
@@ -14,15 +14,16 @@ with c1: cp=st.number_input("売買手数料率（片道・%）",0.0,5.0,0.10,0.
 with c2: sp=st.number_input("スリッページ率（片道・%）",0.0,5.0,0.10,0.01,format="%.2f",key="v500_slippage")
 
 with st.spinner("固定10年結果とv5.0 Walk-Forward AI検証を読み込んでいます。初回だけ時間がかかります..."):
-    results=build_v500_current_results(cp/100.0,sp/100.0)
+    results=build_v510_current_results(cp/100.0,sp/100.0)
     (windows,v34_audit,v34_net,v34_diff,v34_rec,v35_exit,v35_path,v35_risk,v35_diff,v35_audit,
      v36_env,v36_outcome,v36_diff,v36_audit,v37_state,v37_outcome,v37_diff,v37_audit,
      v38_qdist,v38_repro,v38_combo,v38_audit,v39_yearly,v39_expanding,v39_consistency,v39_audit,
      v40_structure,v40_sensitivity,v40_period,v40_yearly,v40_audit,
      v41_event_boot,v41_period_boot,v41_year_boot,v41_loo,v41_loo_summary,v41_audit,
      v42_event_diff,v42_year_diff,v42_rolling3,v42_rolling5,v42_audit,
-     v50_feature_spec,v50_class_year,v50_trade_year,v50_oos_summary,v50_probability,v50_audit)=results
-st.success("v5.0.0 AI導入前・固定特徴量Walk-Forward検証の読み込み完了")
+     v50_feature_spec,v50_class_year,v50_trade_year,v50_oos_summary,v50_probability,v50_audit,
+     v51_concentration,v51_loo,v51_ablation,v51_threshold,v51_margin,v51_audit)=results
+st.success("v5.1.0 AI改善の頑健性・依存度検証の読み込み完了")
 st.caption(f"前5年: {windows['前5年'][0].date()} ～ {windows['前5年'][1].date()} ｜ 現5年: {windows['現5年'][0].date()} ～ {windows['現5年'][1].date()} ｜ ウォームアップ: {V34_WARMUP_CALENDAR_DAYS}暦日")
 
 def copy_text(title,frame,float_format=None):
@@ -36,6 +37,16 @@ def show(num,title,df,expanded=False,ff="%.4f"):
         st.dataframe(df.round(4) if df is not None else df,use_container_width=True,hide_index=True)
         st.code(copy_text(f"{num} {title}",df,float_format=ff),language=None)
 
+st.subheader("🧪 v5.1 AI改善の頑健性・依存度検証")
+st.caption("最初は183番の母集団監査を確認します。v5.0の正式AI仕様は変更せず、改善結果が壊れないかだけを診断します。")
+show(183,"v5.1 AI頑健性・母集団監査",v51_audit,True,None)
+show(178,"v5.1 AI選別・大勝ち依存診断",v51_concentration)
+show(179,"v5.1 OOS年度Leave-One-Year-Out",v51_loo)
+show(180,"v5.1 1特徴量除外・依存度診断",v51_ablation)
+show(181,"v5.1 0.50近傍・閾値感度診断",v51_threshold)
+show(182,"v5.1 OOS予測確率・0.50近傍診断",v51_margin)
+
+st.divider()
 st.subheader("🤖 v5.0 AI導入前・固定特徴量Walk-Forward結果")
 st.caption("最初は177番の母集団監査を確認します。AIは研究比較のみで、売買条件にはまだ採用していません。")
 show(177,"v5.0 AI導入前・母集団監査",v50_audit,True,None)
@@ -106,6 +117,16 @@ show(133,"v3.4.1 時間方向検証・最終監査",v34_rec,False,None)
 show(130,"v3.4.1 固定5年窓・監査サマリー",v34_audit,False,None)
 show(131,"v3.4.1 前5年 vs 現5年・2Rコスト後Net R比較",v34_net)
 show(132,"v3.4.1 20日保有・2R・前5年→現5年差",v34_diff)
+
+st.divider();st.subheader("v5.1.0の研究上の扱い")
+st.write("【固定維持】v5.0の売買条件、4特徴量、L2ロジスティック回帰、C=1.0、正式閾値0.50は変更しません。")
+st.write("【頑健性診断】178番はAI選別利益から最大1件・上位3件を除外し、少数大勝ち依存を確認します。")
+st.write("【時間依存診断】179番はOOS年度を1年ずつ除外し、AI改善が特定年度だけに依存しないか確認します。")
+st.write("【特徴量依存診断】180番は4特徴量から1つずつ除外します。良い組合せを選ぶためではなく、1特徴量への依存を診断するだけです。")
+st.write("【閾値感度診断】181番の0.45/0.50/0.55は感度診断だけです。正式閾値は0.50のままで、結果を見て変更しません。")
+st.write("【確率余裕診断】182番は予測が0.50近辺に密集しているかを確認します。")
+st.write("【未採用】AI実売買、特徴量選択、閾値最適化、複雑モデル、NVDA専用の後付けモデル変更。")
+st.warning("v5.1はv5.0で観察済みの結果に対する頑健性診断です。新しい完全未使用OOSデータではないため、良い結果でも最終的な将来検証の代わりにはなりません。")
 
 st.divider();st.subheader("v5.0.0の研究上の扱い")
 st.write("【固定】特徴量はBandWidth・過去20日Vol・20日騰落率・MA50乖離の4つだけです。v3.8で既に使った情報から固定し、v5.0の結果を見て追加・削除しません。")

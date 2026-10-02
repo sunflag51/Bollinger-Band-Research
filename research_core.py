@@ -209,7 +209,7 @@ st.set_page_config(
 # 定数
 # ============================================================
 
-APP_VERSION = "5.0.0"
+APP_VERSION = "5.1.0"
 
 BB_PERIOD = 20
 BB_STD = 2.0
@@ -8388,3 +8388,165 @@ def build_v500_current_results(commission_rate: float, slippage_rate: float):
     probability_summary=build_v50_probability_summary(preds)
     audit=build_v50_audit(feature_frame,class_year,trade_year,preds)
     return base+(feature_spec,class_year,trade_year,oos_summary,probability_summary,audit)
+
+
+# ============================================================
+# v5.1.0 AI改善の頑健性・依存度検証
+# v5.0の売買条件・4特徴量・モデル・C・閾値0.50は変更しない。
+# 良かったNVDA結果を採用する前に、少数大勝ち・特定年度・特定特徴量・
+# 0.50近傍の確率への依存を壊しにいく診断だけを追加する。
+# 特徴量除外と閾値感度は「新モデル選択」には使わない。
+# ============================================================
+V51_THRESHOLDS=[0.45,0.50,0.55]
+
+
+def build_v51_winner_concentration(preds: pd.DataFrame) -> pd.DataFrame:
+    rows=[]
+    for ticker in ["GOOG","NVDA"]:
+        for signal in ["下落停止","反発開始"]:
+            p=preds[(preds["銘柄"]==ticker)&(preds["シグナル"]==signal)&preds["AI選別"].eq(True)].copy()
+            p=p[p["Net_R_Valid"].eq(True)].copy() if "Net_R_Valid" in p.columns else pd.DataFrame()
+            if not p.empty:
+                p["Net_R"]=pd.to_numeric(p["Net_Realized_R"],errors="coerce"); p=p[p["Net_R"].notna()].copy()
+            vals=sorted(p["Net_R"].tolist(),reverse=True) if not p.empty else []
+            total=float(sum(vals)) if vals else np.nan
+            def after(k):
+                z=vals[k:]
+                return (len(z),float(sum(z)),float(np.mean(z))) if z else (0,np.nan,np.nan)
+            n1,t1,m1=after(1); n3,t3,m3=after(min(3,len(vals)))
+            rows.append({"銘柄":ticker,"シグナル":signal,"AI選別Net_R件数":len(vals),"基準合計R":total,
+                         "基準平均R":float(np.mean(vals)) if vals else np.nan,"最大利益R":max(vals) if vals else np.nan,
+                         "最大1件除外_件数":n1,"最大1件除外_合計R":t1,"最大1件除外_平均R":m1,
+                         "上位3件除外_件数":n3,"上位3件除外_合計R":t3,"上位3件除外_平均R":m3,
+                         "最大1件_基準利益寄与_%":(max(vals)/sum(v for v in vals if v>0)*100.0) if vals and sum(v for v in vals if v>0)>0 else np.nan})
+    return pd.DataFrame(rows)
+
+
+def build_v51_leave_one_year(preds: pd.DataFrame) -> pd.DataFrame:
+    rows=[]
+    for ticker in ["GOOG","NVDA"]:
+        for signal in ["下落停止","反発開始"]:
+            p=preds[(preds["銘柄"]==ticker)&(preds["シグナル"]==signal)].copy()
+            if p.empty: continue
+            p=p[p["Net_R_Valid"].eq(True)].copy(); p["Net_R"]=pd.to_numeric(p["Net_Realized_R"],errors="coerce"); p=p[p["Net_R"].notna()]
+            for yr in sorted(p["テスト年"].dropna().unique()):
+                z=p[p["テスト年"]!=yr].copy(); sel=z[z["AI選別"].eq(True)]
+                allm=float(z["Net_R"].mean()) if len(z) else np.nan; sm=float(sel["Net_R"].mean()) if len(sel) else np.nan
+                rows.append({"銘柄":ticker,"シグナル":signal,"除外年度":yr,"残存全件":len(z),"残存AI選別":len(sel),
+                             "残存全件平均R":allm,"残存AI平均R":sm,"残存平均R差_AI-全件":sm-allm if len(sel) else np.nan,
+                             "AI改善維持":"YES" if len(sel) and sm>allm else "NO"})
+    return pd.DataFrame(rows)
+
+
+def _v51_walk_forward_subset(feature_frame: pd.DataFrame, features) -> pd.DataFrame:
+    parts=[]
+    for ticker in ["GOOG","NVDA"]:
+        for signal in ["下落停止","反発開始"]:
+            p=feature_frame[(feature_frame["銘柄"]==ticker)&(feature_frame["シグナル"]==signal)].copy()
+            p["Signal_Date"]=pd.to_datetime(p["Signal_Date"],errors="coerce"); p=p[p["Signal_Date"].notna()].sort_values("Signal_Date")
+            for yr in V42_CANONICAL_YEARS:
+                test=p[p["テスト年"]==yr].copy()
+                if test.empty: continue
+                cutoff=pd.Timestamp(int(yr.split('-')[0]),10,1); tr=p[(p["Signal_Date"]<cutoff)&p["教師ラベル"].notna()].copy()
+                if len(tr)<V50_MIN_TRAIN_RESOLVED: continue
+                y=pd.to_numeric(tr["教師ラベル"],errors="coerce").astype(int)
+                if int((y==1).sum())<V50_MIN_CLASS_COUNT or int((y==0).sum())<V50_MIN_CLASS_COUNT: continue
+                model=Pipeline([("imputer",SimpleImputer(strategy="median")),("scaler",StandardScaler()),
+                                ("model",LogisticRegression(C=1.0,solver="lbfgs",max_iter=2000,random_state=V50_RANDOM_STATE))])
+                model.fit(tr[list(features)].apply(pd.to_numeric,errors="coerce"),y)
+                test["AI_Target確率"]=model.predict_proba(test[list(features)].apply(pd.to_numeric,errors="coerce"))[:,1]
+                test["AI選別"]=test["AI_Target確率"]>=V50_THRESHOLD; parts.append(test)
+    return pd.concat(parts,ignore_index=True) if parts else pd.DataFrame()
+
+
+def build_v51_feature_ablation(feature_frame: pd.DataFrame) -> pd.DataFrame:
+    rows=[]
+    variants=[("4特徴量基準",V50_FEATURES)]+[(f"除外:{V50_FEATURE_LABELS[f]}",[x for x in V50_FEATURES if x!=f]) for f in V50_FEATURES]
+    for name,features in variants:
+        pr=_v51_walk_forward_subset(feature_frame,features)
+        for ticker in ["GOOG","NVDA"]:
+            for signal in ["下落停止","反発開始"]:
+                p=pr[(pr["銘柄"]==ticker)&(pr["シグナル"]==signal)].copy()
+                valid=p[p["Net_R_Valid"].eq(True)].copy() if not p.empty else pd.DataFrame()
+                if not valid.empty:
+                    valid["Net_R"]=pd.to_numeric(valid["Net_Realized_R"],errors="coerce"); valid=valid[valid["Net_R"].notna()]
+                sel=valid[valid["AI選別"].eq(True)] if not valid.empty else valid
+                res=p[p["教師ラベル"].notna()].copy() if not p.empty else pd.DataFrame()
+                auc=np.nan
+                if not res.empty:
+                    auc=_v50_safe_auc(pd.to_numeric(res["教師ラベル"]).astype(int),pd.to_numeric(res["AI_Target確率"]))
+                rows.append({"銘柄":ticker,"シグナル":signal,"診断仕様":name,"使用特徴量数":len(features),"OOS解決済み":len(res),"AUC":auc,
+                             "全件Net_R件数":len(valid),"全件平均R":float(valid["Net_R"].mean()) if len(valid) else np.nan,
+                             "AI選別件数":len(sel),"AI選別平均R":float(sel["Net_R"].mean()) if len(sel) else np.nan,
+                             "平均R差_AI-全件":float(sel["Net_R"].mean()-valid["Net_R"].mean()) if len(sel) and len(valid) else np.nan})
+    return pd.DataFrame(rows)
+
+
+def build_v51_threshold_sensitivity(preds: pd.DataFrame) -> pd.DataFrame:
+    rows=[]
+    for ticker in ["GOOG","NVDA"]:
+        for signal in ["下落停止","反発開始"]:
+            p=preds[(preds["銘柄"]==ticker)&(preds["シグナル"]==signal)].copy()
+            valid=p[p["Net_R_Valid"].eq(True)].copy() if not p.empty else pd.DataFrame()
+            if not valid.empty:
+                valid["Net_R"]=pd.to_numeric(valid["Net_Realized_R"],errors="coerce"); valid=valid[valid["Net_R"].notna()]
+            base=float(valid["Net_R"].mean()) if len(valid) else np.nan
+            for th in V51_THRESHOLDS:
+                sel=valid[pd.to_numeric(valid["AI_Target確率"],errors="coerce")>=th] if len(valid) else valid
+                sm=float(sel["Net_R"].mean()) if len(sel) else np.nan
+                rows.append({"銘柄":ticker,"シグナル":signal,"診断閾値":th,"全件数":len(valid),"全件平均R":base,"AI選別件数":len(sel),
+                             "AI選別率_%":len(sel)/len(valid)*100 if len(valid) else np.nan,"AI選別平均R":sm,"AI選別合計R":float(sel["Net_R"].sum()) if len(sel) else np.nan,
+                             "平均R差_AI-全件":sm-base if len(sel) else np.nan,"正式閾値":"YES" if abs(th-V50_THRESHOLD)<1e-12 else "NO・感度診断のみ"})
+    return pd.DataFrame(rows)
+
+
+def build_v51_probability_margin(preds: pd.DataFrame) -> pd.DataFrame:
+    rows=[]
+    for ticker in ["GOOG","NVDA"]:
+        for signal in ["下落停止","反発開始"]:
+            p=preds[(preds["銘柄"]==ticker)&(preds["シグナル"]==signal)].copy()
+            pr=pd.to_numeric(p.get("AI_Target確率"),errors="coerce").dropna()
+            rows.append({"銘柄":ticker,"シグナル":signal,"OOS予測件数":len(pr),"確率最小":float(pr.min()) if len(pr) else np.nan,
+                         "確率25%":float(pr.quantile(.25)) if len(pr) else np.nan,"確率中央値":float(pr.median()) if len(pr) else np.nan,
+                         "確率75%":float(pr.quantile(.75)) if len(pr) else np.nan,"確率最大":float(pr.max()) if len(pr) else np.nan,
+                         "0.45未満":int((pr<.45).sum()),"0.45以上0.50未満":int(((pr>=.45)&(pr<.50)).sum()),
+                         "0.50以上0.55未満":int(((pr>=.50)&(pr<.55)).sum()),"0.55以上":int((pr>=.55).sum()),
+                         "0.45-0.55近傍_%":float(((pr>=.45)&(pr<.55)).mean()*100) if len(pr) else np.nan})
+    return pd.DataFrame(rows)
+
+
+def build_v51_audit(preds, concentration, loo, ablation, threshold, margin):
+    rows=[]
+    for ticker in ["GOOG","NVDA"]:
+        for signal in ["下落停止","反発開始"]:
+            p=preds[(preds["銘柄"]==ticker)&(preds["シグナル"]==signal)].copy()
+            years=int(p["テスト年"].nunique()) if not p.empty else 0
+            c=concentration[(concentration["銘柄"]==ticker)&(concentration["シグナル"]==signal)]
+            l=loo[(loo["銘柄"]==ticker)&(loo["シグナル"]==signal)]
+            a=ablation[(ablation["銘柄"]==ticker)&(ablation["シグナル"]==signal)]
+            t=threshold[(threshold["銘柄"]==ticker)&(threshold["シグナル"]==signal)]
+            m=margin[(margin["銘柄"]==ticker)&(margin["シグナル"]==signal)]
+            ok=(len(c)==1 and len(l)==years and len(a)==5 and len(t)==3 and len(m)==1 and len(p)==int(m["OOS予測件数"].iloc[0]))
+            rows.append({"銘柄":ticker,"シグナル":signal,"v5.0_OOS行":len(p),"OOS年度数":years,"大勝ち依存行":len(c),"1年除外行":len(l),
+                         "特徴量診断仕様数":len(a),"閾値感度仕様数":len(t),"確率余裕診断行":len(m),"正式AI閾値":V50_THRESHOLD,"母集団一致":"OK" if ok else "要確認"})
+    return pd.DataFrame(rows)
+
+
+@st.cache_data(persist="disk", show_spinner=False)
+def build_v510_current_results(commission_rate: float, slippage_rate: float):
+    base=build_v500_current_results(commission_rate,slippage_rate)
+    windows=build_v34_windows(); period_bundles={"前5年":{},"現5年":{}}
+    for period_name in ["前5年","現5年"]:
+        eval_start,eval_end=windows[period_name]
+        for ticker in ["GOOG","NVDA"]:
+            prepared=prepare_data_fixed_window(ticker,eval_start,eval_end,V34_WARMUP_CALENDAR_DAYS)
+            period_bundles[period_name][ticker]=build_v30_ticker_bundle(ticker,prepared,commission_rate,slippage_rate)
+    ff=_v50_feature_frame(period_bundles)
+    _,_,preds=build_v50_walk_forward(ff)
+    concentration=build_v51_winner_concentration(preds)
+    loo=build_v51_leave_one_year(preds)
+    ablation=build_v51_feature_ablation(ff)
+    threshold=build_v51_threshold_sensitivity(preds)
+    margin=build_v51_probability_margin(preds)
+    audit=build_v51_audit(preds,concentration,loo,ablation,threshold,margin)
+    return base+(concentration,loo,ablation,threshold,margin,audit)
