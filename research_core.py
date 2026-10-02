@@ -2,7 +2,7 @@
 # GOOG / NVDA
 # Bollinger Band Lower-Band Research Program
 #
-# Version : 3.4.3
+# Version : 3.7.0
 #
 # v1.4まで
 # ・BB下限イベント
@@ -204,7 +204,7 @@ st.set_page_config(
 # 定数
 # ============================================================
 
-APP_VERSION = "3.6.1"
+APP_VERSION = "3.7.0"
 
 BB_PERIOD = 20
 BB_STD = 2.0
@@ -7172,3 +7172,189 @@ def build_v360_current_results(commission_rate: float, slippage_rate: float):
     return (windows, audit, net_summary, difference_20d, reconciliation,
             exit_summary, path_summary, risk_summary, period_difference, v35_audit,
             env_summary, outcome_env, env_difference, v36_audit)
+
+# ============================================================
+# v3.7.0 下落トレンド・下落速度診断
+# 売買条件は変更せず、シグナル確定日までの価格履歴だけを記録する。
+# ============================================================
+
+def _v37_price_state(period_bundles: dict) -> pd.DataFrame:
+    parts = []
+    for period_name in ["前5年", "現5年"]:
+        for ticker_symbol in ["GOOG", "NVDA"]:
+            bundle = period_bundles.get(period_name, {}).get(ticker_symbol)
+            if not bundle:
+                continue
+            data = bundle.get("data", pd.DataFrame()).copy()
+            if data.empty:
+                continue
+            close = pd.to_numeric(data["Close"], errors="coerce")
+            ret1 = close.pct_change()
+            ma50 = close.rolling(50, min_periods=50).mean()
+            ma200 = close.rolling(200, min_periods=200).mean()
+            metrics = pd.DataFrame(index=pd.to_datetime(data.index))
+            metrics["Return_5D_Pct"] = close.pct_change(5).values * 100.0
+            metrics["Return_20D_Pct"] = close.pct_change(20).values * 100.0
+            metrics["Close_vs_MA50_Pct"] = ((close / ma50 - 1.0) * 100.0).values
+            metrics["Close_vs_MA200_Pct"] = ((close / ma200 - 1.0) * 100.0).values
+            metrics["MA200_20D_Change_Pct"] = ((ma200 / ma200.shift(20) - 1.0) * 100.0).values
+            # 直近5営業日の下落日数。シグナル日を含み、その日の終値までで確定する。
+            metrics["Down_Days_Last5"] = ret1.lt(0).rolling(5, min_periods=5).sum().values
+
+            for prefix, label in [("Stop", "下落停止"), ("Rebound", "反発開始")]:
+                sig = bundle.get("signal_valid", {}).get(prefix, pd.DataFrame()).copy()
+                if sig.empty:
+                    continue
+                sig["_Signal_Date_v37"] = pd.to_datetime(sig.index).values
+                out = bundle.get("net_sets", {}).get(prefix, pd.DataFrame()).copy()
+                if not out.empty:
+                    out = out[pd.to_numeric(out["Horizon"], errors="coerce").eq(20)].copy()
+                    out = out[["BB_Event_ID", "Outcome"]].drop_duplicates("BB_Event_ID")
+                    sig = sig.merge(out, on="BB_Event_ID", how="left", validate="one_to_one")
+                else:
+                    sig["Outcome"] = np.nan
+                for col in metrics.columns:
+                    mp = pd.Series(metrics[col].values, index=metrics.index)
+                    sig[col] = pd.to_datetime(sig["_Signal_Date_v37"]).map(mp)
+                sig.drop(columns=["_Signal_Date_v37"], inplace=True)
+                sig["期間"] = period_name
+                sig["銘柄"] = ticker_symbol
+                sig["シグナル"] = label
+                parts.append(sig)
+    return pd.concat(parts, ignore_index=False) if parts else pd.DataFrame()
+
+
+def build_v37_state_summary(state: pd.DataFrame) -> pd.DataFrame:
+    rows = []
+    if state is None or state.empty:
+        return pd.DataFrame()
+    for period in ["前5年", "現5年"]:
+        for ticker in ["GOOG", "NVDA"]:
+            for signal in ["下落停止", "反発開始"]:
+                p = state[(state["期間"] == period) & (state["銘柄"] == ticker) & (state["シグナル"] == signal)].copy()
+                if p.empty:
+                    continue
+                def med(c): return pd.to_numeric(p[c], errors="coerce").median()
+                ma200d = pd.to_numeric(p["Close_vs_MA200_Pct"], errors="coerce")
+                slope = pd.to_numeric(p["MA200_20D_Change_Pct"], errors="coerce")
+                rows.append({
+                    "期間": period, "銘柄": ticker, "シグナル": signal, "対象": len(p),
+                    "5日騰落率中央値_%": med("Return_5D_Pct"),
+                    "20日騰落率中央値_%": med("Return_20D_Pct"),
+                    "MA50乖離中央値_%": med("Close_vs_MA50_Pct"),
+                    "MA200乖離中央値_%": med("Close_vs_MA200_Pct"),
+                    "MA200下_%": ma200d.lt(0).mean() * 100.0 if ma200d.notna().any() else np.nan,
+                    "MA200_20日変化中央値_%": med("MA200_20D_Change_Pct"),
+                    "MA200下降中_%": slope.lt(0).mean() * 100.0 if slope.notna().any() else np.nan,
+                    "直近5日下落日数中央値": med("Down_Days_Last5"),
+                })
+    return pd.DataFrame(rows)
+
+
+def build_v37_outcome_state(state: pd.DataFrame) -> pd.DataFrame:
+    rows = []
+    if state is None or state.empty:
+        return pd.DataFrame()
+    for period in ["前5年", "現5年"]:
+        for ticker in ["GOOG", "NVDA"]:
+            for signal in ["下落停止", "反発開始"]:
+                base = state[(state["期間"] == period) & (state["銘柄"] == ticker) & (state["シグナル"] == signal)].copy()
+                for outcome in ["Target先着", "Stop先着", "期間内未到達"]:
+                    p = base[base["Outcome"].fillna("").astype(str).eq(outcome)].copy()
+                    if p.empty:
+                        continue
+                    def med(c): return pd.to_numeric(p[c], errors="coerce").median()
+                    ma200d = pd.to_numeric(p["Close_vs_MA200_Pct"], errors="coerce")
+                    slope = pd.to_numeric(p["MA200_20D_Change_Pct"], errors="coerce")
+                    rows.append({
+                        "期間": period, "銘柄": ticker, "シグナル": signal, "20日結果": outcome, "件数": len(p),
+                        "5日騰落率中央値_%": med("Return_5D_Pct"),
+                        "20日騰落率中央値_%": med("Return_20D_Pct"),
+                        "MA50乖離中央値_%": med("Close_vs_MA50_Pct"),
+                        "MA200乖離中央値_%": med("Close_vs_MA200_Pct"),
+                        "MA200下_%": ma200d.lt(0).mean() * 100.0 if ma200d.notna().any() else np.nan,
+                        "MA200_20日変化中央値_%": med("MA200_20D_Change_Pct"),
+                        "MA200下降中_%": slope.lt(0).mean() * 100.0 if slope.notna().any() else np.nan,
+                        "直近5日下落日数中央値": med("Down_Days_Last5"),
+                    })
+    return pd.DataFrame(rows)
+
+
+def build_v37_period_difference(summary: pd.DataFrame) -> pd.DataFrame:
+    rows = []
+    if summary is None or summary.empty:
+        return pd.DataFrame()
+    metrics = ["5日騰落率中央値_%", "20日騰落率中央値_%", "MA50乖離中央値_%", "MA200乖離中央値_%", "MA200下_%", "MA200_20日変化中央値_%", "MA200下降中_%", "直近5日下落日数中央値"]
+    for ticker in ["GOOG", "NVDA"]:
+        for signal in ["下落停止", "反発開始"]:
+            a = summary[(summary["期間"] == "前5年") & (summary["銘柄"] == ticker) & (summary["シグナル"] == signal)]
+            b = summary[(summary["期間"] == "現5年") & (summary["銘柄"] == ticker) & (summary["シグナル"] == signal)]
+            if len(a) != 1 or len(b) != 1:
+                continue
+            row = {"銘柄": ticker, "シグナル": signal}
+            for m in metrics:
+                av = pd.to_numeric(pd.Series([a.iloc[0][m]]), errors="coerce").iloc[0]
+                bv = pd.to_numeric(pd.Series([b.iloc[0][m]]), errors="coerce").iloc[0]
+                row[f"前5年_{m}"] = av; row[f"現5年_{m}"] = bv
+                row[f"差_現-前_{m}"] = bv - av if pd.notna(av) and pd.notna(bv) else np.nan
+            rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def build_v37_audit(period_bundles: dict, state: pd.DataFrame) -> pd.DataFrame:
+    rows = []
+    required = ["Return_5D_Pct", "Return_20D_Pct", "Close_vs_MA50_Pct", "Close_vs_MA200_Pct", "MA200_20D_Change_Pct", "Down_Days_Last5"]
+    for period in ["前5年", "現5年"]:
+        for ticker in ["GOOG", "NVDA"]:
+            bundle = period_bundles.get(period, {}).get(ticker)
+            if not bundle: continue
+            for prefix, signal in [("Stop", "下落停止"), ("Rebound", "反発開始")]:
+                expected = len(bundle.get("signal_valid", {}).get(prefix, pd.DataFrame()))
+                p = state[(state["期間"] == period) & (state["銘柄"] == ticker) & (state["シグナル"] == signal)].copy()
+                unique = pd.to_numeric(p.get("BB_Event_ID"), errors="coerce").nunique() if not p.empty else 0
+                counts = {c: int(pd.to_numeric(p.get(c), errors="coerce").notna().sum()) if not p.empty else 0 for c in required}
+                rows.append({
+                    "期間": period, "銘柄": ticker, "シグナル": signal, "R有効シグナル": expected,
+                    "v3.7状態行数": len(p), "ユニークイベントID": int(unique),
+                    "5日騰落率計算可能": counts["Return_5D_Pct"], "20日騰落率計算可能": counts["Return_20D_Pct"],
+                    "MA50計算可能": counts["Close_vs_MA50_Pct"], "MA200計算可能": counts["Close_vs_MA200_Pct"],
+                    "MA200傾き計算可能": counts["MA200_20D_Change_Pct"], "直近5日下落日数計算可能": counts["Down_Days_Last5"],
+                    "母集団一致": "OK" if expected == len(p) == unique else "要確認",
+                })
+    return pd.DataFrame(rows)
+
+
+@st.cache_data(persist="disk", show_spinner=False)
+def build_v370_current_results(commission_rate: float, slippage_rate: float):
+    windows = build_v34_windows()
+    period_bundles = {"前5年": {}, "現5年": {}}
+    for period_name in ["前5年", "現5年"]:
+        eval_start, eval_end = windows[period_name]
+        for ticker_symbol in ["GOOG", "NVDA"]:
+            prepared = prepare_data_fixed_window(ticker_symbol, eval_start, eval_end, V34_WARMUP_CALENDAR_DAYS)
+            period_bundles[period_name][ticker_symbol] = build_v30_ticker_bundle(ticker_symbol, prepared, commission_rate, slippage_rate)
+
+    audit = build_v34_audit(period_bundles, windows)
+    net_summary = build_v34_net_summary(period_bundles)
+    difference_20d = build_v34_20d_difference(net_summary)
+    reconciliation = build_v34_reconciliation(audit, net_summary)
+    exit_summary = build_v35_exit_structure(period_bundles)
+    path_detail, path_summary = build_v35_path_summary(period_bundles, horizon=20)
+    risk_summary = build_v35_risk_summary(period_bundles)
+    period_difference = build_v35_period_difference(exit_summary, path_summary, risk_summary)
+    v35_audit = build_v35_reconciliation(period_bundles, exit_summary, path_detail, risk_summary)
+    env = _v36_signal_environment(period_bundles)
+    env_summary = build_v36_environment_summary(env)
+    outcome_env = build_v36_outcome_environment(env)
+    env_difference = build_v36_period_difference(env_summary)
+    v36_audit = build_v36_audit(period_bundles, env)
+
+    state = _v37_price_state(period_bundles)
+    state_summary = build_v37_state_summary(state)
+    outcome_state = build_v37_outcome_state(state)
+    state_difference = build_v37_period_difference(state_summary)
+    v37_audit = build_v37_audit(period_bundles, state)
+    return (windows, audit, net_summary, difference_20d, reconciliation,
+            exit_summary, path_summary, risk_summary, period_difference, v35_audit,
+            env_summary, outcome_env, env_difference, v36_audit,
+            state_summary, outcome_state, state_difference, v37_audit)
