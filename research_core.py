@@ -209,7 +209,7 @@ st.set_page_config(
 # 定数
 # ============================================================
 
-APP_VERSION = "5.2.0"
+APP_VERSION = "5.3.0"
 
 BB_PERIOD = 20
 BB_STD = 2.0
@@ -8695,3 +8695,153 @@ def build_v520_current_results(commission_rate: float, slippage_rate: float):
     selected_boot=build_v52_selected_mean_bootstrap(preds)
     audit=build_v52_audit(preds,event_boot,year_boot,selected_boot)
     return base+(event_boot,year_boot,selected_boot,audit)
+
+
+# ============================================================
+# v5.3.0 AIモデル凍結・最終未使用期間検証設計
+# 2026-09-30までを「観察済み・凍結学習期間」とし、2026-10-01以降だけを
+# 新しい前向き確認期間として扱う。売買条件・4特徴量・モデル・C=1.0・閾値0.50は変更しない。
+# 前向き期間の結果はモデル再学習へ戻さない。
+# ============================================================
+V53_FREEZE_END = pd.Timestamp("2026-09-30")
+V53_FORWARD_START = pd.Timestamp("2026-10-01")
+
+
+def build_v53_frozen_spec() -> pd.DataFrame:
+    return pd.DataFrame([
+        {"項目":"凍結日", "固定仕様":"2026-09-30までの観察済みデータで固定", "変更":"しない"},
+        {"項目":"前向き確認開始", "固定仕様":"2026-10-01", "変更":"しない"},
+        {"項目":"対象", "固定仕様":"GOOG / NVDA、下落停止 / 反発開始を監査。NVDA反発開始を主要検証候補として追跡", "変更":"しない"},
+        {"項目":"モデル", "固定仕様":"L2正則化ロジスティック回帰", "変更":"しない"},
+        {"項目":"特徴量", "固定仕様":"BandWidth / 過去20日年率Vol / 20日騰落率 / MA50乖離", "変更":"しない"},
+        {"項目":"ハイパーパラメータ", "固定仕様":"C=1.0", "変更":"しない"},
+        {"項目":"正式AI閾値", "固定仕様":"P(Target) >= 0.50", "変更":"しない"},
+        {"項目":"教師ラベル", "固定仕様":"20日2R Target先着=1 / Stop先着=0", "変更":"しない"},
+        {"項目":"売買研究計算", "固定仕様":"次営業日Open Entry / -1R Stop / +2R / 20営業日 / gap・cost・slippage既存仕様", "変更":"しない"},
+        {"項目":"前向きデータの扱い", "固定仕様":"予測・成績確認だけ。凍結モデルの再学習や閾値調整へ戻さない", "変更":"しない"},
+    ])
+
+
+def _v53_feature_rows_from_bundle(bundle, ticker: str) -> pd.DataFrame:
+    if not bundle:
+        return pd.DataFrame()
+    data=bundle.get("data",pd.DataFrame()).copy()
+    if data.empty:
+        return pd.DataFrame()
+    close=pd.to_numeric(data["Close"],errors="coerce")
+    histvol=close.pct_change().rolling(20,min_periods=20).std(ddof=0)*np.sqrt(252)*100.0
+    ret20=close.pct_change(20)*100.0
+    ma50=close.rolling(50,min_periods=50).mean()
+    ma50dev=(close/ma50-1.0)*100.0
+    maps={
+        "BandWidth":pd.Series(pd.to_numeric(data["BandWidth"],errors="coerce").values,index=pd.to_datetime(data.index)),
+        "HistVol_20D_Pct":pd.Series(histvol.values,index=pd.to_datetime(data.index)),
+        "Return_20D_Pct":pd.Series(ret20.values,index=pd.to_datetime(data.index)),
+        "Close_vs_MA50_Pct":pd.Series(ma50dev.values,index=pd.to_datetime(data.index)),
+    }
+    parts=[]
+    for prefix,label in [("Stop","下落停止"),("Rebound","反発開始")]:
+        sig=bundle.get("signal_valid",{}).get(prefix,pd.DataFrame()).copy()
+        if sig.empty:
+            continue
+        sig=sig[["BB_Event_ID"]].copy()
+        sig["Signal_Date"]=pd.to_datetime(sig.index).values
+        for col,mp in maps.items():
+            sig[col]=pd.to_datetime(sig["Signal_Date"]).map(mp)
+        out=bundle.get("net_sets",{}).get(prefix,pd.DataFrame()).copy()
+        if not out.empty:
+            out=out[pd.to_numeric(out["Horizon"],errors="coerce").eq(20)].copy()
+            keep=[c for c in ["BB_Event_ID","Outcome","Net_R_Valid","Net_Realized_R"] if c in out.columns]
+            out=out[keep].drop_duplicates("BB_Event_ID")
+            z=sig.merge(out,on="BB_Event_ID",how="left",validate="one_to_one")
+        else:
+            z=sig.copy(); z["Outcome"]=np.nan; z["Net_R_Valid"]=False; z["Net_Realized_R"]=np.nan
+        z["銘柄"]=ticker; z["シグナル"]=label
+        z["教師ラベル"]=np.where(z["Outcome"].eq("Target先着"),1,np.where(z["Outcome"].eq("Stop先着"),0,np.nan))
+        parts.append(z)
+    return pd.concat(parts,ignore_index=True) if parts else pd.DataFrame()
+
+
+def build_v53_frozen_predictions(fixed_feature_frame: pd.DataFrame, forward_frame: pd.DataFrame):
+    train_rows=[]; pred_parts=[]
+    for ticker in ["GOOG","NVDA"]:
+        for signal in ["下落停止","反発開始"]:
+            tr=fixed_feature_frame[(fixed_feature_frame["銘柄"]==ticker)&(fixed_feature_frame["シグナル"]==signal)&fixed_feature_frame["教師ラベル"].notna()].copy()
+            tr=tr[pd.to_datetime(tr["Signal_Date"],errors="coerce")<=V53_FREEZE_END].copy()
+            y=pd.to_numeric(tr["教師ラベル"],errors="coerce").astype(int) if len(tr) else pd.Series(dtype=int)
+            nt=int((y==1).sum()); ns=int((y==0).sum())
+            eligible=len(tr)>=V50_MIN_TRAIN_RESOLVED and nt>=V50_MIN_CLASS_COUNT and ns>=V50_MIN_CLASS_COUNT
+            train_rows.append({"銘柄":ticker,"シグナル":signal,"凍結学習解決済み":len(tr),"Target":nt,"Stop":ns,
+                               "凍結最終日":V53_FREEZE_END.date(),"固定特徴量数":len(V50_FEATURES),"C":1.0,"正式閾値":V50_THRESHOLD,
+                               "学習条件":"OK" if eligible else "不足"})
+            if not eligible or forward_frame is None or forward_frame.empty:
+                continue
+            te=forward_frame[(forward_frame["銘柄"]==ticker)&(forward_frame["シグナル"]==signal)].copy()
+            if te.empty:
+                continue
+            model=_v50_pipeline(); model.fit(tr[V50_FEATURES].apply(pd.to_numeric,errors="coerce"),y)
+            prob=model.predict_proba(te[V50_FEATURES].apply(pd.to_numeric,errors="coerce"))[:,1]
+            te["AI_Target確率"]=prob; te["AI選別"]=(prob>=V50_THRESHOLD)
+            te["凍結モデル"]="2026-09-30固定"; pred_parts.append(te)
+    preds=pd.concat(pred_parts,ignore_index=True) if pred_parts else pd.DataFrame()
+    return pd.DataFrame(train_rows),preds
+
+
+def build_v53_forward_audit(forward_bundles, forward_frame, preds, latest_date) -> pd.DataFrame:
+    rows=[]
+    for ticker in ["GOOG","NVDA"]:
+        b=forward_bundles.get(ticker)
+        data=b.get("data",pd.DataFrame()) if b else pd.DataFrame()
+        ff=forward_frame[forward_frame["銘柄"]==ticker].copy() if forward_frame is not None and not forward_frame.empty else pd.DataFrame()
+        pp=preds[preds["銘柄"]==ticker].copy() if preds is not None and not preds.empty else pd.DataFrame()
+        rows.append({"銘柄":ticker,"前向き開始":V53_FORWARD_START.date(),"取得最終日":pd.to_datetime(data.index).max().date() if not data.empty else pd.NaT,
+                     "実行時確認上限":pd.Timestamp(latest_date).date(),"前向き価格行":len(data),"凍結後シグナル行":len(ff),
+                     "凍結モデル予測行":len(pp),"AI選別行":int(pp["AI選別"].sum()) if not pp.empty else 0,
+                     "20日Net_R確定行":int(pp.get("Net_R_Valid",pd.Series(dtype=bool)).eq(True).sum()) if not pp.empty else 0,
+                     "期間重複":"なし" if V53_FREEZE_END < V53_FORWARD_START else "要確認"})
+    return pd.DataFrame(rows)
+
+
+def build_v53_forward_results(preds: pd.DataFrame) -> pd.DataFrame:
+    rows=[]
+    for ticker in ["GOOG","NVDA"]:
+        for signal in ["下落停止","反発開始"]:
+            p=preds[(preds["銘柄"]==ticker)&(preds["シグナル"]==signal)].copy() if preds is not None and not preds.empty else pd.DataFrame()
+            valid=p[p.get("Net_R_Valid",pd.Series(False,index=p.index)).eq(True)].copy() if not p.empty else pd.DataFrame()
+            if not valid.empty:
+                valid["Net_R"]=pd.to_numeric(valid["Net_Realized_R"],errors="coerce"); valid=valid[valid["Net_R"].notna()]
+            sel=valid[valid["AI選別"].eq(True)] if not valid.empty else pd.DataFrame()
+            rows.append({"銘柄":ticker,"シグナル":signal,"前向き予測件数":len(p),"AI選別件数":int(p["AI選別"].sum()) if not p.empty else 0,
+                         "20日Net_R確定件数":len(valid),"確定AI選別件数":len(sel),
+                         "全件平均R":float(valid["Net_R"].mean()) if len(valid) else np.nan,
+                         "AI選別平均R":float(sel["Net_R"].mean()) if len(sel) else np.nan,
+                         "平均R差_AI-全件":float(sel["Net_R"].mean()-valid["Net_R"].mean()) if len(sel) and len(valid) else np.nan,
+                         "判定":"蓄積中" if len(valid)==0 else "前向き結果あり"})
+    return pd.DataFrame(rows)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def build_v530_current_results(commission_rate: float, slippage_rate: float):
+    base=build_v520_current_results(commission_rate,slippage_rate)
+    windows=build_v34_windows(); fixed_bundles={"前5年":{},"現5年":{}}
+    for period_name in ["前5年","現5年"]:
+        eval_start,eval_end=windows[period_name]
+        for ticker in ["GOOG","NVDA"]:
+            prepared=prepare_data_fixed_window(ticker,eval_start,eval_end,V34_WARMUP_CALENDAR_DAYS)
+            fixed_bundles[period_name][ticker]=build_v30_ticker_bundle(ticker,prepared,commission_rate,slippage_rate)
+    fixed_ff=_v50_feature_frame(fixed_bundles)
+    latest=pd.Timestamp.today().normalize()
+    forward_bundles={}; fparts=[]
+    if latest>=V53_FORWARD_START:
+        for ticker in ["GOOG","NVDA"]:
+            prepared=prepare_data_fixed_window(ticker,V53_FORWARD_START,latest,V34_WARMUP_CALENDAR_DAYS)
+            b=build_v30_ticker_bundle(ticker,prepared,commission_rate,slippage_rate)
+            forward_bundles[ticker]=b
+            z=_v53_feature_rows_from_bundle(b,ticker)
+            if not z.empty: fparts.append(z)
+    forward_ff=pd.concat(fparts,ignore_index=True) if fparts else pd.DataFrame()
+    frozen_train,preds=build_v53_frozen_predictions(fixed_ff,forward_ff)
+    spec=build_v53_frozen_spec()
+    audit=build_v53_forward_audit(forward_bundles,forward_ff,preds,latest)
+    results=build_v53_forward_results(preds)
+    return base+(spec,frozen_train,audit,results)
