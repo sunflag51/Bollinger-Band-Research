@@ -1,26 +1,27 @@
 import streamlit as st
-from research_core import APP_VERSION, V34_WARMUP_CALENDAR_DAYS, build_v410_current_results
+from research_core import APP_VERSION, V34_WARMUP_CALENDAR_DAYS, build_v420_current_results
 
 st.set_page_config(page_title="GOOG・NVDA BB研究", page_icon="📊", layout="wide")
 st.title("📊 GOOG・NVDA BB下限研究")
-st.caption(f"Version {APP_VERSION} ｜ v4.1.0 統計的不確実性・再標本化診断")
-st.info("v4.1.0では売買条件を変更しません。v4.0までと同じ20日・2R・Net Rを使い、イベント再標本化・年単位再標本化・1年除外で結果の不確実性を診断します。")
+st.caption(f"Version {APP_VERSION} ｜ v4.2.0 時間劣化の直接Bootstrap検証")
+st.info("v4.2.0では売買条件を変更しません。v4.1までと同じ20日・2R・Net Rを使い、現5年平均R－前5年平均Rの差を直接Bootstrapし、3年・5年ローリング窓で時間劣化の形を診断します。")
 st.write("【固定全期間】2016-10-01～2026-09-30 ｜ 前5年/現5年の固定窓も維持")
-st.write("【重要】Bootstrapは過去イベントを再標本化する統計診断です。将来利益を保証するものでも、新しいEntryフィルターでもありません。")
+st.write("【重要】差Bootstrapは「現5年平均R－前5年平均R」を再標本化する診断です。マイナスは現5年の方が弱いことを示しますが、将来利益を保証・予測するものではありません。")
 
 st.subheader("研究用コスト設定")
 c1,c2=st.columns(2)
-with c1: cp=st.number_input("売買手数料率（片道・%）",0.0,5.0,0.10,0.01,format="%.2f",key="v410_commission")
-with c2: sp=st.number_input("スリッページ率（片道・%）",0.0,5.0,0.10,0.01,format="%.2f",key="v410_slippage")
+with c1: cp=st.number_input("売買手数料率（片道・%）",0.0,5.0,0.10,0.01,format="%.2f",key="v420_commission")
+with c2: sp=st.number_input("スリッページ率（片道・%）",0.0,5.0,0.10,0.01,format="%.2f",key="v420_slippage")
 
-with st.spinner("固定10年結果とv4.1再標本化診断を読み込んでいます。初回だけ時間がかかります..."):
-    results=build_v410_current_results(cp/100.0,sp/100.0)
+with st.spinner("固定10年結果とv4.2時間劣化診断を読み込んでいます。初回だけ時間がかかります..."):
+    results=build_v420_current_results(cp/100.0,sp/100.0)
     (windows,v34_audit,v34_net,v34_diff,v34_rec,v35_exit,v35_path,v35_risk,v35_diff,v35_audit,
      v36_env,v36_outcome,v36_diff,v36_audit,v37_state,v37_outcome,v37_diff,v37_audit,
      v38_qdist,v38_repro,v38_combo,v38_audit,v39_yearly,v39_expanding,v39_consistency,v39_audit,
      v40_structure,v40_sensitivity,v40_period,v40_yearly,v40_audit,
-     v41_event_boot,v41_period_boot,v41_year_boot,v41_loo,v41_loo_summary,v41_audit)=results
-st.success("v4.1.0 統計的不確実性・再標本化診断の読み込み完了")
+     v41_event_boot,v41_period_boot,v41_year_boot,v41_loo,v41_loo_summary,v41_audit,
+     v42_event_diff,v42_year_diff,v42_rolling3,v42_rolling5,v42_audit)=results
+st.success("v4.2.0 時間劣化の直接Bootstrap検証の読み込み完了")
 st.caption(f"前5年: {windows['前5年'][0].date()} ～ {windows['前5年'][1].date()} ｜ 現5年: {windows['現5年'][0].date()} ～ {windows['現5年'][1].date()} ｜ ウォームアップ: {V34_WARMUP_CALENDAR_DAYS}暦日")
 
 def copy_text(title,frame,float_format=None):
@@ -34,8 +35,16 @@ def show(num,title,df,expanded=False,ff="%.4f"):
         st.dataframe(df.round(4) if df is not None else df,use_container_width=True,hide_index=True)
         st.code(copy_text(f"{num} {title}",df,float_format=ff),language=None)
 
-st.subheader("📋 v4.1 結果・コピー欄")
-st.caption("番号選択ボタンはありません。最初は165番の監査を確認します。")
+st.subheader("📋 v4.2 結果・コピー欄")
+st.caption("番号選択ボタンはありません。最初は171番の監査を確認します。")
+show(171,"v4.2 時間劣化・母集団監査",v42_audit,True,None)
+show(167,"v4.2 前5年→現5年・平均R差イベントBootstrap",v42_event_diff)
+show(168,"v4.2 前5年→現5年・平均R差年Block Bootstrap",v42_year_diff)
+show(169,"v4.2 3年ローリング・時間推移",v42_rolling3)
+show(170,"v4.2 5年ローリング・時間推移",v42_rolling5)
+
+st.divider();st.subheader("📚 v4.1 統計的不確実性・保存結果")
+st.caption("v4.1の再標本化結果をそのまま保存表示します。")
 show(165,"v4.1 再標本化・母集団監査",v41_audit,True,None)
 show(161,"v4.1 固定10年・イベントBootstrap",v41_event_boot)
 show(162,"v4.1 前5年 vs 現5年・イベントBootstrap",v41_period_boot)
@@ -87,10 +96,10 @@ show(130,"v3.4.1 固定5年窓・監査サマリー",v34_audit,False,None)
 show(131,"v3.4.1 前5年 vs 現5年・2Rコスト後Net R比較",v34_net)
 show(132,"v3.4.1 20日保有・2R・前5年→現5年差",v34_diff)
 
-st.divider();st.subheader("v4.1.0の研究上の扱い")
-st.write("【検証中】固定ルールの平均Net Rが、イベントの再標本化や年単位の変動を考慮してもどの程度プラス側に残るか確認します。")
-st.write("【重要】161・162番はイベントを独立に再標本化するため、時間依存を完全には表現しません。163番は1年をひとかたまりとして再標本化し、年単位の変動を残します。")
-st.write("【重要】表示する2.5%～97.5%はBootstrap percentile区間です。将来リターンの保証範囲ではありません。")
-st.write("【重要】164・166番は1年を丸ごと除いたときの感度です。悪い年だけを実際の売買から除くルールではありません。")
-st.write("【未採用】新しいEntry条件、Bootstrapによる売買フィルター、AI導入。")
-st.warning("イベント数・年度数は限られています。特に年Block BootstrapはGOOG約10年、NVDAの一部は9年程度の年ブロックしかないため、区間を過度に精密な確率として扱いません。")
+st.divider();st.subheader("v4.2.0の研究上の扱い")
+st.write("【検証中】167番はイベント単位、168番は年単位のまとまりを残して『現5年平均R－前5年平均R』を直接Bootstrapします。")
+st.write("【重要】差がマイナスなら現5年の平均Rが前5年より低いことを意味します。『現5年が弱い割合』は将来の下落確率ではなく、観測済み標本の再標本化結果です。")
+st.write("【重要】169番の3年ローリングは変化時期を見やすくしますが窓が短く、イベント数も少なくなるため変動が大きくなります。170番の5年ローリングはより平滑ですが、隣接窓が多くの同じイベントを共有します。")
+st.write("【重要】ローリング窓は独立したOOS検証ではありません。時間劣化が徐々に進んだか、特定時期に集中したかを記述する診断です。")
+st.write("【未採用】新しいEntry条件、時間フィルター、AI導入、GOOG/NVDA専用の救済条件。")
+st.warning("年Block差Bootstrapは各5年程度しか年ブロックがなく、NVDA下落停止の現5年はイベントが存在する年度がさらに少ないため、割合を過度に精密な確率として扱いません。")

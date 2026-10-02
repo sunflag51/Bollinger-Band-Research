@@ -2,7 +2,7 @@
 # GOOG / NVDA
 # Bollinger Band Lower-Band Research Program
 #
-# Version : 4.1.0
+# Version : 4.2.0
 #
 # v1.4まで
 # ・BB下限イベント
@@ -204,7 +204,7 @@ st.set_page_config(
 # 定数
 # ============================================================
 
-APP_VERSION = "4.1.0"
+APP_VERSION = "4.2.0"
 
 BB_PERIOD = 20
 BB_STD = 2.0
@@ -7936,3 +7936,186 @@ def build_v410_current_results(commission_rate: float, slippage_rate: float):
     loo_summary=build_v41_loo_summary(loo)
     audit=build_v41_audit(events,event_boot,period_boot,year_boot,loo)
     return base+(event_boot,period_boot,year_boot,loo,loo_summary,audit)
+
+
+# ============================================================
+# v4.2.0 時間劣化の直接Bootstrap検証
+# 売買条件は変更しない。
+# v4.1までと同じ20日・2R・Net Rを使い、
+# 1) 現5年平均R - 前5年平均R の差をイベント単位で直接bootstrap
+# 2) 同じ差を年Block単位でもbootstrap
+# 3) 固定10年内の3年 / 5年ローリング窓で時間推移を診断
+# する。差がマイナスなら「現5年の平均Rが前5年より低い」。
+# ============================================================
+
+V42_BOOTSTRAP_ITERATIONS = 10000
+V42_EVENT_DIFF_SEED = 4202026
+V42_YEAR_DIFF_SEED = 4203026
+V42_CANONICAL_YEARS = [f"{y}-{y+1}" for y in range(2016, 2026)]
+
+
+def _v42_period_arrays(events: pd.DataFrame, ticker: str, signal: str):
+    x=_v40_valid_r(events)
+    prior=x[(x["期間"]=="前5年")&(x["銘柄"]==ticker)&(x["シグナル"]==signal)].copy()
+    current=x[(x["期間"]=="現5年")&(x["銘柄"]==ticker)&(x["シグナル"]==signal)].copy()
+    a=pd.to_numeric(prior["Net_R"],errors="coerce").dropna().to_numpy(dtype=float)
+    b=pd.to_numeric(current["Net_R"],errors="coerce").dropna().to_numpy(dtype=float)
+    return prior,current,a,b
+
+
+def _v42_diff_summary(diffs: np.ndarray) -> dict:
+    d=np.asarray(diffs,dtype=float)
+    d=d[np.isfinite(d)]
+    if len(d)==0:
+        return {"差Bootstrap中央値":np.nan,"差Bootstrap_2.5%":np.nan,"差Bootstrap_97.5%":np.nan,
+                "現5年が弱い割合_%":np.nan,"現5年が同等以上割合_%":np.nan,"差Bootstrap標準誤差":np.nan}
+    return {
+        "差Bootstrap中央値":float(np.median(d)),
+        "差Bootstrap_2.5%":float(np.percentile(d,2.5)),
+        "差Bootstrap_97.5%":float(np.percentile(d,97.5)),
+        "現5年が弱い割合_%":float((d<0).mean()*100.0),
+        "現5年が同等以上割合_%":float((d>=0).mean()*100.0),
+        "差Bootstrap標準誤差":float(np.std(d,ddof=1)) if len(d)>1 else np.nan,
+    }
+
+
+def build_v42_event_difference_bootstrap(events: pd.DataFrame) -> pd.DataFrame:
+    rows=[]
+    for ti,ticker in enumerate(["GOOG","NVDA"]):
+        for si,signal in enumerate(["下落停止","反発開始"]):
+            _,_,prior,current=_v42_period_arrays(events,ticker,signal)
+            seed=V42_EVENT_DIFF_SEED + ti*100 + si*10
+            if len(prior)==0 or len(current)==0:
+                diffs=np.array([],dtype=float)
+            else:
+                rng=np.random.default_rng(seed)
+                ip=rng.integers(0,len(prior),size=(V42_BOOTSTRAP_ITERATIONS,len(prior)))
+                ic=rng.integers(0,len(current),size=(V42_BOOTSTRAP_ITERATIONS,len(current)))
+                diffs=current[ic].mean(axis=1)-prior[ip].mean(axis=1)
+            obs_prior=float(prior.mean()) if len(prior) else np.nan
+            obs_current=float(current.mean()) if len(current) else np.nan
+            rows.append({"銘柄":ticker,"シグナル":signal,"反復回数":V42_BOOTSTRAP_ITERATIONS,
+                         "前5年件数":len(prior),"現5年件数":len(current),
+                         "前5年観測平均R":obs_prior,"現5年観測平均R":obs_current,
+                         "観測差_現5年-前5年":obs_current-obs_prior if len(prior) and len(current) else np.nan,
+                         **_v42_diff_summary(diffs)})
+    return pd.DataFrame(rows)
+
+
+def _v42_year_group_arrays(z: pd.DataFrame):
+    p=z.copy()
+    p=p[p["テスト年"].notna() & pd.to_numeric(p["Net_R"],errors="coerce").notna()].copy()
+    if p.empty:
+        return np.array([],dtype=float),np.array([],dtype=float),[]
+    g=p.groupby("テスト年",sort=True)["Net_R"].agg(["sum","count"])
+    return g["sum"].to_numpy(dtype=float),g["count"].to_numpy(dtype=float),list(g.index)
+
+
+def _v42_cluster_means(sums, counts, iterations, rng):
+    ny=len(sums)
+    if ny==0:
+        return np.array([],dtype=float)
+    idx=rng.integers(0,ny,size=(int(iterations),ny))
+    ss=sums[idx].sum(axis=1)
+    cc=counts[idx].sum(axis=1)
+    return np.divide(ss,cc,out=np.full(len(ss),np.nan,dtype=float),where=cc>0)
+
+
+def build_v42_year_difference_bootstrap(events: pd.DataFrame) -> pd.DataFrame:
+    x=_v40_valid_r(events); rows=[]
+    for ti,ticker in enumerate(["GOOG","NVDA"]):
+        for si,signal in enumerate(["下落停止","反発開始"]):
+            prior=x[(x["期間"]=="前5年")&(x["銘柄"]==ticker)&(x["シグナル"]==signal)].copy()
+            current=x[(x["期間"]=="現5年")&(x["銘柄"]==ticker)&(x["シグナル"]==signal)].copy()
+            ps,pc,py=_v42_year_group_arrays(prior); cs,cc,cy=_v42_year_group_arrays(current)
+            rng=np.random.default_rng(V42_YEAR_DIFF_SEED + ti*100 + si*10)
+            pm=_v42_cluster_means(ps,pc,V42_BOOTSTRAP_ITERATIONS,rng)
+            cm=_v42_cluster_means(cs,cc,V42_BOOTSTRAP_ITERATIONS,rng)
+            diffs=cm-pm if len(pm) and len(cm) else np.array([],dtype=float)
+            pr=pd.to_numeric(prior["Net_R"],errors="coerce").dropna()
+            cr=pd.to_numeric(current["Net_R"],errors="coerce").dropna()
+            op=float(pr.mean()) if len(pr) else np.nan; oc=float(cr.mean()) if len(cr) else np.nan
+            rows.append({"銘柄":ticker,"シグナル":signal,"反復回数":V42_BOOTSTRAP_ITERATIONS,
+                         "前5年年度数":len(py),"現5年年度数":len(cy),"前5年件数":len(pr),"現5年件数":len(cr),
+                         "前5年観測平均R":op,"現5年観測平均R":oc,
+                         "観測差_現5年-前5年":oc-op if len(pr) and len(cr) else np.nan,
+                         **_v42_diff_summary(diffs)})
+    return pd.DataFrame(rows)
+
+
+def _v42_rolling(events: pd.DataFrame, width: int) -> pd.DataFrame:
+    x=_v40_valid_r(events); rows=[]
+    years=V42_CANONICAL_YEARS
+    for ticker in ["GOOG","NVDA"]:
+        for signal in ["下落停止","反発開始"]:
+            p=x[(x["銘柄"]==ticker)&(x["シグナル"]==signal)].copy()
+            for i in range(0,len(years)-width+1):
+                ys=years[i:i+width]
+                z=p[p["テスト年"].isin(ys)].copy()
+                r=pd.to_numeric(z["Net_R"],errors="coerce").dropna()
+                active=int(z.loc[pd.to_numeric(z["Net_R"],errors="coerce").notna(),"テスト年"].nunique()) if not z.empty else 0
+                rows.append({"銘柄":ticker,"シグナル":signal,"窓年数":width,
+                             "開始年":ys[0],"終了年":ys[-1],"想定年度数":width,"イベント有年度数":active,
+                             "Net_R件数":len(r),"Net_R合計":float(r.sum()) if len(r) else np.nan,
+                             "Net_R平均":float(r.mean()) if len(r) else np.nan,
+                             "Net_R中央値":float(r.median()) if len(r) else np.nan,
+                             "プラスR件数":int((r>0).sum()),"マイナスR件数":int((r<0).sum())})
+    return pd.DataFrame(rows)
+
+
+def build_v42_rolling3(events: pd.DataFrame) -> pd.DataFrame:
+    return _v42_rolling(events,3)
+
+
+def build_v42_rolling5(events: pd.DataFrame) -> pd.DataFrame:
+    return _v42_rolling(events,5)
+
+
+def build_v42_audit(events: pd.DataFrame, event_diff: pd.DataFrame, year_diff: pd.DataFrame,
+                    rolling3: pd.DataFrame, rolling5: pd.DataFrame) -> pd.DataFrame:
+    x=_v40_valid_r(events); rows=[]
+    for ticker in ["GOOG","NVDA"]:
+        for signal in ["下落停止","反発開始"]:
+            raw=events[(events["銘柄"]==ticker)&(events["シグナル"]==signal)].copy()
+            z=x[(x["銘柄"]==ticker)&(x["シグナル"]==signal)].copy()
+            unique=raw[["期間","BB_Event_ID"]].drop_duplicates().shape[0]
+            ed=event_diff[(event_diff["銘柄"]==ticker)&(event_diff["シグナル"]==signal)]
+            yd=year_diff[(year_diff["銘柄"]==ticker)&(year_diff["シグナル"]==signal)]
+            r3=rolling3[(rolling3["銘柄"]==ticker)&(rolling3["シグナル"]==signal)]
+            r5=rolling5[(rolling5["銘柄"]==ticker)&(rolling5["シグナル"]==signal)]
+            prior=z[z["期間"]=="前5年"]; current=z[z["期間"]=="現5年"]
+            first5=r5[(r5["開始年"]=="2016-2017")&(r5["終了年"]=="2020-2021")]
+            last5=r5[(r5["開始年"]=="2021-2022")&(r5["終了年"]=="2025-2026")]
+            checks=[len(raw)==unique,
+                    len(ed)==1 and int(ed.iloc[0]["前5年件数"])==len(prior) and int(ed.iloc[0]["現5年件数"])==len(current),
+                    len(yd)==1 and int(yd.iloc[0]["前5年件数"])==len(prior) and int(yd.iloc[0]["現5年件数"])==len(current),
+                    len(r3)==8,len(r5)==6,
+                    len(first5)==1 and int(first5.iloc[0]["Net_R件数"])==len(prior),
+                    len(last5)==1 and int(last5.iloc[0]["Net_R件数"])==len(current)]
+            rows.append({"銘柄":ticker,"シグナル":signal,"20日イベント":len(raw),"ユニークイベントID":int(unique),
+                         "Net_R計算可能":len(z),"前5年件数":len(prior),"現5年件数":len(current),
+                         "イベント差Bootstrap件数":int(ed.iloc[0]["前5年件数"]+ed.iloc[0]["現5年件数"]) if len(ed)==1 else np.nan,
+                         "年Block差_前年度数":int(yd.iloc[0]["前5年年度数"]) if len(yd)==1 else np.nan,
+                         "年Block差_現年度数":int(yd.iloc[0]["現5年年度数"]) if len(yd)==1 else np.nan,
+                         "3年ローリング窓数":len(r3),"5年ローリング窓数":len(r5),
+                         "Bootstrap反復回数":V42_BOOTSTRAP_ITERATIONS,
+                         "母集団一致":"OK" if all(checks) else "要確認"})
+    return pd.DataFrame(rows)
+
+
+@st.cache_data(persist="disk", show_spinner=False)
+def build_v420_current_results(commission_rate: float, slippage_rate: float):
+    base=build_v410_current_results(commission_rate,slippage_rate)
+    windows=build_v34_windows(); period_bundles={"前5年":{},"現5年":{}}
+    for period_name in ["前5年","現5年"]:
+        eval_start,eval_end=windows[period_name]
+        for ticker in ["GOOG","NVDA"]:
+            prepared=prepare_data_fixed_window(ticker,eval_start,eval_end,V34_WARMUP_CALENDAR_DAYS)
+            period_bundles[period_name][ticker]=build_v30_ticker_bundle(ticker,prepared,commission_rate,slippage_rate)
+    events=_v39_event_results(period_bundles)
+    event_diff=build_v42_event_difference_bootstrap(events)
+    year_diff=build_v42_year_difference_bootstrap(events)
+    rolling3=build_v42_rolling3(events)
+    rolling5=build_v42_rolling5(events)
+    audit=build_v42_audit(events,event_diff,year_diff,rolling3,rolling5)
+    return base+(event_diff,year_diff,rolling3,rolling5,audit)
