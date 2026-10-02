@@ -204,7 +204,7 @@ st.set_page_config(
 # 定数
 # ============================================================
 
-APP_VERSION = "3.8.0"
+APP_VERSION = "3.9.0"
 
 BB_PERIOD = 20
 BB_STD = 2.0
@@ -7489,3 +7489,117 @@ def build_v380_current_results(commission_rate: float, slippage_rate: float):
             env_summary, outcome_env, env_difference, v36_audit,
             state_summary, outcome_state, state_difference, v37_audit,
             v38_qdist, v38_repro, v38_combo, v38_audit)
+
+# ============================================================
+# v3.9.0 ウォークフォワード再現性検証
+# 売買条件は固定したまま、時間を1年ずつ前へ進めて20日2R Net Rの再現性を確認する。
+# 各テスト年の判定に未来年は使わない。過去累積は比較基準としてのみ表示する。
+# ============================================================
+
+def _v39_event_results(period_bundles: dict) -> pd.DataFrame:
+    parts=[]
+    for period in ["前5年","現5年"]:
+        for ticker in ["GOOG","NVDA"]:
+            b=period_bundles.get(period,{}).get(ticker)
+            if not b: continue
+            for prefix,label in [("Stop","下落停止"),("Rebound","反発開始")]:
+                sig=b.get("signal_valid",{}).get(prefix,pd.DataFrame()).copy()
+                out=b.get("net_sets",{}).get(prefix,pd.DataFrame()).copy()
+                if sig.empty or out.empty: continue
+                date_map=pd.Series(pd.to_datetime(sig.index).values,index=pd.to_numeric(sig["BB_Event_ID"],errors="coerce"))
+                out=out[pd.to_numeric(out["Horizon"],errors="coerce").eq(20)].copy()
+                out["Signal_Date"]=pd.to_numeric(out["BB_Event_ID"],errors="coerce").map(date_map)
+                out["期間"]=period; out["銘柄"]=ticker; out["シグナル"]=label
+                parts.append(out)
+    return pd.concat(parts,ignore_index=True) if parts else pd.DataFrame()
+
+
+def _v39_test_year(d):
+    d=pd.Timestamp(d)
+    # 固定研究窓の年度: 10/1～翌9/30
+    y=d.year if d.month>=10 else d.year-1
+    return f"{y}-{y+1}"
+
+
+def build_v39_yearly_summary(events: pd.DataFrame) -> pd.DataFrame:
+    rows=[]
+    if events is None or events.empty:return pd.DataFrame()
+    e=events.copy(); e["Signal_Date"]=pd.to_datetime(e["Signal_Date"],errors="coerce"); e=e[e["Signal_Date"].notna()].copy()
+    e["テスト年"]=e["Signal_Date"].map(_v39_test_year)
+    for ticker in ["GOOG","NVDA"]:
+      for signal in ["下落停止","反発開始"]:
+        p=e[(e["銘柄"]==ticker)&(e["シグナル"]==signal)].copy()
+        for yr in sorted(p["テスト年"].dropna().unique()):
+            z=p[p["テスト年"]==yr].copy(); valid=z[z["Net_R_Valid"].eq(True)].copy() if "Net_R_Valid" in z else pd.DataFrame()
+            nr=pd.to_numeric(valid.get("Net_Realized_R"),errors="coerce").dropna()
+            resolved=z[z["Outcome"].isin(["Target先着","Stop先着"])]
+            nt=int(resolved["Outcome"].eq("Target先着").sum()); ns=int(resolved["Outcome"].eq("Stop先着").sum()); nres=nt+ns
+            rows.append({"テスト年":yr,"銘柄":ticker,"シグナル":signal,"20日イベント":len(z),"Net_R計算可能":len(nr),
+                         "Target先着":nt,"Stop先着":ns,"Target率_%":nt/nres*100 if nres else np.nan,
+                         "Net_R合計":nr.sum() if len(nr) else np.nan,"Net_R平均":nr.mean() if len(nr) else np.nan,
+                         "Net_R中央値":nr.median() if len(nr) else np.nan,"プラスR件数":int((nr>0).sum()),"マイナスR件数":int((nr<0).sum())})
+    return pd.DataFrame(rows)
+
+
+def build_v39_expanding_comparison(events: pd.DataFrame) -> pd.DataFrame:
+    rows=[]
+    if events is None or events.empty:return pd.DataFrame()
+    e=events.copy(); e["Signal_Date"]=pd.to_datetime(e["Signal_Date"],errors="coerce"); e=e[e["Signal_Date"].notna()].copy(); e["テスト年"]=e["Signal_Date"].map(_v39_test_year)
+    for ticker in ["GOOG","NVDA"]:
+      for signal in ["下落停止","反発開始"]:
+        p=e[(e["銘柄"]==ticker)&(e["シグナル"]==signal)].sort_values("Signal_Date")
+        years=sorted(p["テスト年"].unique())
+        for i,yr in enumerate(years):
+            if i<2: continue  # 最低2年度を過去参照として確保
+            test=p[p["テスト年"]==yr]; cutoff=test["Signal_Date"].min(); train=p[p["Signal_Date"]<cutoff]
+            tr=train[train["Net_R_Valid"].eq(True)]; te=test[test["Net_R_Valid"].eq(True)]
+            trr=pd.to_numeric(tr["Net_Realized_R"],errors="coerce").dropna(); ter=pd.to_numeric(te["Net_Realized_R"],errors="coerce").dropna()
+            rows.append({"テスト年":yr,"銘柄":ticker,"シグナル":signal,"過去累積イベント":len(train),"過去累積Net_R件数":len(trr),
+                         "過去累積Net_R平均":trr.mean() if len(trr) else np.nan,"過去累積Net_R中央値":trr.median() if len(trr) else np.nan,
+                         "次1年イベント":len(test),"次1年Net_R件数":len(ter),"次1年Net_R平均":ter.mean() if len(ter) else np.nan,
+                         "次1年Net_R中央値":ter.median() if len(ter) else np.nan,
+                         "平均R方向一致":"OK" if len(trr) and len(ter) and np.sign(trr.mean())==np.sign(ter.mean()) else "不一致"})
+    return pd.DataFrame(rows)
+
+
+def build_v39_consistency(expanding: pd.DataFrame) -> pd.DataFrame:
+    rows=[]
+    if expanding is None or expanding.empty:return pd.DataFrame()
+    for ticker in ["GOOG","NVDA"]:
+      for signal in ["下落停止","反発開始"]:
+        p=expanding[(expanding["銘柄"]==ticker)&(expanding["シグナル"]==signal)].copy()
+        vals=pd.to_numeric(p["次1年Net_R平均"],errors="coerce").dropna()
+        rows.append({"銘柄":ticker,"シグナル":signal,"検証年数":len(vals),"次1年平均Rプラス年":int((vals>0).sum()),"次1年平均Rマイナス年":int((vals<0).sum()),
+                     "プラス年率_%":((vals>0).mean()*100 if len(vals) else np.nan),"次1年平均Rの中央値":vals.median() if len(vals) else np.nan,
+                     "過去→次年_平均R方向一致年":int(p["平均R方向一致"].eq("OK").sum()),"方向一致率_%":p["平均R方向一致"].eq("OK").mean()*100 if len(p) else np.nan})
+    return pd.DataFrame(rows)
+
+
+def build_v39_audit(events: pd.DataFrame, yearly: pd.DataFrame) -> pd.DataFrame:
+    rows=[]
+    if events is None or events.empty:return pd.DataFrame()
+    for ticker in ["GOOG","NVDA"]:
+      for signal in ["下落停止","反発開始"]:
+        p=events[(events["銘柄"]==ticker)&(events["シグナル"]==signal)].copy(); y=yearly[(yearly["銘柄"]==ticker)&(yearly["シグナル"]==signal)]
+        unique=p[["期間","BB_Event_ID"]].drop_duplicates().shape[0]
+        rows.append({"銘柄":ticker,"シグナル":signal,"結合イベント":len(p),"ユニークイベントID":int(unique),"Signal_Date計算可能":int(pd.to_datetime(p["Signal_Date"],errors="coerce").notna().sum()),
+                     "年別イベント合計":int(pd.to_numeric(y["20日イベント"],errors="coerce").sum()) if not y.empty else 0,
+                     "テスト年度数":int(y["テスト年"].nunique()) if not y.empty else 0,
+                     "母集団一致":"OK" if len(p)==unique==int(pd.to_numeric(y["20日イベント"],errors="coerce").sum()) else "要確認"})
+    return pd.DataFrame(rows)
+
+@st.cache_data(persist="disk", show_spinner=False)
+def build_v390_current_results(commission_rate: float, slippage_rate: float):
+    base=build_v380_current_results(commission_rate,slippage_rate)
+    windows=build_v34_windows(); period_bundles={"前5年":{},"現5年":{}}
+    for period_name in ["前5年","現5年"]:
+        eval_start,eval_end=windows[period_name]
+        for ticker in ["GOOG","NVDA"]:
+            prepared=prepare_data_fixed_window(ticker,eval_start,eval_end,V34_WARMUP_CALENDAR_DAYS)
+            period_bundles[period_name][ticker]=build_v30_ticker_bundle(ticker,prepared,commission_rate,slippage_rate)
+    events=_v39_event_results(period_bundles)
+    yearly=build_v39_yearly_summary(events)
+    expanding=build_v39_expanding_comparison(events)
+    consistency=build_v39_consistency(expanding)
+    audit=build_v39_audit(events,yearly)
+    return base+(yearly,expanding,consistency,audit)
