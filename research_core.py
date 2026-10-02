@@ -2,7 +2,7 @@
 # GOOG / NVDA
 # Bollinger Band Lower-Band Research Program
 #
-# Version : 4.0.0
+# Version : 4.1.0
 #
 # v1.4まで
 # ・BB下限イベント
@@ -204,7 +204,7 @@ st.set_page_config(
 # 定数
 # ============================================================
 
-APP_VERSION = "4.0.0"
+APP_VERSION = "4.1.0"
 
 BB_PERIOD = 20
 BB_STD = 2.0
@@ -7750,3 +7750,189 @@ def build_v400_current_results(commission_rate: float, slippage_rate: float):
     yearly_robust=build_v40_yearly_robustness(events)
     audit=build_v40_audit(events,sensitivity,period_robust)
     return base+(structure,sensitivity,period_robust,yearly_robust,audit)
+
+
+# ============================================================
+# v4.1.0 統計的不確実性・再標本化診断
+# 売買条件は変更しない。
+# v4.0までと同じ20日・2R・Net Rを使い、
+# 1) イベント単位bootstrap
+# 2) 前5年 / 現5年のイベント単位bootstrap
+# 3) 年単位cluster bootstrap
+# 4) Leave-One-Year-Out
+# で、平均Net Rの不確実性と年依存性を診断する。
+# ============================================================
+
+V41_BOOTSTRAP_ITERATIONS = 10000
+V41_EVENT_BOOTSTRAP_SEED = 4102026
+V41_YEAR_BOOTSTRAP_SEED = 4103026
+
+
+def _v41_bootstrap_mean(r, iterations=V41_BOOTSTRAP_ITERATIONS, seed=V41_EVENT_BOOTSTRAP_SEED):
+    arr=pd.to_numeric(pd.Series(r),errors="coerce").dropna().to_numpy(dtype=float)
+    n=len(arr)
+    if n == 0:
+        return {"件数":0,"観測平均R":np.nan,"Bootstrap平均R中央値":np.nan,
+                "Bootstrap平均R_2.5%":np.nan,"Bootstrap平均R_97.5%":np.nan,
+                "平均Rプラス割合_%":np.nan,"平均Rゼロ以下割合_%":np.nan,
+                "Bootstrap標準誤差":np.nan}
+    rng=np.random.default_rng(seed)
+    # 77件×10,000回程度なので一括生成しても軽量。
+    idx=rng.integers(0,n,size=(int(iterations),n))
+    means=arr[idx].mean(axis=1)
+    return {
+        "件数":int(n),
+        "観測平均R":float(arr.mean()),
+        "Bootstrap平均R中央値":float(np.median(means)),
+        "Bootstrap平均R_2.5%":float(np.percentile(means,2.5)),
+        "Bootstrap平均R_97.5%":float(np.percentile(means,97.5)),
+        "平均Rプラス割合_%":float((means>0).mean()*100.0),
+        "平均Rゼロ以下割合_%":float((means<=0).mean()*100.0),
+        "Bootstrap標準誤差":float(np.std(means,ddof=1)),
+    }
+
+
+def build_v41_event_bootstrap(events: pd.DataFrame) -> pd.DataFrame:
+    x=_v40_valid_r(events); rows=[]
+    for ti,ticker in enumerate(["GOOG","NVDA"]):
+        for si,signal in enumerate(["下落停止","反発開始"]):
+            z=x[(x["銘柄"]==ticker)&(x["シグナル"]==signal)].copy()
+            seed=V41_EVENT_BOOTSTRAP_SEED + ti*100 + si*10
+            rows.append({"銘柄":ticker,"シグナル":signal,"反復回数":V41_BOOTSTRAP_ITERATIONS,
+                         **_v41_bootstrap_mean(z["Net_R"],V41_BOOTSTRAP_ITERATIONS,seed)})
+    return pd.DataFrame(rows)
+
+
+def build_v41_period_bootstrap(events: pd.DataFrame) -> pd.DataFrame:
+    x=_v40_valid_r(events); rows=[]
+    for pi,period in enumerate(["前5年","現5年"]):
+        for ti,ticker in enumerate(["GOOG","NVDA"]):
+            for si,signal in enumerate(["下落停止","反発開始"]):
+                z=x[(x["期間"]==period)&(x["銘柄"]==ticker)&(x["シグナル"]==signal)].copy()
+                seed=V41_EVENT_BOOTSTRAP_SEED + 1000 + pi*500 + ti*100 + si*10
+                rows.append({"期間":period,"銘柄":ticker,"シグナル":signal,"反復回数":V41_BOOTSTRAP_ITERATIONS,
+                             **_v41_bootstrap_mean(z["Net_R"],V41_BOOTSTRAP_ITERATIONS,seed)})
+    return pd.DataFrame(rows)
+
+
+def _v41_year_cluster_bootstrap(z: pd.DataFrame, iterations=V41_BOOTSTRAP_ITERATIONS, seed=V41_YEAR_BOOTSTRAP_SEED):
+    p=z.copy()
+    p=p[p["テスト年"].notna() & pd.to_numeric(p["Net_R"],errors="coerce").notna()].copy()
+    if p.empty:
+        return {"年数":0,"件数":0,"観測平均R":np.nan,"年Block平均R中央値":np.nan,
+                "年Block平均R_2.5%":np.nan,"年Block平均R_97.5%":np.nan,
+                "平均Rプラス割合_%":np.nan,"平均Rゼロ以下割合_%":np.nan}
+    g=p.groupby("テスト年",sort=True)["Net_R"].agg(["sum","count"])
+    sums=g["sum"].to_numpy(dtype=float); counts=g["count"].to_numpy(dtype=float)
+    ny=len(g)
+    rng=np.random.default_rng(seed)
+    idx=rng.integers(0,ny,size=(int(iterations),ny))
+    sampled_sum=sums[idx].sum(axis=1)
+    sampled_count=counts[idx].sum(axis=1)
+    means=np.divide(sampled_sum,sampled_count,out=np.full_like(sampled_sum,np.nan,dtype=float),where=sampled_count>0)
+    means=means[np.isfinite(means)]
+    obs=pd.to_numeric(p["Net_R"],errors="coerce").dropna()
+    return {
+        "年数":int(ny),"件数":int(len(obs)),"観測平均R":float(obs.mean()),
+        "年Block平均R中央値":float(np.median(means)) if len(means) else np.nan,
+        "年Block平均R_2.5%":float(np.percentile(means,2.5)) if len(means) else np.nan,
+        "年Block平均R_97.5%":float(np.percentile(means,97.5)) if len(means) else np.nan,
+        "平均Rプラス割合_%":float((means>0).mean()*100.0) if len(means) else np.nan,
+        "平均Rゼロ以下割合_%":float((means<=0).mean()*100.0) if len(means) else np.nan,
+    }
+
+
+def build_v41_year_block_bootstrap(events: pd.DataFrame) -> pd.DataFrame:
+    x=_v40_valid_r(events); rows=[]
+    for ti,ticker in enumerate(["GOOG","NVDA"]):
+        for si,signal in enumerate(["下落停止","反発開始"]):
+            z=x[(x["銘柄"]==ticker)&(x["シグナル"]==signal)].copy()
+            seed=V41_YEAR_BOOTSTRAP_SEED + ti*100 + si*10
+            rows.append({"銘柄":ticker,"シグナル":signal,"反復回数":V41_BOOTSTRAP_ITERATIONS,
+                         **_v41_year_cluster_bootstrap(z,V41_BOOTSTRAP_ITERATIONS,seed)})
+    return pd.DataFrame(rows)
+
+
+def build_v41_leave_one_year_out(events: pd.DataFrame) -> pd.DataFrame:
+    x=_v40_valid_r(events); rows=[]
+    for ticker in ["GOOG","NVDA"]:
+        for signal in ["下落停止","反発開始"]:
+            p=x[(x["銘柄"]==ticker)&(x["シグナル"]==signal)&x["テスト年"].notna()].copy()
+            years=sorted(p["テスト年"].dropna().unique())
+            base=pd.to_numeric(p["Net_R"],errors="coerce").dropna()
+            for yr in years:
+                keep=p[p["テスト年"]!=yr].copy()
+                r=pd.to_numeric(keep["Net_R"],errors="coerce").dropna()
+                excluded=pd.to_numeric(p.loc[p["テスト年"]==yr,"Net_R"],errors="coerce").dropna()
+                rows.append({"銘柄":ticker,"シグナル":signal,"除外年":yr,
+                             "基準件数":len(base),"除外年件数":len(excluded),"残存件数":len(r),
+                             "基準平均R":base.mean() if len(base) else np.nan,
+                             "除外年合計R":excluded.sum() if len(excluded) else np.nan,
+                             "除外後合計R":r.sum() if len(r) else np.nan,
+                             "除外後平均R":r.mean() if len(r) else np.nan,
+                             "除外後中央値R":r.median() if len(r) else np.nan,
+                             "除外後平均Rプラス":"YES" if len(r) and r.mean()>0 else "NO"})
+    return pd.DataFrame(rows)
+
+
+def build_v41_loo_summary(loo: pd.DataFrame) -> pd.DataFrame:
+    rows=[]
+    if loo is None or loo.empty:
+        return pd.DataFrame()
+    for ticker in ["GOOG","NVDA"]:
+        for signal in ["下落停止","反発開始"]:
+            z=loo[(loo["銘柄"]==ticker)&(loo["シグナル"]==signal)].copy()
+            vals=pd.to_numeric(z["除外後平均R"],errors="coerce").dropna()
+            rows.append({"銘柄":ticker,"シグナル":signal,"除外テスト年数":len(z),
+                         "除外後平均Rプラス年数":int(z["除外後平均Rプラス"].eq("YES").sum()),
+                         "除外後平均Rプラス率_%":z["除外後平均Rプラス"].eq("YES").mean()*100.0 if len(z) else np.nan,
+                         "除外後平均R_最小":vals.min() if len(vals) else np.nan,
+                         "除外後平均R_中央値":vals.median() if len(vals) else np.nan,
+                         "除外後平均R_最大":vals.max() if len(vals) else np.nan})
+    return pd.DataFrame(rows)
+
+
+def build_v41_audit(events: pd.DataFrame, event_boot: pd.DataFrame, period_boot: pd.DataFrame,
+                    year_boot: pd.DataFrame, loo: pd.DataFrame) -> pd.DataFrame:
+    x=_v40_valid_r(events); rows=[]
+    for ticker in ["GOOG","NVDA"]:
+        for signal in ["下落停止","反発開始"]:
+            raw=events[(events["銘柄"]==ticker)&(events["シグナル"]==signal)].copy()
+            z=x[(x["銘柄"]==ticker)&(x["シグナル"]==signal)].copy()
+            unique=raw[["期間","BB_Event_ID"]].drop_duplicates().shape[0]
+            eb=event_boot[(event_boot["銘柄"]==ticker)&(event_boot["シグナル"]==signal)]
+            pb=period_boot[(period_boot["銘柄"]==ticker)&(period_boot["シグナル"]==signal)]
+            yb=year_boot[(year_boot["銘柄"]==ticker)&(year_boot["シグナル"]==signal)]
+            ly=loo[(loo["銘柄"]==ticker)&(loo["シグナル"]==signal)]
+            years=int(z["テスト年"].dropna().nunique())
+            checks=[len(raw)==unique, len(eb)==1 and int(eb.iloc[0]["件数"])==len(z),
+                    len(pb)==2 and int(pd.to_numeric(pb["件数"],errors="coerce").sum())==len(z),
+                    len(yb)==1 and int(yb.iloc[0]["件数"])==len(z) and int(yb.iloc[0]["年数"])==years,
+                    len(ly)==years]
+            rows.append({"銘柄":ticker,"シグナル":signal,"20日イベント":len(raw),
+                         "ユニークイベントID":int(unique),"Net_R計算可能":len(z),"テスト年度数":years,
+                         "イベントBootstrap件数":int(eb.iloc[0]["件数"]) if len(eb)==1 else np.nan,
+                         "前5年+現5年Bootstrap件数":int(pd.to_numeric(pb["件数"],errors="coerce").sum()) if not pb.empty else 0,
+                         "年Block年度数":int(yb.iloc[0]["年数"]) if len(yb)==1 else np.nan,
+                         "LOO除外年数":len(ly),"Bootstrap反復回数":V41_BOOTSTRAP_ITERATIONS,
+                         "母集団一致":"OK" if all(checks) else "要確認"})
+    return pd.DataFrame(rows)
+
+
+@st.cache_data(persist="disk", show_spinner=False)
+def build_v410_current_results(commission_rate: float, slippage_rate: float):
+    base=build_v400_current_results(commission_rate,slippage_rate)
+    windows=build_v34_windows(); period_bundles={"前5年":{},"現5年":{}}
+    for period_name in ["前5年","現5年"]:
+        eval_start,eval_end=windows[period_name]
+        for ticker in ["GOOG","NVDA"]:
+            prepared=prepare_data_fixed_window(ticker,eval_start,eval_end,V34_WARMUP_CALENDAR_DAYS)
+            period_bundles[period_name][ticker]=build_v30_ticker_bundle(ticker,prepared,commission_rate,slippage_rate)
+    events=_v39_event_results(period_bundles)
+    event_boot=build_v41_event_bootstrap(events)
+    period_boot=build_v41_period_bootstrap(events)
+    year_boot=build_v41_year_block_bootstrap(events)
+    loo=build_v41_leave_one_year_out(events)
+    loo_summary=build_v41_loo_summary(loo)
+    audit=build_v41_audit(events,event_boot,period_boot,year_boot,loo)
+    return base+(event_boot,period_boot,year_boot,loo,loo_summary,audit)
