@@ -2,7 +2,7 @@
 # GOOG / NVDA
 # Bollinger Band Lower-Band Research Program
 #
-# Version : 3.8.0
+# Version : 4.0.0
 #
 # v1.4まで
 # ・BB下限イベント
@@ -204,7 +204,7 @@ st.set_page_config(
 # 定数
 # ============================================================
 
-APP_VERSION = "3.9.0"
+APP_VERSION = "4.0.0"
 
 BB_PERIOD = 20
 BB_STD = 2.0
@@ -7603,3 +7603,150 @@ def build_v390_current_results(commission_rate: float, slippage_rate: float):
     consistency=build_v39_consistency(expanding)
     audit=build_v39_audit(events,yearly)
     return base+(yearly,expanding,consistency,audit)
+
+
+# ============================================================
+# v4.0.0 利益の頑健性・少数大勝ち依存診断
+# 売買条件は変更しない。
+# v3.9と同じ20日・2R・Net Rを使い、利益が少数の大勝ちイベントへ
+# どの程度集中しているかを診断する。
+# ============================================================
+
+def _v40_valid_r(events: pd.DataFrame) -> pd.DataFrame:
+    if events is None or events.empty:
+        return pd.DataFrame()
+    x=events.copy()
+    if "Net_R_Valid" in x.columns:
+        x=x[x["Net_R_Valid"].eq(True)].copy()
+    x["Net_R"]=pd.to_numeric(x.get("Net_Realized_R"),errors="coerce")
+    x=x[x["Net_R"].notna()].copy()
+    x["Signal_Date"]=pd.to_datetime(x.get("Signal_Date"),errors="coerce")
+    x["テスト年"]=x["Signal_Date"].map(_v39_test_year)
+    return x
+
+
+def _v40_stats(z: pd.DataFrame) -> dict:
+    r=pd.to_numeric(z.get("Net_R"),errors="coerce").dropna()
+    pos=r[r>0]; neg=r[r<0]
+    gross_profit=float(pos.sum()) if len(pos) else 0.0
+    gross_loss=float(-neg.sum()) if len(neg) else 0.0
+    payoff=(float(pos.mean())/abs(float(neg.mean()))) if len(pos) and len(neg) and float(neg.mean())!=0 else np.nan
+    pf=(gross_profit/gross_loss) if gross_loss>0 else (np.inf if gross_profit>0 else np.nan)
+    desc=r.sort_values(ascending=False)
+    top1=float(desc.iloc[:1].sum()) if len(desc) else 0.0
+    top3=float(desc.iloc[:min(3,len(desc))].sum()) if len(desc) else 0.0
+    k10=max(1,int(np.ceil(len(desc)*0.10))) if len(desc) else 0
+    top10=float(desc.iloc[:k10].sum()) if k10 else 0.0
+    return {
+        "Net_R件数":int(len(r)),"Net_R合計":float(r.sum()) if len(r) else np.nan,
+        "Net_R平均":float(r.mean()) if len(r) else np.nan,"Net_R中央値":float(r.median()) if len(r) else np.nan,
+        "プラスR件数":int((r>0).sum()),"マイナスR件数":int((r<0).sum()),"ゼロR件数":int((r==0).sum()),
+        "勝ち平均R":float(pos.mean()) if len(pos) else np.nan,"負け平均R":float(neg.mean()) if len(neg) else np.nan,
+        "Payoff比":payoff,"Profit_Factor":pf,
+        "Gross_Profit_R":gross_profit,"Gross_Loss_R":gross_loss,
+        "最大利益R":float(r.max()) if len(r) else np.nan,"最大損失R":float(r.min()) if len(r) else np.nan,
+        "上位10%件数":k10,
+        "最大1件_総利益寄与_%":top1/gross_profit*100.0 if gross_profit>0 else np.nan,
+        "上位3件_総利益寄与_%":top3/gross_profit*100.0 if gross_profit>0 else np.nan,
+        "上位10%_総利益寄与_%":top10/gross_profit*100.0 if gross_profit>0 else np.nan,
+    }
+
+
+def build_v40_profit_structure(events: pd.DataFrame) -> pd.DataFrame:
+    x=_v40_valid_r(events); rows=[]
+    for ticker in ["GOOG","NVDA"]:
+        for signal in ["下落停止","反発開始"]:
+            z=x[(x["銘柄"]==ticker)&(x["シグナル"]==signal)].copy()
+            rows.append({"銘柄":ticker,"シグナル":signal,**_v40_stats(z)})
+    return pd.DataFrame(rows)
+
+
+def build_v40_removal_sensitivity(events: pd.DataFrame) -> pd.DataFrame:
+    x=_v40_valid_r(events); rows=[]
+    for ticker in ["GOOG","NVDA"]:
+        for signal in ["下落停止","反発開始"]:
+            z=x[(x["銘柄"]==ticker)&(x["シグナル"]==signal)].copy().sort_values("Net_R",ascending=False)
+            n=len(z); k10=max(1,int(np.ceil(n*0.10))) if n else 0
+            cases=[("基準・除外なし",0),("最大利益1件を除外",min(1,n)),("利益上位3件を除外",min(3,n)),("利益上位10%を除外",min(k10,n))]
+            base_total=float(z["Net_R"].sum()) if n else np.nan
+            for label,k in cases:
+                keep=z.iloc[k:].copy() if k else z.copy()
+                r=pd.to_numeric(keep["Net_R"],errors="coerce").dropna()
+                rows.append({"銘柄":ticker,"シグナル":signal,"診断":label,"除外件数":k,"残存件数":len(r),
+                             "Net_R合計":r.sum() if len(r) else np.nan,"Net_R平均":r.mean() if len(r) else np.nan,
+                             "Net_R中央値":r.median() if len(r) else np.nan,"プラスR件数":int((r>0).sum()),"マイナスR件数":int((r<0).sum()),
+                             "基準合計Rとの差":(r.sum()-base_total) if len(r) and pd.notna(base_total) else np.nan})
+    return pd.DataFrame(rows)
+
+
+def build_v40_period_robustness(events: pd.DataFrame) -> pd.DataFrame:
+    x=_v40_valid_r(events); rows=[]
+    for period in ["前5年","現5年"]:
+        for ticker in ["GOOG","NVDA"]:
+            for signal in ["下落停止","反発開始"]:
+                z=x[(x["期間"]==period)&(x["銘柄"]==ticker)&(x["シグナル"]==signal)].copy().sort_values("Net_R",ascending=False)
+                n=len(z); k10=max(1,int(np.ceil(n*0.10))) if n else 0
+                base=_v40_stats(z)
+                r1=z.iloc[min(1,n):]["Net_R"] if n else pd.Series(dtype=float)
+                r3=z.iloc[min(3,n):]["Net_R"] if n else pd.Series(dtype=float)
+                r10=z.iloc[min(k10,n):]["Net_R"] if n else pd.Series(dtype=float)
+                rows.append({"期間":period,"銘柄":ticker,"シグナル":signal,"Net_R件数":n,
+                             "基準合計R":base["Net_R合計"],"基準平均R":base["Net_R平均"],"基準中央値R":base["Net_R中央値"],
+                             "最大1件除外_合計R":r1.sum() if len(r1) else np.nan,"最大1件除外_平均R":r1.mean() if len(r1) else np.nan,
+                             "上位3件除外_合計R":r3.sum() if len(r3) else np.nan,"上位3件除外_平均R":r3.mean() if len(r3) else np.nan,
+                             "上位10%除外件数":k10,"上位10%除外_合計R":r10.sum() if len(r10) else np.nan,"上位10%除外_平均R":r10.mean() if len(r10) else np.nan,
+                             "最大1件_総利益寄与_%":base["最大1件_総利益寄与_%"],"上位3件_総利益寄与_%":base["上位3件_総利益寄与_%"],
+                             "上位10%_総利益寄与_%":base["上位10%_総利益寄与_%"]})
+    return pd.DataFrame(rows)
+
+
+def build_v40_yearly_robustness(events: pd.DataFrame) -> pd.DataFrame:
+    x=_v40_valid_r(events); rows=[]
+    for ticker in ["GOOG","NVDA"]:
+        for signal in ["下落停止","反発開始"]:
+            p=x[(x["銘柄"]==ticker)&(x["シグナル"]==signal)].copy()
+            for yr in sorted(p["テスト年"].dropna().unique()):
+                z=p[p["テスト年"]==yr].sort_values("Net_R",ascending=False).copy(); n=len(z)
+                r=z["Net_R"]; r1=z.iloc[min(1,n):]["Net_R"] if n else pd.Series(dtype=float)
+                rows.append({"テスト年":yr,"銘柄":ticker,"シグナル":signal,"Net_R件数":n,
+                             "基準合計R":r.sum() if n else np.nan,"基準平均R":r.mean() if n else np.nan,"基準中央値R":r.median() if n else np.nan,
+                             "最大利益R":r.max() if n else np.nan,"最大1件除外_合計R":r1.sum() if len(r1) else np.nan,
+                             "最大1件除外_平均R":r1.mean() if len(r1) else np.nan,
+                             "最大1件除外後も合計プラス":"YES" if len(r1) and r1.sum()>0 else "NO"})
+    return pd.DataFrame(rows)
+
+
+def build_v40_audit(events: pd.DataFrame, sensitivity: pd.DataFrame, period_robust: pd.DataFrame) -> pd.DataFrame:
+    rows=[]
+    x=_v40_valid_r(events)
+    for ticker in ["GOOG","NVDA"]:
+        for signal in ["下落停止","反発開始"]:
+            raw=events[(events["銘柄"]==ticker)&(events["シグナル"]==signal)].copy()
+            z=x[(x["銘柄"]==ticker)&(x["シグナル"]==signal)].copy()
+            unique=raw[["期間","BB_Event_ID"]].drop_duplicates().shape[0]
+            base=sensitivity[(sensitivity["銘柄"]==ticker)&(sensitivity["シグナル"]==signal)&(sensitivity["診断"]=="基準・除外なし")]
+            pr=period_robust[(period_robust["銘柄"]==ticker)&(period_robust["シグナル"]==signal)]
+            sign_count=int((z["Net_R"]>0).sum()+(z["Net_R"]<0).sum()+(z["Net_R"]==0).sum())
+            checks=[len(raw)==unique, sign_count==len(z), len(base)==1 and int(base.iloc[0]["残存件数"])==len(z), int(pr["Net_R件数"].sum())==len(z)]
+            rows.append({"銘柄":ticker,"シグナル":signal,"20日イベント":len(raw),"ユニークイベントID":int(unique),
+                         "Net_R計算可能":len(z),"符号件数合計":sign_count,"感度分析基準件数":int(base.iloc[0]["残存件数"]) if len(base)==1 else np.nan,
+                         "前5年+現5年件数":int(pr["Net_R件数"].sum()) if not pr.empty else 0,"母集団一致":"OK" if all(checks) else "要確認"})
+    return pd.DataFrame(rows)
+
+
+@st.cache_data(persist="disk", show_spinner=False)
+def build_v400_current_results(commission_rate: float, slippage_rate: float):
+    base=build_v390_current_results(commission_rate,slippage_rate)
+    windows=build_v34_windows(); period_bundles={"前5年":{},"現5年":{}}
+    for period_name in ["前5年","現5年"]:
+        eval_start,eval_end=windows[period_name]
+        for ticker in ["GOOG","NVDA"]:
+            prepared=prepare_data_fixed_window(ticker,eval_start,eval_end,V34_WARMUP_CALENDAR_DAYS)
+            period_bundles[period_name][ticker]=build_v30_ticker_bundle(ticker,prepared,commission_rate,slippage_rate)
+    events=_v39_event_results(period_bundles)
+    structure=build_v40_profit_structure(events)
+    sensitivity=build_v40_removal_sensitivity(events)
+    period_robust=build_v40_period_robustness(events)
+    yearly_robust=build_v40_yearly_robustness(events)
+    audit=build_v40_audit(events,sensitivity,period_robust)
+    return base+(structure,sensitivity,period_robust,yearly_robust,audit)

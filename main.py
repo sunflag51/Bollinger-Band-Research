@@ -1,24 +1,25 @@
 import streamlit as st
-from research_core import APP_VERSION, V34_WARMUP_CALENDAR_DAYS, build_v390_current_results
+from research_core import APP_VERSION, V34_WARMUP_CALENDAR_DAYS, build_v400_current_results
 
 st.set_page_config(page_title="GOOG・NVDA BB研究", page_icon="📊", layout="wide")
 st.title("📊 GOOG・NVDA BB下限研究")
-st.caption(f"Version {APP_VERSION} ｜ v3.9.0 ウォークフォワード再現性検証")
-st.info("v3.9.0では売買条件を変更しません。固定ルールの20日・2R結果を1年度ずつ時間方向へ進め、過去累積の結果が次の1年でも再現するかを確認します。")
-st.write("【固定全期間】2016-10-01～2026-09-30 ｜ 研究年度=10月1日～翌9月30日")
-st.write("【重要】各テスト年より未来の結果は、そのテスト年の比較基準に使用しません。新しい売買フィルターやAIはまだ導入しません。")
+st.caption(f"Version {APP_VERSION} ｜ v4.0.0 利益の頑健性・少数大勝ち依存診断")
+st.info("v4.0.0では売買条件を変更しません。v3.9と同じ20日・2R・Net Rを使い、利益が少数の大勝ちイベントにどの程度依存しているかを診断します。")
+st.write("【固定全期間】2016-10-01～2026-09-30 ｜ 前5年/現5年の固定窓も維持")
+st.write("【重要】最大利益1件・上位3件・利益上位10%を仮に除いた感度分析は、売買フィルターではありません。戦略の頑健性を調べる診断だけです。")
 
 st.subheader("研究用コスト設定")
 c1,c2=st.columns(2)
-with c1: cp=st.number_input("売買手数料率（片道・%）",0.0,5.0,0.10,0.01,format="%.2f",key="v390_commission")
-with c2: sp=st.number_input("スリッページ率（片道・%）",0.0,5.0,0.10,0.01,format="%.2f",key="v390_slippage")
+with c1: cp=st.number_input("売買手数料率（片道・%）",0.0,5.0,0.10,0.01,format="%.2f",key="v400_commission")
+with c2: sp=st.number_input("スリッページ率（片道・%）",0.0,5.0,0.10,0.01,format="%.2f",key="v400_slippage")
 
-with st.spinner("固定10年結果とv3.9ウォークフォワード診断を読み込んでいます。初回だけ時間がかかります..."):
-    results=build_v390_current_results(cp/100.0,sp/100.0)
+with st.spinner("固定10年結果とv4.0頑健性診断を読み込んでいます。初回だけ時間がかかります..."):
+    results=build_v400_current_results(cp/100.0,sp/100.0)
     (windows,v34_audit,v34_net,v34_diff,v34_rec,v35_exit,v35_path,v35_risk,v35_diff,v35_audit,
      v36_env,v36_outcome,v36_diff,v36_audit,v37_state,v37_outcome,v37_diff,v37_audit,
-     v38_qdist,v38_repro,v38_combo,v38_audit,v39_yearly,v39_expanding,v39_consistency,v39_audit)=results
-st.success("v3.9.0 ウォークフォワード再現性検証の読み込み完了")
+     v38_qdist,v38_repro,v38_combo,v38_audit,v39_yearly,v39_expanding,v39_consistency,v39_audit,
+     v40_structure,v40_sensitivity,v40_period,v40_yearly,v40_audit)=results
+st.success("v4.0.0 利益の頑健性・少数大勝ち依存診断の読み込み完了")
 st.caption(f"前5年: {windows['前5年'][0].date()} ～ {windows['前5年'][1].date()} ｜ 現5年: {windows['現5年'][0].date()} ～ {windows['現5年'][1].date()} ｜ ウォームアップ: {V34_WARMUP_CALENDAR_DAYS}暦日")
 
 def copy_text(title,frame,float_format=None):
@@ -32,9 +33,16 @@ def show(num,title,df,expanded=False,ff="%.4f"):
         st.dataframe(df.round(4) if df is not None else df,use_container_width=True,hide_index=True)
         st.code(copy_text(f"{num} {title}",df,float_format=ff),language=None)
 
-st.subheader("📋 v3.9 結果・コピー欄")
-st.caption("番号選択ボタンはありません。最初は155番の監査を確認します。")
-show(155,"v3.9 ウォークフォワード・母集団監査",v39_audit,True,None)
+st.subheader("📋 v4.0 結果・コピー欄")
+st.caption("番号選択ボタンはありません。最初は160番の監査を確認します。")
+show(160,"v4.0 利益頑健性・母集団監査",v40_audit,True,None)
+show(156,"v4.0 固定10年・利益構造と集中度",v40_structure)
+show(157,"v4.0 大勝ちイベント除外・感度分析",v40_sensitivity)
+show(158,"v4.0 前5年 vs 現5年・大勝ち依存比較",v40_period)
+show(159,"v4.0 1年ごと・最大利益1件除外診断",v40_yearly)
+
+st.divider();st.subheader("📚 v3.9 ウォークフォワード・保存結果")
+show(155,"v3.9 ウォークフォワード・母集団監査",v39_audit,False,None)
 show(152,"v3.9 1年ごと・固定ルール20日2R結果",v39_yearly)
 show(153,"v3.9 過去累積→次1年・再現性比較",v39_expanding)
 show(154,"v3.9 次1年・方向安定性サマリー",v39_consistency)
@@ -70,8 +78,9 @@ show(130,"v3.4.1 固定5年窓・監査サマリー",v34_audit,False,None)
 show(131,"v3.4.1 前5年 vs 現5年・2Rコスト後Net R比較",v34_net)
 show(132,"v3.4.1 20日保有・2R・前5年→現5年差",v34_diff)
 
-st.divider();st.subheader("v3.9.0の研究上の扱い")
-st.write("【検証中】固定した現在の売買ルールが、1年単位で時間を前へ進めても同じ方向のNet Rを示すか確認します。")
-st.write("【重要】153番の『過去累積』は、そのテスト年より前だけを使用します。未来年を混ぜません。")
-st.write("【未採用】年ごとの結果を見てルールを変更すること。特定年だけを除外すること。AI導入。")
-st.warning("1年ごとのイベント件数は小さくなります。単年の大きなプラス・マイナスだけで判断せず、複数年の方向と安定性を確認します。")
+st.divider();st.subheader("v4.0.0の研究上の扱い")
+st.write("【検証中】固定ルールのプラス期待値が、少数の大勝ちイベントを除いても残るか確認します。")
+st.write("【重要】Profit Factor = プラスR合計 ÷ マイナスR絶対値合計。Payoff比 = 勝ち平均R ÷ 負け平均R絶対値です。")
+st.write("【重要】上位イベント除外は仮想的なストレステストです。実際に大勝ちを見分けて除外する売買ルールではありません。")
+st.write("【未採用】大勝ちイベント除外、利益上位10%除外、新しいEntry条件、AI導入。")
+st.warning("イベント数が少ないグループでは上位1～3件の影響が大きく見えます。156～159番を組み合わせ、全期間・前後5年・年別の3段階で確認します。")
