@@ -204,7 +204,7 @@ st.set_page_config(
 # 定数
 # ============================================================
 
-APP_VERSION = "3.4.3"
+APP_VERSION = "3.5.0"
 
 BB_PERIOD = 20
 BB_STD = 2.0
@@ -6684,3 +6684,312 @@ def build_v343_current_results(
 
     # main.py へは必要な小さい結果だけ返す。
     return windows, audit, net_summary, difference_20d, reconciliation
+
+# ============================================================
+# v3.5.0
+# 前5年 vs 現5年・20日価格経路 / 決済構造の原因分解
+#
+# 目的:
+# ・v3.4.1で確認した前5年→現5年の成績悪化について、売買条件を変更せず原因を分解する。
+# ・20日2Rの Target先着 / Stop先着 / 期間内未到達 の比率を比較する。
+# ・固定20営業日の MFE / MAE / 20日終値R を比較する。
+# ・計画時点1R率の分布を比較する。
+# ・ここでは新しいフィルター、Stop幅変更、銘柄専用条件を採用しない。
+# ============================================================
+
+
+def build_v35_exit_structure(period_bundles: dict) -> pd.DataFrame:
+    """20日・2Rの先着/未到達構造を、前5年と現5年で同じ定義のまま集計する。"""
+    rows = []
+    for period_name in ["前5年", "現5年"]:
+        for ticker_symbol in ["GOOG", "NVDA"]:
+            bundle = period_bundles.get(period_name, {}).get(ticker_symbol)
+            if not bundle:
+                continue
+            for prefix_name, signal_label in [("Stop", "下落停止"), ("Rebound", "反発開始")]:
+                results = bundle.get("net_sets", {}).get(prefix_name, pd.DataFrame())
+                if results is None or results.empty:
+                    continue
+                part = results[pd.to_numeric(results["Horizon"], errors="coerce").eq(20)].copy()
+                n = len(part)
+                outcome = part["Outcome"].fillna("").astype(str)
+                target_n = int(outcome.eq("Target先着").sum())
+                stop_n = int(outcome.eq("Stop先着").sum())
+                timeout_n = int(outcome.eq("期間内未到達").sum())
+                ambiguous_n = int(outcome.eq("同日両方到達・順序不明").sum())
+                insufficient_n = int(outcome.eq("将来データ不足").sum())
+                net_valid_n = int(part["Net_R_Valid"].eq(True).sum()) if "Net_R_Valid" in part.columns else 0
+                rows.append({
+                    "期間": period_name,
+                    "銘柄": ticker_symbol,
+                    "シグナル": signal_label,
+                    "20日対象": n,
+                    "Target先着": target_n,
+                    "Target先着_%": target_n / n * 100.0 if n else np.nan,
+                    "Stop先着": stop_n,
+                    "Stop先着_%": stop_n / n * 100.0 if n else np.nan,
+                    "期間内未到達": timeout_n,
+                    "期間内未到達_%": timeout_n / n * 100.0 if n else np.nan,
+                    "同日両方_順序不明": ambiguous_n,
+                    "将来データ不足": insufficient_n,
+                    "Net_R計算可能": net_valid_n,
+                })
+    return pd.DataFrame(rows)
+
+
+def build_v35_path_summary(period_bundles: dict, horizon: int = 20) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """固定20営業日の価格経路を最後まで観察し、MFE/MAEを期間別に集計する。"""
+    detail_parts = []
+    summary_rows = []
+    for period_name in ["前5年", "現5年"]:
+        bundles = period_bundles.get(period_name, {})
+        detail = build_v32_path_detail(bundles, horizon=horizon)
+        if detail is None or detail.empty:
+            continue
+        detail = detail.copy()
+        detail.insert(0, "期間", period_name)
+        detail_parts.append(detail)
+
+        for ticker_symbol in ["GOOG", "NVDA"]:
+            for signal_label in ["下落停止", "反発開始"]:
+                all_part = detail[
+                    detail["銘柄"].eq(ticker_symbol)
+                    & detail["シグナル"].eq(signal_label)
+                ].copy()
+                if all_part.empty:
+                    continue
+                part = all_part[all_part["20日観察完了"].eq(True)].copy()
+                n = len(part)
+                mfe = pd.to_numeric(part["MFE_R"], errors="coerce").dropna()
+                mae = pd.to_numeric(part["MAE_R"], errors="coerce").dropna()
+                close20 = pd.to_numeric(part["20日終値_R"], errors="coerce").dropna()
+                touch2 = int(part["2R到達"].eq(True).sum()) if n else 0
+                mae1 = int(part["MAE1R以上"].eq(True).sum()) if n else 0
+                summary_rows.append({
+                    "期間": period_name,
+                    "銘柄": ticker_symbol,
+                    "シグナル": signal_label,
+                    "R有効シグナル": len(all_part),
+                    "20日観察完了": n,
+                    "20日観察未完了": len(all_part) - n,
+                    "MFE平均R": float(mfe.mean()) if not mfe.empty else np.nan,
+                    "MFE中央値R": float(mfe.median()) if not mfe.empty else np.nan,
+                    "20日内2R到達": touch2,
+                    "20日内2R到達_%": touch2 / n * 100.0 if n else np.nan,
+                    "MAE平均R": float(mae.mean()) if not mae.empty else np.nan,
+                    "MAE中央値R": float(mae.median()) if not mae.empty else np.nan,
+                    "MAE1R以上": mae1,
+                    "MAE1R以上_%": mae1 / n * 100.0 if n else np.nan,
+                    "20日終値平均R": float(close20.mean()) if not close20.empty else np.nan,
+                    "20日終値中央値R": float(close20.median()) if not close20.empty else np.nan,
+                })
+
+    detail_all = pd.concat(detail_parts, ignore_index=True) if detail_parts else pd.DataFrame()
+    return detail_all, pd.DataFrame(summary_rows)
+
+
+def build_v35_risk_summary(period_bundles: dict) -> pd.DataFrame:
+    """Entry時点で固定された1R幅を、後の結果を使わず期間別に記述する。"""
+    rows = []
+    for period_name in ["前5年", "現5年"]:
+        for ticker_symbol in ["GOOG", "NVDA"]:
+            bundle = period_bundles.get(period_name, {}).get(ticker_symbol)
+            if not bundle:
+                continue
+            for prefix_name, signal_label in [("Stop", "下落停止"), ("Rebound", "反発開始")]:
+                signals = bundle.get("signal_valid", {}).get(prefix_name, pd.DataFrame())
+                if signals is None:
+                    signals = pd.DataFrame()
+                risk_col = f"{prefix_name}_Risk_1R_Percent"
+                if signals.empty or risk_col not in signals.columns:
+                    risk = pd.Series(dtype=float)
+                else:
+                    risk = pd.to_numeric(signals[risk_col], errors="coerce").dropna()
+                rows.append({
+                    "期間": period_name,
+                    "銘柄": ticker_symbol,
+                    "シグナル": signal_label,
+                    "R有効シグナル": len(signals),
+                    "1R率計算可能": len(risk),
+                    "1R率平均_%": float(risk.mean()) if not risk.empty else np.nan,
+                    "1R率中央値_%": float(risk.median()) if not risk.empty else np.nan,
+                    "1R率25%点_%": float(risk.quantile(0.25)) if not risk.empty else np.nan,
+                    "1R率75%点_%": float(risk.quantile(0.75)) if not risk.empty else np.nan,
+                    "1R率最小_%": float(risk.min()) if not risk.empty else np.nan,
+                    "1R率最大_%": float(risk.max()) if not risk.empty else np.nan,
+                    "1R率1%未満": int((risk < 1.0).sum()) if not risk.empty else 0,
+                    "1R率1%未満_%": float((risk < 1.0).mean() * 100.0) if not risk.empty else np.nan,
+                })
+    return pd.DataFrame(rows)
+
+
+def build_v35_period_difference(
+    exit_summary: pd.DataFrame,
+    path_summary: pd.DataFrame,
+    risk_summary: pd.DataFrame,
+) -> pd.DataFrame:
+    """原因分解の主要指標を4組に圧縮し、前5年→現5年の差を直接表示する。"""
+    rows = []
+    for ticker_symbol in ["GOOG", "NVDA"]:
+        for signal_label in ["下落停止", "反発開始"]:
+            def one(df, period):
+                g = df[
+                    df["期間"].eq(period)
+                    & df["銘柄"].eq(ticker_symbol)
+                    & df["シグナル"].eq(signal_label)
+                ]
+                return None if g.empty else g.iloc[0]
+
+            ep = one(exit_summary, "前5年")
+            ec = one(exit_summary, "現5年")
+            pp = one(path_summary, "前5年")
+            pc = one(path_summary, "現5年")
+            rp = one(risk_summary, "前5年")
+            rc = one(risk_summary, "現5年")
+            if any(x is None for x in [ep, ec, pp, pc, rp, rc]):
+                continue
+
+            def diff(current, prior, key):
+                a = pd.to_numeric(pd.Series([prior.get(key, np.nan)]), errors="coerce").iloc[0]
+                b = pd.to_numeric(pd.Series([current.get(key, np.nan)]), errors="coerce").iloc[0]
+                return float(b - a) if pd.notna(a) and pd.notna(b) else np.nan
+
+            rows.append({
+                "銘柄": ticker_symbol,
+                "シグナル": signal_label,
+                "前5年_Target先着_%": ep["Target先着_%"],
+                "現5年_Target先着_%": ec["Target先着_%"],
+                "Target先着差_ポイント": diff(ec, ep, "Target先着_%"),
+                "前5年_Stop先着_%": ep["Stop先着_%"],
+                "現5年_Stop先着_%": ec["Stop先着_%"],
+                "Stop先着差_ポイント": diff(ec, ep, "Stop先着_%"),
+                "前5年_MFE中央値R": pp["MFE中央値R"],
+                "現5年_MFE中央値R": pc["MFE中央値R"],
+                "MFE中央値差_R": diff(pc, pp, "MFE中央値R"),
+                "前5年_MAE中央値R": pp["MAE中央値R"],
+                "現5年_MAE中央値R": pc["MAE中央値R"],
+                "MAE中央値差_R": diff(pc, pp, "MAE中央値R"),
+                "前5年_20日終値中央値R": pp["20日終値中央値R"],
+                "現5年_20日終値中央値R": pc["20日終値中央値R"],
+                "20日終値中央値差_R": diff(pc, pp, "20日終値中央値R"),
+                "前5年_1R率中央値_%": rp["1R率中央値_%"],
+                "現5年_1R率中央値_%": rc["1R率中央値_%"],
+                "1R率中央値差_ポイント": diff(rc, rp, "1R率中央値_%"),
+            })
+    return pd.DataFrame(rows)
+
+
+def build_v35_reconciliation(
+    period_bundles: dict,
+    exit_summary: pd.DataFrame,
+    path_detail: pd.DataFrame,
+    risk_summary: pd.DataFrame,
+) -> pd.DataFrame:
+    """v3.5の各原因分解表が同じR有効シグナル母集団から始まっているか監査する。"""
+    rows = []
+    for period_name in ["前5年", "現5年"]:
+        for ticker_symbol in ["GOOG", "NVDA"]:
+            bundle = period_bundles.get(period_name, {}).get(ticker_symbol)
+            if not bundle:
+                continue
+            for prefix_name, signal_label in [("Stop", "下落停止"), ("Rebound", "反発開始")]:
+                expected = len(bundle.get("signal_valid", {}).get(prefix_name, pd.DataFrame()))
+                e = exit_summary[
+                    exit_summary["期間"].eq(period_name)
+                    & exit_summary["銘柄"].eq(ticker_symbol)
+                    & exit_summary["シグナル"].eq(signal_label)
+                ]
+                p = path_detail[
+                    path_detail["期間"].eq(period_name)
+                    & path_detail["銘柄"].eq(ticker_symbol)
+                    & path_detail["シグナル"].eq(signal_label)
+                ] if path_detail is not None and not path_detail.empty else pd.DataFrame()
+                r = risk_summary[
+                    risk_summary["期間"].eq(period_name)
+                    & risk_summary["銘柄"].eq(ticker_symbol)
+                    & risk_summary["シグナル"].eq(signal_label)
+                ]
+
+                exit_n = int(e.iloc[0]["20日対象"]) if len(e) == 1 else -1
+                path_n = len(p)
+                path_complete = int(p["20日観察完了"].eq(True).sum()) if not p.empty else 0
+                risk_n = int(r.iloc[0]["R有効シグナル"]) if len(r) == 1 else -1
+                unique_event = (
+                    int(pd.to_numeric(p["イベントID"], errors="coerce").nunique())
+                    if not p.empty else 0
+                )
+                ok = (
+                    len(e) == 1
+                    and len(r) == 1
+                    and expected == exit_n == path_n == risk_n == unique_event
+                    and 0 <= path_complete <= expected
+                )
+                rows.append({
+                    "期間": period_name,
+                    "銘柄": ticker_symbol,
+                    "シグナル": signal_label,
+                    "R有効シグナル": expected,
+                    "134_20日対象": exit_n,
+                    "135_価格経路行数": path_n,
+                    "135_20日観察完了": path_complete,
+                    "136_1R率母集団": risk_n,
+                    "ユニークイベントID": unique_event,
+                    "母集団一致": "OK" if ok else "要確認",
+                })
+    return pd.DataFrame(rows)
+
+
+@st.cache_data(persist="disk", show_spinner=False)
+def build_v350_current_results(
+    commission_rate: float,
+    slippage_rate: float,
+):
+    """
+    v3.4.1の固定ルール・固定2つの5年窓をそのまま再利用し、
+    v3.5の原因分解表まで一度に作る。main.pyへは小さい表だけ返す。
+    """
+    windows = build_v34_windows()
+    period_bundles = {"前5年": {}, "現5年": {}}
+
+    for period_name in ["前5年", "現5年"]:
+        eval_start, eval_end = windows[period_name]
+        for ticker_symbol in ["GOOG", "NVDA"]:
+            prepared = prepare_data_fixed_window(
+                ticker_symbol,
+                eval_start,
+                eval_end,
+                V34_WARMUP_CALENDAR_DAYS,
+            )
+            period_bundles[period_name][ticker_symbol] = build_v30_ticker_bundle(
+                ticker_symbol,
+                prepared,
+                commission_rate,
+                slippage_rate,
+            )
+
+    audit = build_v34_audit(period_bundles, windows)
+    net_summary = build_v34_net_summary(period_bundles)
+    difference_20d = build_v34_20d_difference(net_summary)
+    reconciliation = build_v34_reconciliation(audit, net_summary)
+
+    exit_summary = build_v35_exit_structure(period_bundles)
+    path_detail, path_summary = build_v35_path_summary(period_bundles, horizon=20)
+    risk_summary = build_v35_risk_summary(period_bundles)
+    period_difference = build_v35_period_difference(exit_summary, path_summary, risk_summary)
+    v35_audit = build_v35_reconciliation(
+        period_bundles, exit_summary, path_detail, risk_summary
+    )
+
+    return (
+        windows,
+        audit,
+        net_summary,
+        difference_20d,
+        reconciliation,
+        exit_summary,
+        path_summary,
+        risk_summary,
+        period_difference,
+        v35_audit,
+    )
+
