@@ -1,10 +1,10 @@
 import streamlit as st
-from research_core import APP_VERSION, V34_WARMUP_CALENDAR_DAYS, build_v510_current_results
+from research_core import APP_VERSION, V34_WARMUP_CALENDAR_DAYS, build_v520_current_results
 
 st.set_page_config(page_title="GOOG・NVDA BB研究", page_icon="📊", layout="wide")
 st.title("📊 GOOG・NVDA BB下限研究")
-st.caption(f"Version {APP_VERSION} ｜ v5.1.0 AI改善の頑健性・依存度検証")
-st.info("v5.1.0では売買条件・4特徴量・モデル・正式閾値0.50を変更しません。v5.0で見えたAI改善が、少数大勝ち・特定年度・特定特徴量・0.50近傍の確率に依存していないかを壊しにいきます。")
+st.caption(f"Version {APP_VERSION} ｜ v5.2.0 AI追加価値・統計的不確実性検証")
+st.info("v5.2.0では売買条件・4特徴量・モデル・正式閾値0.50を変更しません。v5.1を通過したAI改善について、イベント単位と年度BlockのBootstrapで統計的不確実性を直接測ります。")
 st.write("【固定全期間】2016-10-01～2026-09-30 ｜ 前5年/現5年の固定窓も維持")
 st.write("【重要】AIはまだ採用しません。Target先着=1 / Stop先着=0を教師ラベルにし、P(Target) 0.50以上の選別が未知の次年度で全件取引より改善するかだけを検査します。")
 
@@ -14,7 +14,7 @@ with c1: cp=st.number_input("売買手数料率（片道・%）",0.0,5.0,0.10,0.
 with c2: sp=st.number_input("スリッページ率（片道・%）",0.0,5.0,0.10,0.01,format="%.2f",key="v500_slippage")
 
 with st.spinner("固定10年結果とv5.0 Walk-Forward AI検証を読み込んでいます。初回だけ時間がかかります..."):
-    results=build_v510_current_results(cp/100.0,sp/100.0)
+    results=build_v520_current_results(cp/100.0,sp/100.0)
     (windows,v34_audit,v34_net,v34_diff,v34_rec,v35_exit,v35_path,v35_risk,v35_diff,v35_audit,
      v36_env,v36_outcome,v36_diff,v36_audit,v37_state,v37_outcome,v37_diff,v37_audit,
      v38_qdist,v38_repro,v38_combo,v38_audit,v39_yearly,v39_expanding,v39_consistency,v39_audit,
@@ -22,8 +22,9 @@ with st.spinner("固定10年結果とv5.0 Walk-Forward AI検証を読み込ん�
      v41_event_boot,v41_period_boot,v41_year_boot,v41_loo,v41_loo_summary,v41_audit,
      v42_event_diff,v42_year_diff,v42_rolling3,v42_rolling5,v42_audit,
      v50_feature_spec,v50_class_year,v50_trade_year,v50_oos_summary,v50_probability,v50_audit,
-     v51_concentration,v51_loo,v51_ablation,v51_threshold,v51_margin,v51_audit)=results
-st.success("v5.1.0 AI改善の頑健性・依存度検証の読み込み完了")
+     v51_concentration,v51_loo,v51_ablation,v51_threshold,v51_margin,v51_audit,
+     v52_event_boot,v52_year_boot,v52_selected_boot,v52_audit)=results
+st.success("v5.2.0 AI追加価値・統計的不確実性検証の読み込み完了")
 st.caption(f"前5年: {windows['前5年'][0].date()} ～ {windows['前5年'][1].date()} ｜ 現5年: {windows['現5年'][0].date()} ～ {windows['現5年'][1].date()} ｜ ウォームアップ: {V34_WARMUP_CALENDAR_DAYS}暦日")
 
 def copy_text(title,frame,float_format=None):
@@ -37,6 +38,14 @@ def show(num,title,df,expanded=False,ff="%.4f"):
         st.dataframe(df.round(4) if df is not None else df,use_container_width=True,hide_index=True)
         st.code(copy_text(f"{num} {title}",df,float_format=ff),language=None)
 
+st.subheader("📐 v5.2 AI追加価値・統計的不確実性検証")
+st.caption("最初は187番の母集団監査を確認します。正式AI仕様は固定したまま、AI選別の追加価値とAI選別平均Rの不確実性を再標本化します。")
+show(187,"v5.2 AI追加価値・母集団監査",v52_audit,True,None)
+show(184,"v5.2 AI追加価値・イベントBootstrap",v52_event_boot)
+show(185,"v5.2 AI追加価値・年Block Bootstrap",v52_year_boot)
+show(186,"v5.2 AI選別平均R・イベントBootstrap",v52_selected_boot)
+
+st.divider()
 st.subheader("🧪 v5.1 AI改善の頑健性・依存度検証")
 st.caption("最初は183番の母集団監査を確認します。v5.0の正式AI仕様は変更せず、改善結果が壊れないかだけを診断します。")
 show(183,"v5.1 AI頑健性・母集団監査",v51_audit,True,None)
@@ -117,6 +126,15 @@ show(133,"v3.4.1 時間方向検証・最終監査",v34_rec,False,None)
 show(130,"v3.4.1 固定5年窓・監査サマリー",v34_audit,False,None)
 show(131,"v3.4.1 前5年 vs 現5年・2Rコスト後Net R比較",v34_net)
 show(132,"v3.4.1 20日保有・2R・前5年→現5年差",v34_diff)
+
+st.divider();st.subheader("v5.2.0の研究上の扱い")
+st.write("【固定維持】売買条件、4特徴量、L2ロジスティック回帰、C=1.0、正式閾値0.50は変更しません。")
+st.write("【184】同じOOSイベントを再標本化し、AI選別平均R－全件平均Rを直接Bootstrapします。AI選別と全件は同じ再標本内で計算します。")
+st.write("【185】OOS年度をまとまりのまま再標本化し、年度内のイベント相関を残した年Block Bootstrapで同じ平均R差を診断します。")
+st.write("【186】AI選別イベントだけの平均RをイベントBootstrapし、AI選別平均Rそのものが0をまたぐ不確実性を確認します。")
+st.write("【重要】Bootstrapの0超割合は将来の成功確率ではありません。観測済みOOS標本を再標本化したときの安定性です。")
+st.write("【未採用】AI実売買、特徴量変更、閾値変更、複雑モデル、Bootstrap結果を使った後付け最適化。")
+st.warning("OOS年度数とAI選別件数は小さいままです。10,000回の再標本化をしても、新しい年度や新しい市場局面が10,000個増えるわけではありません。")
 
 st.divider();st.subheader("v5.1.0の研究上の扱い")
 st.write("【固定維持】v5.0の売買条件、4特徴量、L2ロジスティック回帰、C=1.0、正式閾値0.50は変更しません。")

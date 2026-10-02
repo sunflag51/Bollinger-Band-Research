@@ -209,7 +209,7 @@ st.set_page_config(
 # 定数
 # ============================================================
 
-APP_VERSION = "5.1.0"
+APP_VERSION = "5.2.0"
 
 BB_PERIOD = 20
 BB_STD = 2.0
@@ -8550,3 +8550,148 @@ def build_v510_current_results(commission_rate: float, slippage_rate: float):
     margin=build_v51_probability_margin(preds)
     audit=build_v51_audit(preds,concentration,loo,ablation,threshold,margin)
     return base+(concentration,loo,ablation,threshold,margin,audit)
+
+
+# ============================================================
+# v5.2.0 AI追加価値・統計的不確実性検証
+# v5.0/v5.1の売買条件・4特徴量・モデル・C=1.0・正式閾値0.50は変更しない。
+# 観測済みOOSにおける「AI選別平均R－全件平均R」の不確実性を、
+# イベント単位Bootstrapと年度Block Bootstrapの両方で直接測る。
+# さらにAI選別平均RそのもののイベントBootstrapも表示する。
+# Bootstrapは将来成功確率ではなく、観測済み標本に対する再標本化診断である。
+# ============================================================
+V52_BOOTSTRAP_ITERATIONS = 10000
+V52_EVENT_SEED = 5202026
+V52_YEAR_SEED = 5203026
+
+
+def _v52_valid_trade_rows(preds: pd.DataFrame, ticker: str, signal: str) -> pd.DataFrame:
+    p=preds[(preds["銘柄"]==ticker)&(preds["シグナル"]==signal)].copy()
+    if p.empty or "Net_R_Valid" not in p.columns:
+        return pd.DataFrame()
+    p=p[p["Net_R_Valid"].eq(True)].copy()
+    p["Net_R"]=pd.to_numeric(p["Net_Realized_R"],errors="coerce")
+    p=p[p["Net_R"].notna()].copy()
+    p["AI選別"]=p["AI選別"].eq(True)
+    return p
+
+
+def _v52_summary(arr):
+    a=np.asarray(arr,dtype=float)
+    a=a[np.isfinite(a)]
+    if len(a)==0:
+        return {"Bootstrap有効反復":0,"Bootstrap中央値":np.nan,"2.5%":np.nan,"97.5%":np.nan,
+                "0超割合_%":np.nan,"0以下割合_%":np.nan,"Bootstrap_SE":np.nan}
+    return {"Bootstrap有効反復":int(len(a)),"Bootstrap中央値":float(np.median(a)),
+            "2.5%":float(np.quantile(a,.025)),"97.5%":float(np.quantile(a,.975)),
+            "0超割合_%":float(np.mean(a>0)*100.0),"0以下割合_%":float(np.mean(a<=0)*100.0),
+            "Bootstrap_SE":float(np.std(a,ddof=1)) if len(a)>1 else np.nan}
+
+
+def build_v52_event_uplift_bootstrap(preds: pd.DataFrame) -> pd.DataFrame:
+    rows=[]
+    for ti,ticker in enumerate(["GOOG","NVDA"]):
+        for si,signal in enumerate(["下落停止","反発開始"]):
+            p=_v52_valid_trade_rows(preds,ticker,signal)
+            vals=p["Net_R"].to_numpy(float) if not p.empty else np.array([])
+            sel=p["AI選別"].to_numpy(bool) if not p.empty else np.array([],dtype=bool)
+            obs_all=float(np.mean(vals)) if len(vals) else np.nan
+            obs_ai=float(np.mean(vals[sel])) if sel.any() else np.nan
+            obs_diff=obs_ai-obs_all if np.isfinite(obs_ai) and np.isfinite(obs_all) else np.nan
+            diffs=[]
+            if len(vals):
+                rng=np.random.default_rng(V52_EVENT_SEED+ti*100+si*10)
+                for _ in range(V52_BOOTSTRAP_ITERATIONS):
+                    ix=rng.integers(0,len(vals),size=len(vals))
+                    v=vals[ix]; s=sel[ix]
+                    if not s.any():
+                        continue
+                    diffs.append(float(v[s].mean()-v.mean()))
+            rows.append({"銘柄":ticker,"シグナル":signal,"OOS全件":len(vals),"AI選別件数":int(sel.sum()) if len(sel) else 0,
+                         "観測全件平均R":obs_all,"観測AI平均R":obs_ai,"観測平均R差_AI-全件":obs_diff,
+                         "反復回数":V52_BOOTSTRAP_ITERATIONS,**_v52_summary(diffs)})
+    return pd.DataFrame(rows)
+
+
+def build_v52_year_block_uplift_bootstrap(preds: pd.DataFrame) -> pd.DataFrame:
+    rows=[]
+    for ti,ticker in enumerate(["GOOG","NVDA"]):
+        for si,signal in enumerate(["下落停止","反発開始"]):
+            p=_v52_valid_trade_rows(preds,ticker,signal)
+            years=sorted(p["テスト年"].dropna().unique()) if not p.empty else []
+            obs_all=float(p["Net_R"].mean()) if len(p) else np.nan
+            ps=p[p["AI選別"]]
+            obs_ai=float(ps["Net_R"].mean()) if len(ps) else np.nan
+            obs_diff=obs_ai-obs_all if len(ps) else np.nan
+            diffs=[]
+            if years:
+                rng=np.random.default_rng(V52_YEAR_SEED+ti*100+si*10)
+                by_year={y:p[p["テスト年"]==y].copy() for y in years}
+                for _ in range(V52_BOOTSTRAP_ITERATIONS):
+                    sampled=rng.choice(years,size=len(years),replace=True)
+                    blocks=[by_year[y] for y in sampled]
+                    z=pd.concat(blocks,ignore_index=True)
+                    zs=z[z["AI選別"]]
+                    if zs.empty:
+                        continue
+                    diffs.append(float(zs["Net_R"].mean()-z["Net_R"].mean()))
+            rows.append({"銘柄":ticker,"シグナル":signal,"OOS年度数":len(years),"OOS全件":len(p),"AI選別件数":len(ps),
+                         "観測全件平均R":obs_all,"観測AI平均R":obs_ai,"観測平均R差_AI-全件":obs_diff,
+                         "反復回数":V52_BOOTSTRAP_ITERATIONS,**_v52_summary(diffs)})
+    return pd.DataFrame(rows)
+
+
+def build_v52_selected_mean_bootstrap(preds: pd.DataFrame) -> pd.DataFrame:
+    rows=[]
+    for ti,ticker in enumerate(["GOOG","NVDA"]):
+        for si,signal in enumerate(["下落停止","反発開始"]):
+            p=_v52_valid_trade_rows(preds,ticker,signal)
+            ps=p[p["AI選別"]].copy()
+            vals=ps["Net_R"].to_numpy(float) if not ps.empty else np.array([])
+            means=[]
+            if len(vals):
+                rng=np.random.default_rng(V52_EVENT_SEED+5000+ti*100+si*10)
+                ix=rng.integers(0,len(vals),size=(V52_BOOTSTRAP_ITERATIONS,len(vals)))
+                means=vals[ix].mean(axis=1)
+            rows.append({"銘柄":ticker,"シグナル":signal,"AI選別件数":len(vals),
+                         "観測AI平均R":float(np.mean(vals)) if len(vals) else np.nan,"反復回数":V52_BOOTSTRAP_ITERATIONS,
+                         **_v52_summary(means)})
+    return pd.DataFrame(rows)
+
+
+def build_v52_audit(preds, event_boot, year_boot, selected_boot):
+    rows=[]
+    for ticker in ["GOOG","NVDA"]:
+        for signal in ["下落停止","反発開始"]:
+            p=_v52_valid_trade_rows(preds,ticker,signal)
+            e=event_boot[(event_boot["銘柄"]==ticker)&(event_boot["シグナル"]==signal)]
+            y=year_boot[(year_boot["銘柄"]==ticker)&(year_boot["シグナル"]==signal)]
+            s=selected_boot[(selected_boot["銘柄"]==ticker)&(selected_boot["シグナル"]==signal)]
+            years=int(p["テスト年"].nunique()) if not p.empty else 0
+            sel=int(p["AI選別"].sum()) if not p.empty else 0
+            ok=(len(e)==1 and len(y)==1 and len(s)==1 and
+                int(e["OOS全件"].iloc[0])==len(p) and int(e["AI選別件数"].iloc[0])==sel and
+                int(y["OOS年度数"].iloc[0])==years and int(s["AI選別件数"].iloc[0])==sel and
+                int(e["反復回数"].iloc[0])==V52_BOOTSTRAP_ITERATIONS and int(y["反復回数"].iloc[0])==V52_BOOTSTRAP_ITERATIONS)
+            rows.append({"銘柄":ticker,"シグナル":signal,"OOS_Net_R件数":len(p),"AI選別件数":sel,"OOS年度数":years,
+                         "イベントBootstrap行":len(e),"年Block_Bootstrap行":len(y),"AI平均Bootstrap行":len(s),
+                         "Bootstrap反復回数":V52_BOOTSTRAP_ITERATIONS,"正式AI閾値":V50_THRESHOLD,"母集団一致":"OK" if ok else "要確認"})
+    return pd.DataFrame(rows)
+
+
+@st.cache_data(persist="disk", show_spinner=False)
+def build_v520_current_results(commission_rate: float, slippage_rate: float):
+    base=build_v510_current_results(commission_rate,slippage_rate)
+    windows=build_v34_windows(); period_bundles={"前5年":{},"現5年":{}}
+    for period_name in ["前5年","現5年"]:
+        eval_start,eval_end=windows[period_name]
+        for ticker in ["GOOG","NVDA"]:
+            prepared=prepare_data_fixed_window(ticker,eval_start,eval_end,V34_WARMUP_CALENDAR_DAYS)
+            period_bundles[period_name][ticker]=build_v30_ticker_bundle(ticker,prepared,commission_rate,slippage_rate)
+    ff=_v50_feature_frame(period_bundles)
+    _,_,preds=build_v50_walk_forward(ff)
+    event_boot=build_v52_event_uplift_bootstrap(preds)
+    year_boot=build_v52_year_block_uplift_bootstrap(preds)
+    selected_boot=build_v52_selected_mean_bootstrap(preds)
+    audit=build_v52_audit(preds,event_boot,year_boot,selected_boot)
+    return base+(event_boot,year_boot,selected_boot,audit)
