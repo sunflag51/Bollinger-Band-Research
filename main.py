@@ -17,7 +17,8 @@ def section(n,title,df,open_=False):
             st.info("該当データなし")
         else:
             st.dataframe(df,use_container_width=True,hide_index=True)
-            st.text_area("コピー用CSV",df.to_csv(index=False),height=180,key=f"s{n}")
+            st.caption("右上のコピーボタンで、そのままChatGPTへ貼り付けできます。")
+            st.code(f"【{n} {title}】\n" + df.to_csv(index=False), language=None)
 
 st.info("【重要】v5.3の凍結AI・2026-10-01以降の前向き検証には、この研究結果を混ぜません。")
 
