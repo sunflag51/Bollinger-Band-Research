@@ -3,7 +3,7 @@ import pandas as pd
 import streamlit as st
 import yfinance as yf
 
-VERSION = "1.1.0"
+VERSION = "1.1.1"
 
 PRIOR = (pd.Timestamp("2016-10-01"), pd.Timestamp("2021-09-30"))
 CURRENT = (pd.Timestamp("2021-10-01"), pd.Timestamp("2026-09-30"))
