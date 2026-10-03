@@ -7,7 +7,7 @@ VERSION = "1.1.1"
 
 PRIOR = (pd.Timestamp("2016-10-01"), pd.Timestamp("2021-09-30"))
 CURRENT = (pd.Timestamp("2021-10-01"), pd.Timestamp("2026-09-30"))
-METHODS = ["価格構造", "ATR×1", "ATR×1.5", "ATR×2"]
+METHODS = ["価格構造", "価格構造＋最低ATR×1", "ATR×1", "ATR×1.5", "ATR×2"]
 MULT = {"ATR×1": 1.0, "ATR×1.5": 1.5, "ATR×2": 2.0}
 HORIZONS = [5, 10, 20]
 
@@ -162,6 +162,20 @@ def build_design_records(ticker, period, x, ev):
                         reason = "Entry<=価格構造Stop"
                     else:
                         reason = ""
+
+                elif method == "価格構造＋最低ATR×1":
+                    if not np.isfinite(struct):
+                        stop = np.nan
+                        reason = "価格構造Stop欠損"
+                    elif not np.isfinite(atr) or atr <= 0:
+                        stop = np.nan
+                        reason = "ATR14計算不可"
+                    else:
+                        # 価格構造を基本にしつつ、1R幅が最低でもATR×1になるようにする。
+                        # Stop価格は「価格構造Stop」と「Entry-ATR」の低い方。
+                        stop = min(struct, entry - atr)
+                        reason = "" if entry > stop else "Entry<=Hybrid Stop"
+
                 else:
                     if not np.isfinite(atr) or atr <= 0:
                         stop = np.nan
@@ -210,6 +224,10 @@ def build_design_records(ticker, period, x, ev):
                             "価格構造Stop": struct,
                             "価格構造R_ATR": (
                                 (entry - struct) / atr
+                                if np.isfinite(atr) and atr > 0 else np.nan
+                            ),
+                            "StopR_ATR": (
+                                R / atr
                                 if np.isfinite(atr) and atr > 0 else np.nan
                             ),
                         }
@@ -436,7 +454,7 @@ def audit(evmap, attempts, common_status):
                     q = a[a["Stop方式"] == m]
                     row[m + "_設計可能"] = int(q["設計可能"].sum()) if len(q) else 0
 
-                row["4方式共通比較件数"] = common_count
+                row["5方式共通比較件数"] = common_count
                 row["共通母集団除外件数"] = signal_count - common_count
 
                 common_method_counts = []
@@ -450,7 +468,7 @@ def audit(evmap, attempts, common_status):
                     )
                     common_method_counts.append(len(q))
 
-                row["共通母集団4方式一致"] = (
+                row["共通母集団5方式一致"] = (
                     "OK"
                     if all(v == common_count for v in common_method_counts)
                     else "要確認"
@@ -476,6 +494,9 @@ def risk_summary(ds):
                 "1R_%最小": g["1R_%"].min(),
                 "1R_%最大": g["1R_%"].max(),
                 "価格構造R_ATR中央値": g["価格構造R_ATR"].median(),
+                "StopR_ATR中央値": g["StopR_ATR"].median(),
+                "StopR_ATR最小": g["StopR_ATR"].min(),
+                "StopR_ATR最大": g["StopR_ATR"].max(),
             }
         )
 
@@ -554,7 +575,7 @@ def paired(o):
                     columns={"結果": "構造結果", "Net_R": "構造NetR"}
                 )
 
-                for method in ["ATR×1", "ATR×1.5", "ATR×2"]:
+                for method in ["価格構造＋最低ATR×1", "ATR×1", "ATR×1.5", "ATR×2"]:
                     a = x[
                         (x["期間"] == period) &
                         (x["銘柄"] == ticker) &
@@ -609,6 +630,93 @@ def paired(o):
 
     return pd.DataFrame(rows)
 
+
+def hybrid_diagnostic(o):
+    """価格構造Stopと、価格構造＋最低ATR×1を同一イベントで直接比較する。"""
+    x = o[o["Horizon"] == 20].copy()
+    ids = ["期間", "銘柄", "シグナル", "Event"]
+    rows = []
+
+    for period in ["前5年", "現5年"]:
+        for ticker in ["GOOG", "NVDA"]:
+            for sig in ["下落停止", "反発開始"]:
+                b = x[
+                    (x["期間"] == period) &
+                    (x["銘柄"] == ticker) &
+                    (x["シグナル"] == sig) &
+                    (x["Stop方式"] == "価格構造")
+                ][ids + ["1R_%", "価格構造R_ATR", "結果", "Net_R"]].rename(
+                    columns={
+                        "1R_%": "構造1R_%",
+                        "結果": "構造結果",
+                        "Net_R": "構造NetR",
+                    }
+                )
+
+                h = x[
+                    (x["期間"] == period) &
+                    (x["銘柄"] == ticker) &
+                    (x["シグナル"] == sig) &
+                    (x["Stop方式"] == "価格構造＋最低ATR×1")
+                ][ids + ["1R_%", "結果", "Net_R"]].rename(
+                    columns={
+                        "1R_%": "Hybrid1R_%",
+                        "結果": "Hybrid結果",
+                        "Net_R": "HybridNetR",
+                    }
+                )
+
+                p = b.merge(h, on=ids, how="inner")
+                if p.empty:
+                    continue
+
+                v = p[
+                    pd.to_numeric(p["構造NetR"], errors="coerce").notna() &
+                    pd.to_numeric(p["HybridNetR"], errors="coerce").notna()
+                ].copy()
+
+                diff = (
+                    pd.to_numeric(v["HybridNetR"], errors="coerce") -
+                    pd.to_numeric(v["構造NetR"], errors="coerce")
+                )
+
+                floor_used = pd.to_numeric(
+                    p["価格構造R_ATR"], errors="coerce"
+                ) < 1.0
+
+                rows.append(
+                    {
+                        "期間": period,
+                        "銘柄": ticker,
+                        "シグナル": sig,
+                        "共通ペア件数": len(p),
+                        "最低ATR×1が実際に作動": int(floor_used.sum()),
+                        "作動率_%": floor_used.mean() * 100.0,
+                        "構造1R_%最小": p["構造1R_%"].min(),
+                        "Hybrid1R_%最小": p["Hybrid1R_%"].min(),
+                        "両方NetR計算可能": len(v),
+                        "Hybrid-構造_平均NetR差": diff.mean() if len(diff) else np.nan,
+                        "Hybridが高い件数": int((diff > 0).sum()),
+                        "構造が高い件数": int((diff < 0).sum()),
+                        "同値件数": int((diff == 0).sum()),
+                        "構造Stop→Hybridでは非Stop": int(
+                            (
+                                (p["構造結果"] == "Stop先着") &
+                                (p["Hybrid結果"] != "Stop先着")
+                            ).sum()
+                        ),
+                        "構造非Stop→HybridではStop": int(
+                            (
+                                (p["構造結果"] != "Stop先着") &
+                                (p["Hybrid結果"] == "Stop先着")
+                            ).sum()
+                        ),
+                    }
+                )
+
+    return pd.DataFrame(rows)
+
+
 def yearly(o):
     x = o[
         (o["Horizon"] == 20) &
@@ -647,7 +755,7 @@ def spec(comm, slip):
         [
             ["Version", VERSION],
             ["目的", "Stop設計を独立研究。既存v5.3は変更しない"],
-            ["比較母集団", "4方式すべて設計可能な同一イベントだけ"],
+            ["比較母集団", "5方式すべて設計可能な同一イベントだけ"],
             ["除外処理", "除外イベントを別監査表へ保存"],
             ["前5年", "2016-10-01～2021-09-30"],
             ["現5年", "2021-10-01～2026-09-30"],
@@ -656,8 +764,8 @@ def spec(comm, slip):
             ["下落停止", "Higher Low & Close Up"],
             ["反発開始", "Close > Prev High"],
             ["Entry", "シグナル翌営業日Open"],
-            ["Stop", "価格構造 / ATR×1 / ATR×1.5 / ATR×2"],
-            ["ATR", "Wilder ATR14・シグナル日まで"],
+            ["Stop", "価格構造 / 価格構造＋最低ATR×1 / ATR×1 / ATR×1.5 / ATR×2"],
+            ["ATR", "ATR14・シグナル日まで（EWM alpha=1/14, adjust=False）"],
             ["Target", "+2R"],
             ["評価", "5 / 10 / 20営業日"],
             ["片道手数料", f"{comm * 100:.3f}%"],
@@ -741,7 +849,7 @@ def run_research(comm=0.001, slip=0.001):
 
     detail_cols = [
         "期間", "銘柄", "Event", "Day0", "シグナル", "シグナル日",
-        "Entry日", "Entry", "Stop方式", "ATR", "Stop", "1R", "1R_%",
+        "Entry日", "Entry", "Stop方式", "ATR", "Stop", "1R", "1R_%", "StopR_ATR",
         "共通比較対象", "結果", "結果日", "決済方法",
         "Gross_R", "Net_R", "MFE_R", "MAE_R",
     ]
@@ -760,6 +868,7 @@ def run_research(comm=0.001, slip=0.001):
         "summary": summary.drop(columns=["Horizon"]),
         "validation": validation(summary20),
         "paired": paired(outcomes),
+        "hybrid": hybrid_diagnostic(outcomes),
         "yearly": yearly(outcomes),
         "detail": detail,
     }

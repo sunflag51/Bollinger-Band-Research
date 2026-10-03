@@ -5,7 +5,7 @@ from stop_research_core import run_research, VERSION
 st.set_page_config(page_title="GOOG・NVDA Stop設計研究", page_icon="📊", layout="wide")
 st.title("📊 GOOG・NVDA Stop設計研究")
 st.caption(
-    f"v{VERSION}｜4方式の共通イベント母集団でStop設計を比較します。"
+    f"v{VERSION}｜価格構造＋最低ATR×1を追加し、5方式の共通イベント母集団で比較します。"
     "既存v5.3は変更しません。"
 )
 
@@ -58,12 +58,12 @@ def split_copy_section(n, title, df, rows_per_part=40, open_=False):
 
 
 st.info(
-    "【重要】成績比較は、価格構造 / ATR×1 / ATR×1.5 / ATR×2 の4方式すべてが"
+    "【重要】成績比較は、価格構造 / 価格構造＋最低ATR×1 / ATR×1 / ATR×1.5 / ATR×2 の5方式すべてが"
     "設計可能な同一イベントだけを使用します。除外イベントは別に監査します。"
 )
 
 if run:
-    with st.spinner("GOOG / NVDAの共通母集団を作成し、Stop方式を比較しています..."):
+    with st.spinner("GOOG / NVDAの共通母集団を作成し、5つのStop方式を比較しています..."):
         r = run_research(commission, slippage)
 
     if r.get("error"):
@@ -81,12 +81,13 @@ if run:
     section(7, "前5年選択→現5年固定検証", r["validation"], True)
     section(8, "価格構造Stopとのペア比較", r["paired"], True)
     section(9, "年別20営業日Net R", r["yearly"], False)
-    split_copy_section(10, "20営業日イベント明細", r["detail"], rows_per_part=40, open_=False)
+    section(10, "価格構造＋最低ATR×1の直接診断", r["hybrid"], True)
+    split_copy_section(11, "20営業日イベント明細", r["detail"], rows_per_part=40, open_=False)
 
     st.warning(
-        "【未採用】画面上で最良に見えたATR倍率を、そのまま売買ルールにはしません。"
+        "【未採用】価格構造＋最低ATR×1を含め、画面上で最良に見えたStop方式をそのまま売買ルールにはしません。"
         "7番は前5年だけで選び、現5年で固定確認する診断です。"
     )
 else:
-    st.write("比較: 価格構造 / ATR×1 / ATR×1.5 / ATR×2")
+    st.write("比較: 価格構造 / 価格構造＋最低ATR×1 / ATR×1 / ATR×1.5 / ATR×2")
     st.write("前5年: 2016-10-01～2021-09-30｜現5年: 2021-10-01～2026-09-30")
